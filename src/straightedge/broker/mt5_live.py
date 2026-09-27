@@ -234,33 +234,133 @@ class Mt5Broker:
         )
 
     def symbol(self, name: str) -> SymbolSpec:
+        """Read a symbol spec, recording every field that was NOT measured.
+
+        Every numeric read used `d.get(key, DEFAULT) or DEFAULT` with FX-shaped
+        defaults, and `unmeasured` was never set. Two failures in one:
+
+        `or` fires on a legitimate ZERO as well as on absence, so a
+        broker-reported zero became a plausible EURUSD number that nothing
+        downstream could tell from a real measurement. An XAUUSD spec arriving
+        with zeros was sized as though gold had a 100,000 unit contract and a $1
+        tick. That is the ratio CLAUDE.md warns about under "The per-symbol
+        trap": gold measures `point 0.01` and `contract_size 100` against a
+        5-digit pair's `0.00001` and `100000`.
+
+        And with `unmeasured` empty, `unmeasured_for_sizing()` was empty too, so
+        the repo's own "unmeasured specs refuse, they never default" rule could
+        never fire on MT5. It was implemented, tested and live on MT4 (issue #68,
+        broken and re-fixed there) and simply absent here.
+
+        THE MECHANISM, not a reminder to set a flag. Every field goes through one
+        reader that records it and returns a value no caller can mistake for a
+        measurement. There is no second reader to forget:
+        `tests/test_mt5_unmeasured_specs.py` fails if a raw `d.get(` reappears in
+        this method.
+
+        `positive=` marks the fields where zero is not a possible measurement,
+        only a failed one. Fields where zero IS a real reading pass
+        `positive=False` and survive: `digits` is 0 on an index quoted in whole
+        points, and `stops_level` is 0 on a broker with no minimum stop distance.
+
+        The names recorded are the CANONICAL spec names (`tick_value`, not
+        `trade_tick_value`), because `unmeasured_for_sizing()` intersects with
+        `SPEC_SIZING_FIELDS`, which is spelled that way. A set full of raw MT5
+        keys would look populated and gate nothing.
+        """
         info = self._mt5.symbol_info(name)
         if info is None:
             raise RuntimeError(f"symbol_info({name}) failed: {self._mt5.last_error()}")
         d = _asdict(info)
-        if not d.get("visible", True):
+        if "visible" in d and not bool(d["visible"]):
             self.select_symbol(name)
-            info = self._mt5.symbol_info(name)
-            d = _asdict(info)
+            # `_asdict(None)` is `{}`. Under the old code every `or DEFAULT` then
+            # fired at once, so a terminal that answered NOTHING here produced a
+            # complete, plausible, entirely invented EURUSD spec. Now an empty
+            # dict marks every field unmeasured, which refuses.
+            d = _asdict(self._mt5.symbol_info(name))
+        unmeasured: set[str] = set()
+
+        def measure(key: str, field: str, *, positive: bool) -> float:
+            """The measured value, or 0.0 with `field` recorded as unmeasured."""
+            if key not in d:
+                unmeasured.add(field)
+                return 0.0
+            try:
+                value = float(d[key])
+            except (TypeError, ValueError):
+                unmeasured.add(field)
+                return 0.0
+            if positive and value <= 0:
+                unmeasured.add(field)
+                return 0.0
+            return value
+
+        def text(key: str, field: str) -> str:
+            """A string field. Absent is recorded; empty from the broker is not.
+
+            An empty currency code is a real answer from some brokers on
+            non-FX instruments, so it is not treated as a failed read.
+            """
+            if key not in d:
+                unmeasured.add(field)
+                return ""
+            return str(d[key])
+
+        # Evaluated before the constructor call on purpose: `unmeasured` is filled
+        # in by these, and relying on argument evaluation order to have happened
+        # first would be a trap for the next reader.
+        point = measure("point", "point", positive=True)
+        digits = measure("digits", "digits", positive=False)
+        # No fallback to `point`. A derived value is not a measurement, and
+        # `ticks_between` already falls back to `point` on its own if it is ever
+        # reached; the sizing gate fires first, which is the honest order.
+        tick_size = measure("trade_tick_size", "tick_size", positive=True)
+        tick_value = measure("trade_tick_value", "tick_value", positive=True)
+        contract_size = measure("trade_contract_size", "contract_size", positive=True)
+        volume_min = measure("volume_min", "volume_min", positive=True)
+        volume_max = measure("volume_max", "volume_max", positive=True)
+        volume_step = measure("volume_step", "volume_step", positive=True)
+        stops_level = measure("trade_stops_level", "stops_level", positive=False)
+        freeze_level = measure("trade_freeze_level", "freeze_level", positive=False)
+        filling = measure("filling_mode", "filling_mode", positive=False)
+        spread = measure("spread", "spread", positive=False)
+
+        if "trade_mode" in d:
+            trade_mode = int(d["trade_mode"])
+        else:
+            # 4 is FULL TRADING, so the old default presented a close-only or
+            # disabled symbol as fully tradable. 0 is MQL5's DISABLED: the
+            # fail-closed direction, and what MT4 already does.
+            unmeasured.add("trade_mode")
+            trade_mode = 0
+
+        if "visible" in d:
+            visible = bool(d["visible"])
+        else:
+            unmeasured.add("visible")
+            visible = True
+
         return SymbolSpec(
-            name=str(d.get("name", name)),
-            digits=int(d.get("digits", 5)),
-            point=float(d.get("point", 0.00001)),
-            trade_tick_size=float(d.get("trade_tick_size") or d.get("point") or 0.00001),
-            trade_tick_value=float(d.get("trade_tick_value") or 1.0),
-            trade_contract_size=float(d.get("trade_contract_size") or 100_000),
-            volume_min=float(d.get("volume_min") or 0.01),
-            volume_max=float(d.get("volume_max") or 100),
-            volume_step=float(d.get("volume_step") or 0.01),
-            trade_stops_level=int(d.get("trade_stops_level") or 0),
-            trade_freeze_level=int(d.get("trade_freeze_level") or 0),
-            filling_mode=int(d.get("filling_mode") or 0),
-            currency_base=str(d.get("currency_base", "")),
-            currency_profit=str(d.get("currency_profit", "")),
-            currency_margin=str(d.get("currency_margin", "")),
-            trade_mode=int(d.get("trade_mode", 4)),
-            visible=bool(d.get("visible", True)),
-            spread=int(d.get("spread") or 0),
+            name=str(d["name"]) if "name" in d else name,
+            digits=int(digits),
+            point=point,
+            trade_tick_size=tick_size,
+            trade_tick_value=tick_value,
+            trade_contract_size=contract_size,
+            volume_min=volume_min,
+            volume_max=volume_max,
+            volume_step=volume_step,
+            trade_stops_level=int(stops_level),
+            trade_freeze_level=int(freeze_level),
+            filling_mode=int(filling),
+            currency_base=text("currency_base", "currency_base"),
+            currency_profit=text("currency_profit", "currency_profit"),
+            currency_margin=text("currency_margin", "currency_margin"),
+            trade_mode=trade_mode,
+            visible=visible,
+            spread=int(spread),
+            unmeasured=frozenset(unmeasured),
         )
 
     def tick(self, name: str) -> Tick:
