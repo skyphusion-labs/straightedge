@@ -161,6 +161,191 @@ class TestRemovingAStopIsRefused:
         assert rec.get("ticket") == pos.ticket, rec
 
 
+class TestANonFinitePriceIsNotAPrice:
+    """NaN and infinity are not caught by ANY comparison in the guard.
+
+    Every IEEE-754 comparison against NaN is False, so `sl <= 0`, the breakeven
+    arm, the tighten comparison and the cap test all fall through together and
+    the guard used to return "". `float("nan")` succeeds, so this is reachable
+    from the desk with one typed command.
+    """
+
+    def test_nan_does_not_un_protect_a_position(self, tmp_path: Path) -> None:
+        engine = _engine(tmp_path)
+        engine.start()
+        pos = _open(engine)
+        assert pos.sl > 0
+
+        reply = engine.handle_command(TgCommand("1", 1, f"/sl {pos.ticket} nan", 3))
+        engine.stop()
+
+        live = _live(engine, pos.ticket)
+        assert live.sl == pos.sl, (
+            f"the stop is now {live.sl}; a NaN stop is no stop, and the position "
+            "is unbounded on the downside"
+        )
+        assert live.sl == live.sl, "the stop on the book is NaN"
+        assert "sl #" not in reply, reply
+        assert "stop_removal_refused" in reply, reply
+
+    def test_positive_infinity_does_not_un_protect_a_position(
+        self, tmp_path: Path
+    ) -> None:
+        """`+inf` fell through the BREAKEVEN arm, not the cap.
+
+        `price_open - inf` is `-inf`, which is <= 0, so the guard read it as a
+        stop at locked-in profit and allowed it.
+        """
+        engine = _engine(tmp_path)
+        engine.start()
+        pos = _open(engine)
+
+        reply = engine.handle_command(TgCommand("1", 1, f"/sl {pos.ticket} inf", 3))
+        engine.stop()
+
+        assert _live(engine, pos.ticket).sl == pos.sl, "inf reached the book"
+        assert "stop_removal_refused" in reply, reply
+
+    def test_a_finite_tighten_still_applies(self, tmp_path: Path) -> None:
+        """The allow side. The finiteness arm must not refuse a real price."""
+        engine = _engine(tmp_path)
+        engine.start()
+        pos = _open(engine)
+        tighter = pos.price_open - (pos.price_open - pos.sl) / 2
+
+        reply = engine.handle_command(
+            TgCommand("1", 1, f"/sl {pos.ticket} {tighter:.5f}", 3)
+        )
+        engine.stop()
+
+        assert "sl #" in reply, reply
+        assert _live(engine, pos.ticket).sl != pos.sl, "a real tighten was refused"
+
+
+class TestTheCapFailsClosedOnAnUnmeasuredSpec:
+    """A widening may not be waved through because the spec is unmeasured.
+
+    `ticks_between` returns 0.0 when `trade_tick_size or point` is <= 0, so
+    `worst` became 0.0 and `0.0 > min(per_trade, loss_room)` is False: every
+    widening passed. The arithmetic was copied from `risk.evaluate` without its
+    `spec_not_measured` precondition.
+    """
+
+    @staticmethod
+    def _blind(engine: Engine, symbol: str) -> None:
+        """Make the broker answer with a spec whose sizing fields are unmeasured."""
+        real = engine.broker.symbol(symbol)
+        blind = replace(
+            real,
+            trade_tick_size=0.0,
+            point=0.0,
+            unmeasured=frozenset({"point", "tick_size"}),
+        )
+        engine.broker.symbol = lambda name, _b=blind, _r=real: (  # type: ignore[method-assign]
+            _b if name == symbol else _r
+        )
+
+    def test_a_widening_refuses_when_the_spec_is_unmeasured(
+        self, tmp_path: Path
+    ) -> None:
+        engine = _engine(tmp_path)
+        engine.start()
+        pos = _open(engine)
+        wide = pos.price_open - (pos.price_open - pos.sl) * 500
+        self._blind(engine, pos.symbol)
+
+        reply = engine.handle_command(
+            TgCommand("1", 1, f"/sl {pos.ticket} {wide:.5f}", 3)
+        )
+        engine.stop()
+
+        assert _live(engine, pos.ticket).sl == pos.sl, (
+            "a 500x widening was applied because the spec could not be measured; "
+            "the cap failed OPEN"
+        )
+        assert "spec_not_measured" in reply, reply
+
+    def test_a_tighten_still_applies_when_the_spec_is_unmeasured(
+        self, tmp_path: Path
+    ) -> None:
+        """The asymmetry has to survive the new refusal.
+
+        A tightening returns before the spec read, so an operator must still be
+        able to reduce risk on a symbol the broker has not streamed. If this
+        refused, the fix would have traded one unbounded-loss path for another.
+        """
+        engine = _engine(tmp_path)
+        engine.start()
+        pos = _open(engine)
+        tighter = pos.price_open - (pos.price_open - pos.sl) / 2
+        self._blind(engine, pos.symbol)
+
+        reply = engine.handle_command(
+            TgCommand("1", 1, f"/sl {pos.ticket} {tighter:.5f}", 3)
+        )
+        engine.stop()
+
+        assert "sl #" in reply, reply
+        assert _live(engine, pos.ticket).sl != pos.sl, (
+            "a tighten was refused on an unmeasured spec; the guard is no longer "
+            "asymmetric and an operator cannot reduce risk"
+        )
+
+
+class TestTheDirectionIsRightOnAShort:
+    """A short's stop sits ABOVE entry, so tighten and widen invert.
+
+    The sign is pinned by `test_loss_distance_goes_negative_past_breakeven`, but
+    nothing drove a short through the desk, so a guard that was backwards on
+    shorts would have passed this file.
+    """
+
+    @staticmethod
+    def _short(engine: Engine):
+        engine.handle_command(TgCommand("1", 1, "/sell EURUSD", 1))
+        reply = engine.handle_command(TgCommand("1", 1, "/confirm", 2))
+        assert "sent sell" in reply, reply
+        positions = engine.broker.positions(magic=engine.cfg.risk.magic)
+        assert len(positions) == 1, positions
+        return replace(positions[0])
+
+    def test_lowering_a_shorts_stop_is_a_tighten_and_applies(
+        self, tmp_path: Path
+    ) -> None:
+        engine = _engine(tmp_path)
+        engine.start()
+        pos = self._short(engine)
+        assert pos.sl > pos.price_open, "a short is stopped ABOVE entry"
+        tighter = pos.price_open + (pos.sl - pos.price_open) / 2
+
+        reply = engine.handle_command(
+            TgCommand("1", 1, f"/sl {pos.ticket} {tighter:.5f}", 3)
+        )
+        engine.stop()
+
+        assert "sl #" in reply, reply
+        assert _live(engine, pos.ticket).sl < pos.sl, "a short tighten was refused"
+
+    def test_raising_a_shorts_stop_past_the_cap_is_refused(
+        self, tmp_path: Path
+    ) -> None:
+        engine = _engine(tmp_path)
+        engine.start()
+        pos = self._short(engine)
+        wide = pos.price_open + (pos.sl - pos.price_open) * 500
+
+        reply = engine.handle_command(
+            TgCommand("1", 1, f"/sl {pos.ticket} {wide:.5f}", 3)
+        )
+        engine.stop()
+
+        assert _live(engine, pos.ticket).sl == pos.sl, (
+            "a short stop was WIDENED past the cap; the comparison is backwards "
+            "on this side of the book"
+        )
+        assert "stop_exceeds_risk" in reply, reply
+
+
 class TestWideningIsCapped:
     def test_a_stop_moved_far_enough_to_blow_the_cap_is_refused(
         self, tmp_path: Path

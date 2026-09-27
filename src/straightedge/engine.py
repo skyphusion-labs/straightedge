@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 import time
 from datetime import datetime, timezone
@@ -531,6 +532,18 @@ class Engine:
 
         Only a genuine widening pays for the spec and the account read.
         """
+        # FIRST, before the unprotected-position arm. NaN is not a price and it
+        # is not caught by any comparison below: every IEEE-754 comparison
+        # against NaN is False, so `sl <= 0`, `proposed <= 0`, the tighten
+        # comparison and the cap test ALL fall through and the guard returns "".
+        # `float("nan")` succeeds, so `/sl <ticket> nan` reached the broker and
+        # the desk answered `sl #1 -> nan`, which reads as success. `+inf` fell
+        # through the breakeven arm the same way (price_open - inf is -inf).
+        # Measured: an unstopped long ran to -$58,058 on a $10,000 account.
+        # This arm has to precede arm 1 because on an UNPROTECTED position arm 1
+        # returns "" and would wave NaN straight through.
+        if not math.isfinite(sl):
+            return STOP_REMOVAL_REFUSED
         if pos.sl <= 0:
             return ""
         if sl <= 0:
@@ -545,6 +558,22 @@ class Engine:
         if proposed <= _loss_distance(pos, pos.sl) + 1e-12:
             return ""
         spec = self.broker.symbol(pos.symbol)
+        # Fail CLOSED before the arithmetic, exactly as `risk.evaluate` does at
+        # its own spec read. This gate needs points, and `ticks_between` returns
+        # 0.0 when `trade_tick_size or point` is <= 0, so an unmeasured spec
+        # makes `worst` 0.0 and `0.0 > min(per_trade, loss_room)` False: every
+        # widening passed. The arithmetic here was copied from `risk.evaluate`
+        # and the precondition was left behind, which is how a correct rule
+        # becomes a fail-open. `models.SymbolSpec.points` states the invariant
+        # that every gate needing points runs after this refusal, and CLAUDE.md
+        # states the rule: unmeasured specs refuse, they never default.
+        #
+        # The asymmetry survives: a tightening returns above without ever
+        # reaching this read, so a stop can still be tightened on a symbol whose
+        # specs the broker has not streamed. Only a WIDENING refuses.
+        not_measured = spec.unmeasured_for_sizing()
+        if not_measured:
+            return "spec_not_measured:" + ",".join(sorted(not_measured))
         account = self.broker.account()
         r = self.cfg.risk
         worst = money_per_lot_at_stop(pos.price_open, sl, spec) * pos.volume
