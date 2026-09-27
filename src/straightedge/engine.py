@@ -542,16 +542,29 @@ class Engine:
             attempts=int(entry.get("attempts", 0)),
             first_at=entry.get("at"),
         )
-        return OrderResult.unknown(
-            f"unresolved send {client_id}: an earlier attempt for this order left "
-            "no verdict, so it may already be on the book. Reconcile in the "
-            "terminal (/positions), then /cancel and re-stage if nothing moved."
+        return OrderResult.not_sent(
+            f"unresolved send {client_id}: nothing was transmitted this time. An "
+            "earlier attempt for this order left no verdict, so it may already be "
+            "on the book. Reconcile in the terminal (/positions), then /cancel "
+            "and re-stage if nothing moved."
         )
 
     def _after_unresolved_send(
-        self, client_id: str, symbol: str, exc: BaseException
+        self,
+        client_id: str,
+        symbol: str,
+        exc: BaseException | None = None,
+        *,
+        detail: str = "",
     ) -> None:
         """One book read after a send that answered nothing, and an honest report.
+
+        Two callers, one money question. `exc` is the send that RAISED (a bridge
+        timeout, an OSError, a Ctrl-C). `exc=None` with `detail` set is the send
+        that RETURNED an unmeasured `OrderResult`, which is what an adapter
+        produces when the request went out and no reply came back. The adapter
+        choosing `raise` or `return` says nothing about the money, so it must not
+        change what gets recorded.
 
         Not a resolution. A matching position is a POSITIVE and is reported as an
         unmanaged position, because a send that never returned also never got its
@@ -563,7 +576,7 @@ class Engine:
         withdrawal = getattr(exc, "withdrawal", "") or "unknown"
         found: list[int] = []
         read_failed = ""
-        if isinstance(exc, Exception):
+        if exc is None or isinstance(exc, Exception):
             # The probe costs a full read budget, and it is skipped for the
             # BaseException arms (KeyboardInterrupt, SystemExit): the operator is
             # stopping the process and adding a five second book read to a Ctrl-C
@@ -589,7 +602,7 @@ class Engine:
             request=withdrawal,
             matched=found,
             book_read_failed=read_failed,
-            detail=str(exc),
+            detail=detail or str(exc),
         )
         for ticket in found:
             # It carries our key, so it IS this send. It also never had its stop
@@ -674,9 +687,19 @@ class Engine:
             # not swallow anything.
             self._after_unresolved_send(key, signal.symbol, exc)
             raise
-        # Every path from here has a VERDICT from the venue, including the
-        # rejections, so the ambiguity is gone and the entry is closed.
-        self.inflight.resolve(key, "ok" if result.ok else "rejected")
+        # The entry closes on a VERDICT only, and `measured` is what tells the
+        # two apart. A rejection IS a verdict and closes it; an unmeasured result
+        # is the venue not answering, which is the state the ledger exists to
+        # hold open. Filing it as "rejected" deleted the only record that the
+        # order might be on the book, and it disabled BOTH duplicate controls at
+        # once, because `Engine._unresolved` and `Desk._already_attempted` read
+        # this one file.
+        if result.measured:
+            self.inflight.resolve(key, "ok" if result.ok else "rejected")
+        else:
+            self._after_unresolved_send(
+                key, signal.symbol, detail=result.comment or "no verdict"
+            )
         if result.ok:
             self.risk.record_trade()
             ticket = int(result.order or result.deal or 0)
@@ -982,7 +1005,13 @@ class Engine:
         except BaseException as exc:
             self._after_unresolved_send(key, signal.symbol, exc)
             raise
-        self.inflight.resolve(key, "ok" if result.ok else "rejected")
+        # Same partition as `_open`; see the comment there.
+        if result.measured:
+            self.inflight.resolve(key, "ok" if result.ok else "rejected")
+        else:
+            self._after_unresolved_send(
+                key, signal.symbol, detail=result.comment or "no verdict"
+            )
         if result.ok:
             self.risk.record_trade()
         else:

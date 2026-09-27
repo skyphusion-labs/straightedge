@@ -59,6 +59,31 @@ TRADE_ACTION_MODIFY = 7
 TRADE_ACTION_REMOVE = 8
 TRADE_ACTION_CLOSE_BY = 10
 
+#: The trade actions whose REPEAT is the same request rather than a second one.
+#:
+#: Each of these states a TARGET: set this stop, put this order at this price,
+#: remove this order. A duplicate arrival leaves the same book, so a lost reply
+#: may safely be answered by reconnecting and asking again.
+#:
+#: Everything absent from this set CREATES or CONSUMES volume (DEAL opens,
+#: closes and partially closes; PENDING rests a new order; CLOSE_BY consumes two
+#: positions), and for those a repeat is a SECOND money event. A lost reply
+#: cannot distinguish "the terminal never saw it" from "the terminal accepted it
+#: and the reply died", so those are sent exactly once and an absent reply is
+#: reported as `OrderResult.unknown`.
+#:
+#: This is an ALLOWLIST and never a denylist, which is the whole point: a
+#: `TRADE_ACTION_*` added later by someone who has not read this comment lands
+#: in the single-attempt lane by default. Fail-closed costs an order; fail-open
+#: costs a position. `tests/test_order_send_is_sent_once.py` pins that property.
+IDEMPOTENT_TRADE_ACTIONS = frozenset(
+    {
+        TRADE_ACTION_SLTP,
+        TRADE_ACTION_MODIFY,
+        TRADE_ACTION_REMOVE,
+    }
+)
+
 # ORDER_TYPE
 ORDER_TYPE_BUY = 0
 ORDER_TYPE_SELL = 1
