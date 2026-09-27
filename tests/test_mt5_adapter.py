@@ -422,14 +422,26 @@ def test_reconnect_once_then_raises() -> None:
     assert fake.init_count == 2
 
 
-def test_order_send_reconnects_on_none() -> None:
+def test_order_send_reconnects_BEFORE_it_sends_never_after() -> None:
+    """A dead link is repaired ahead of the request, not behind it.
+
+    All three assertions below held under the old `_with_reconnect` send too,
+    which is why this test passed while the adapter could double-send: this
+    fake's `_dead()` answers None WITHOUT recording, so the send it discards
+    never reached the terminal and repeating it was free. The dangerous half --
+    accepted, then the reply lost -- is unrepresentable here and lives in
+    `tests/test_order_send_is_sent_once.py`.
+
+    Kept, and renamed, because the old name ("reconnects on none") described the
+    defect as the contract and would invite it straight back.
+    """
     fake = FakeMt5()
     broker = Mt5Broker(mt5=fake)
     broker.connect()
     fake.disconnected = True
     result = broker.order_send({"action": 1, "type_filling": 0, "volume": 0.01})
     assert result.ok
-    assert fake.init_count == 2
+    assert fake.init_count == 2, "ensure_connected did not repair the link first"
     assert len(fake.sends) == 1
 
 

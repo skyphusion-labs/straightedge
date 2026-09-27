@@ -243,6 +243,17 @@ class OrderResult:
     # Venues that attach the stop in the same call as the entry have no
     # such window and leave this at 0.
     survivor_ticket: int | None = 0
+    #: Did this request leave the process?
+    #:
+    #: Only ever False together with `measured` False, and the pair is not a
+    #: redundancy: "the venue did not answer" and "we declined to ask" are
+    #: different facts and only one of them can have moved money. Reporting a
+    #: refusal in the words of a lost reply tells an operator to go hunting for a
+    #: position that cannot exist; reporting a lost reply in the words of a
+    #: refusal is far worse, because it says nothing is on the book when
+    #: something may be. Defaults True, so every ordinary result is what it was
+    #: before: something went out and the venue answered it.
+    transmitted: bool = True
 
     @property
     def ok(self) -> bool:
@@ -265,10 +276,27 @@ class OrderResult:
 
     @classmethod
     def unknown(cls, comment: str, request: dict[str, Any] | None = None) -> OrderResult:
-        """No result came back: COULD NOT MEASURE, never PASSED."""
+        """The request WENT OUT and no result came back: COULD NOT MEASURE.
+
+        This is the expensive one. It may have filled, so nothing downstream may
+        read it as a rejection, resolve an in-flight entry on it, or retry it.
+        """
         from straightedge.constants import RETCODE_UNKNOWN
 
         return cls(retcode=RETCODE_UNKNOWN, comment=comment, request=request or {})
+
+    @classmethod
+    def not_sent(cls, comment: str) -> OrderResult:
+        """We DECLINED to transmit. No verdict, and nothing on the wire.
+
+        Unmeasured like `unknown`, because there is still no verdict to act on,
+        and every safety rule that keys off `measured` applies unchanged. It is
+        separate so an operator is told which of the two happened; `comment`
+        carries the reason and is shown verbatim.
+        """
+        from straightedge.constants import RETCODE_UNKNOWN
+
+        return cls(retcode=RETCODE_UNKNOWN, comment=comment, transmitted=False)
 
     @classmethod
     def unchanged(cls) -> OrderResult:
