@@ -52,7 +52,7 @@ from test_mt5_adapter import FakeMt5, _nt
 
 from straightedge.broker.mt5_live import Mt5Broker
 from straightedge.models import SPEC_SIZING_FIELDS
-from straightedge.sizing import lots_for_risk
+from straightedge.sizing import lots_for_risk, money_per_lot_at_stop
 
 MT5_SRC = Path(__file__).resolve().parents[1] / "src" / "straightedge" / "broker" / "mt5_live.py"
 
@@ -276,6 +276,15 @@ class TestARealMeasurementSurvives:
         assert spec.unmeasured == frozenset()
         assert spec.trade_contract_size == 100.0
         assert spec.point == 0.01
+        # And it SIZES. Asserting the spec fields alone left FX as the only
+        # instrument this file proves can size, and FX is precisely where the
+        # defect was invisible: the fabricated spec errs only when the real
+        # tick_value/tick_size ratio differs from 1e5, which is exactly where a
+        # 5-digit pair sits. Gold is the case that moved, so gold is the case
+        # that has to size here. $40 of real risk against a $50 budget.
+        lots = lots_for_risk(10_000.0, 0.005, 4000.0, 3980.0, spec)
+        assert lots == 0.02, lots
+        assert money_per_lot_at_stop(4000.0, 3980.0, spec) * lots == 40.0
 
 
 def _symbol_code() -> str:
@@ -315,6 +324,38 @@ class TestThereIsNoOtherReader:
         assert "or 1.0" not in code
         assert "or 100_000" not in code
 
+        # Subscripts too, NOT only `d.get(`. The `d.get(`-only form of this
+        # guard was decorative for the route that matters: replacing
+        # `measure("volume_min", ...)` with `float(d["volume_min"]) if
+        # "volume_min" in d else 0.01` reintroduces issue #68 on a field that
+        # IS in SPEC_SIZING_FIELDS, and it passed every test in this file AND
+        # the entire 983-test suite. A guard that cannot observe the bypass it
+        # names is not a guard.
+        #
+        # Three literal keys are read raw on purpose and are allowlisted BY
+        # NAME, so a fourth has to be added here deliberately rather than
+        # arriving unnoticed. None of the three is a sizing input:
+        # `visible` and `trade_mode` carry their own recording branches (a
+        # measure() returning 0.0 cannot express DISABLED-vs-unmeasured for an
+        # enum), and `name` is the symbol label, not a measurement.
+        ALLOWED_RAW_KEYS = {"visible", "trade_mode", "name"}
+        raw_keys = set(re.findall(r'd\[\s*"([^"]+)"\s*\]', code))
+        unexpected = raw_keys - ALLOWED_RAW_KEYS
+        assert unexpected == set(), (
+            f"raw d[...] read(s) for {sorted(unexpected)} in Mt5Broker.symbol; a "
+            "spec field read by subscript bypasses measure() and can silently "
+            "default, which is exactly how #68 was re-broken. Route it through "
+            "measure()/text(), or allowlist it here with a reason."
+        )
+
+        # `d[key]` with the VARIABLE key is the two readers themselves. Pinning
+        # the count stops a third variable-key reader being added beside them,
+        # which the literal-key allowlist above cannot see.
+        assert len(re.findall(r"d\[key\]", code)) == 2, (
+            "expected exactly two d[key] reads, one in measure() and one in "
+            "text(); a third is a new reader that records nothing"
+        )
+
     def test_the_fx_shaped_defaults_are_gone(self) -> None:
         code = _symbol_code()
 
@@ -335,3 +376,9 @@ class TestThereIsNoOtherReader:
         assert "measure(" in code
         assert "unmeasured" in code
         assert re.search(r"d\.get\(", "x = d.get('k')") is not None
+        # And the subscript pattern, on a sample that MUST match, so the
+        # allowlist assertion above cannot pass by never matching anything.
+        assert re.findall(r'd\[\s*"([^"]+)"\s*\]', 'x = d["volume_min"]') == [
+            "volume_min"
+        ]
+        assert len(re.findall(r"d\[key\]", "v = d[key]")) == 1

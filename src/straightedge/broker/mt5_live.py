@@ -266,11 +266,21 @@ class Mt5Broker:
         never fire on MT5. It was implemented, tested and live on MT4 (issue #68,
         broken and re-fixed there) and simply absent here.
 
-        THE MECHANISM, not a reminder to set a flag. Every field goes through one
-        reader that records it and returns a value no caller can mistake for a
-        measurement. There is no second reader to forget:
-        `tests/test_mt5_unmeasured_specs.py` fails if a raw `d.get(` reappears in
-        this method.
+        THE MECHANISM, not a reminder to set a flag. Every spec field goes
+        through one reader that records it and returns a value no caller can
+        mistake for a measurement. `tests/test_mt5_unmeasured_specs.py` enforces
+        that structurally: it fails on a raw `d.get(` anywhere in this method,
+        and on a raw `d["..."]` for any key outside the three allowlisted below.
+        The subscript half is not redundant. With only the `d.get(` check,
+        `float(d["volume_min"]) if "volume_min" in d else 0.01` reintroduced #68
+        on a sizing-gated field and passed the entire suite.
+
+        `visible`, `trade_mode` and `name` ARE read raw, deliberately, and are
+        allowlisted by name in that test. The first two are enums whose failure
+        value is not 0.0, so `measure` cannot express them (0 IS the DISABLED
+        reading for `trade_mode`); they carry their own recording branches
+        below. `name` is the symbol label, not a measurement. A fourth raw key
+        has to be added to the allowlist on purpose.
 
         `positive=` marks the fields where zero is not a possible measurement,
         only a failed one. Fields where zero IS a real reading pass
