@@ -249,13 +249,66 @@ class TestTheAdapterReadsItAsUnmeasured:
         assert not res.measured
         assert res.survivor_ticket is None
 
-    # A companion assertion, that this result is unmeasured because the reply was
-    # LOST rather than because the desk declined to send, belongs here too. It
-    # reads `OrderResult.transmitted`, which is introduced by #100, so it is not
-    # in this PR: this branch is off `main` and has to be green on its own. The
-    # dependency is stated in the PR body rather than left implied, because on
-    # `main` alone `Desk._confirm` still reports this reply as "send failed" and
-    # the in-flight entry is still resolved. #100 is what fixes those.
+    def test_a_timed_out_send_is_unmeasured_because_it_WAS_transmitted(
+        self, tmp_path: Path
+    ) -> None:
+        """Unmeasured because the reply was LOST, not because nothing was sent.
+
+        `OrderResult.transmitted` arrived with #100, which is now on `main`
+        (e46191b), so the assertion this file used to defer can be made. It is
+        the difference that decides whether the desk may re-send: a request that
+        never left is safe to retry, one that was transmitted is not.
+        """
+        with _Mailbox(tmp_path, TIMEOUT_REPLY):
+            res = _broker(tmp_path).market(_market())
+
+        assert res.transmitted, "a timed-out send DID reach the wire"
+        assert not res.measured
+
+    def test_the_reported_reason_is_not_overwritten_as_unreported(
+        self, tmp_path: Path
+    ) -> None:
+        """The Expert reported a reason, so nothing may claim it did not.
+
+        `_result` appends "reason not reported by the Expert" when an unmeasured
+        failure carries NO reason, which is the `raw == 0` case. A send timeout
+        reports its reason precisely. Without the emptiness gate this comment
+        reads `send_timeout_outcome_unknown (reason not reported by the
+        Expert)`, which contradicts itself in the journal and in the desk reply
+        the operator reads during the incident.
+        """
+        with _Mailbox(tmp_path, TIMEOUT_REPLY):
+            res = _broker(tmp_path).market(_market())
+
+        assert res.comment == MT4_SEND_TIMEOUT_UNKNOWN, res.comment
+        assert "not reported" not in res.comment
+
+    def test_the_operator_is_not_told_to_reattach_the_expert(self) -> None:
+        """The remedy on a timeout is to LOOK, never to detach the Expert.
+
+        `survivor_unknown` covers two states: an Expert too old to answer, and a
+        current one that deliberately could not settle the book. The old text
+        said "Update Mt4RiskBot.mq4" for both, so the documented remedy on a
+        timeout was to reattach the Expert while an unstopped position may be
+        live. An absent reason still gets the update instruction, which is what
+        the second assertion pins.
+        """
+        from straightedge.engine import _format_event
+
+        timed_out = _format_event(
+            "survivor_unknown",
+            {"symbol": "XAUUSD", "retcode": -1, "comment": MT4_SEND_TIMEOUT_UNKNOWN},
+        )
+        assert "Mt4RiskBot.mq4" not in timed_out, timed_out
+        assert "TIMED OUT" in timed_out
+        assert "may already be on the book" in timed_out
+        assert "NOT be sent again" in timed_out
+
+        no_reason = _format_event(
+            "survivor_unknown",
+            {"symbol": "XAUUSD", "retcode": 10006, "comment": ""},
+        )
+        assert "Mt4RiskBot.mq4" in no_reason, no_reason
 
     def test_an_ordinary_rejection_is_still_measured(self, tmp_path: Path) -> None:
         """The positive control. Not every failure may become unmeasured.

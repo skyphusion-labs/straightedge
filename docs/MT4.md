@@ -394,12 +394,16 @@ COULD NOT MEASURE, and the engine writes `survivor_unknown`. It is NOT reported
 as zero, because "the Expert did not answer" and "the Expert checked and
 nothing survived" are different facts and only one of them is safe.
 
-If you see `survivor_unknown`, recompile and reattach `Mt4RiskBot.mq4`.
+If you see `survivor_unknown` with NO reason reported, recompile and reattach
+`Mt4RiskBot.mq4`. If it carries `send_timeout_outcome_unknown`, the Expert is
+already current and deliberately could not settle the book: the order may be on
+the book, so check the terminal before re-staging and do NOT reattach the Expert
+while an unstopped position may be live.
 
 ### A send that TIMED OUT is not a send that failed
 
-`SendRetry` retries `OrderSend` on three MQL4 errors, and only two of them are
-safe to repeat:
+`SendRetry` USED TO retry `OrderSend` on three MQL4 errors, and only two of them
+are safe to repeat. It now retries on those two only:
 
 | Error | Meaning | Repeating it |
 | --- | --- | --- |
