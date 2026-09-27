@@ -10,6 +10,7 @@ from typing import Any
 
 from straightedge.broker.base import Broker
 from straightedge.config import BotConfig
+from straightedge.constants import MT4_SEND_TIMEOUT_UNKNOWN
 from straightedge.desk import Desk
 from straightedge.history import HistoryReport, preflight
 from straightedge.indicators import adx, ema, last_closed
@@ -1939,6 +1940,26 @@ def _format_event(event: str, fields: dict[str, Any]) -> str:
             f"open and has NO STOP. Close or protect it in the terminal now."
         )
     if event == "survivor_unknown":
+        # TWO states reach this event and they need different instructions.
+        #
+        # A send TIMEOUT is a CURRENT Expert answering honestly: it put the
+        # request on the wire, the reply was lost, and it omits
+        # `survivor_ticket` because absence is this ICD's encoding for "could
+        # not measure". Telling that operator to update the Expert is wrong
+        # three ways -- the send did not fail, the reason WAS reported, and the
+        # Expert is already current -- and acting on it means detaching the
+        # Expert while an unstopped position may be live. The order may be on
+        # the book, so the only correct instruction is to look.
+        #
+        # Absence with NO reason is the other state: an Expert older than the
+        # `survivor_ticket` contract, which cannot answer at all. There
+        # updating it is exactly the fix.
+        if str(fields.get("comment") or "") == MT4_SEND_TIMEOUT_UNKNOWN:
+            return (
+                f"COULD NOT MEASURE {fields.get('symbol')}: the send TIMED OUT, so it may "
+                f"already be on the book (retcode={fields.get('retcode')}). It will NOT be "
+                f"sent again. Check the terminal for this order before you re-stage it."
+            )
         return (
             f"COULD NOT MEASURE {fields.get('symbol')}: a send failed "
             f"(retcode={fields.get('retcode')}) and the Expert did not say whether it left "

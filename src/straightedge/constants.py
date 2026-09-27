@@ -167,6 +167,23 @@ RETCODE_OK = {TRADE_RETCODE_DONE, TRADE_RETCODE_DONE_PARTIAL, TRADE_RETCODE_PLAC
 # vocabulary, and this code never comes from a broker.
 RETCODE_UNKNOWN = -1
 
+#: The MT4 ICD error token for a send whose OUTCOME IS UNKNOWN.
+#:
+#: MQL4 error 128 is ERR_TRADE_TIMEOUT: the request reached the server and the
+#: reply did not come back. The Expert stops its ladder there rather than
+#: re-sending, looks for the order on the book by the desk's client order id, and
+#: emits this token when it cannot find it. `Mt4Broker._result` maps the token to
+#: `RETCODE_UNKNOWN`, so the result is UNMEASURED and the desk's in-flight entry
+#: stays open instead of being filed as a venue rejection.
+#:
+#: It is keyed on the TOKEN and not on the bare code 128, because an Expert older
+#: than this change reports a timeout as an ordinary `OrderSend` failure after
+#: having already re-sent. Those two need different handling and the token is what
+#: separates them. The .mq4 cannot import this constant, so
+#: `tests/test_mt4_send_timeout_is_not_a_failure.py` pins the one spelling across
+#: both languages.
+MT4_SEND_TIMEOUT_UNKNOWN = "send_timeout_outcome_unknown"
+
 RETCODE_NAME = {
     10004: "REQUOTE",
     10006: "REJECT",

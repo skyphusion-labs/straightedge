@@ -394,7 +394,77 @@ COULD NOT MEASURE, and the engine writes `survivor_unknown`. It is NOT reported
 as zero, because "the Expert did not answer" and "the Expert checked and
 nothing survived" are different facts and only one of them is safe.
 
-If you see `survivor_unknown`, recompile and reattach `Mt4RiskBot.mq4`.
+If you see `survivor_unknown` with NO reason reported, recompile and reattach
+`Mt4RiskBot.mq4`. If it carries `send_timeout_outcome_unknown`, the Expert is
+already current and deliberately could not settle the book: the order may be on
+the book, so check the terminal before re-staging and do NOT reattach the Expert
+while an unstopped position may be live.
+
+### A send that TIMED OUT is not a send that failed
+
+`SendRetry` USED TO retry `OrderSend` on three MQL4 errors, and only two of them
+are safe to repeat. It now retries on those two only:
+
+| Error | Meaning | Repeating it |
+| --- | --- | --- |
+| 146 `ERR_TRADE_CONTEXT_BUSY` | another trade is in progress; nothing was sent | safe, and retried |
+| 141 `ERR_TOO_MANY_REQUESTS` | throttled; nothing was sent | safe, and retried |
+| 128 `ERR_TRADE_TIMEOUT` | the request REACHED the server and the reply did not come back | **opens a second position** |
+
+128 does not mean the order failed. It means the outcome is unknown. The Expert
+used to re-send 50ms later, so a timed-out order that actually filled was sent
+again and the desk only ever learned the second ticket.
+
+The ladder now STOPS at 128 and the BOOK decides, which is the discipline
+`RollbackPosition` already follows in the same Expert: `OrderClose`'s return
+value is a claim, and the book is the artifact. `FindByClientId` scans
+`MODE_TRADES` (open AND pending) for an order carrying this desk's `magic` and
+this send's `client_id`.
+
+* **Found.** The send DID land. The Expert returns that ticket and the reply is
+  an ordinary `ok=1`, because the order exists and nothing is ambiguous.
+* **Not found.** This proves nothing, and the Expert does not treat it as a
+  failure. Brokers append to and overwrite `OrderComment`, so the key can vanish
+  from the book, and a fill may simply not be in the local pool yet. A lookup
+  that re-sent on "not found" would have its failure in the DANGEROUS direction.
+
+The not-found reply is:
+
+```
+ok=0
+retcode=128
+error=send_timeout_outcome_unknown
+```
+
+**`survivor_ticket` is deliberately ABSENT, and this is the one trade reply that
+omits it.** Per the section above, an absent field is COULD NOT MEASURE and the
+adapter reports `survivor_ticket = None`. `survivor_ticket=0` would assert that
+the book was checked and nothing survived, which is the single thing this reply
+does not know. So this outcome needs no new ICD field: the existing
+absent-is-unmeasured rule already carries it.
+
+The adapter maps that token to `RETCODE_UNKNOWN`, so `OrderResult.measured` is
+False. That matters because `_MT4_RET` has no entry for 128 and the fallback
+would otherwise make it `TRADE_RETCODE_REJECT`: a rejection is a VERDICT, and a
+verdict closes the desk's in-flight entry and tells the operator the venue
+refused an order that may be filling. The entry instead stays open and the send
+is reported as unresolved, which is what `docs/RUNBOOK.md` has an operator
+reconcile.
+
+**The mapping is keyed on the TOKEN, never on the bare code 128.** An Expert
+older than this contract reports a timeout as a plain `error=OrderSend` failure,
+and by then it has already re-sent. The adapter cannot undo that and does not
+pretend to; such a reply keeps its existing meaning, and the fix is to install
+the current Expert.
+
+**The Expert does not WAIT for the book to settle.** Waiting would spend the
+desk's send budget, which is derived from the Expert's declared
+`SE_LADDER_SLEEP_MS` and `SE_BROKER_CALLS` (see "Why a send gets its own budget"
+and `tests/test_send_budget.py`). The book scan reads the terminal's own order
+pool, so it costs no broker round trip and no `Sleep`, and the declared ladder is
+unchanged. An unresolved send already has a durable home one layer up in
+`<journal stem>.inflight.json`; resolving it is a human's job with the terminal
+in front of them, not a job to attempt inside a timing budget.
 
 ### Startup reconciliation
 
