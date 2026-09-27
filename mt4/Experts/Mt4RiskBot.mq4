@@ -24,6 +24,11 @@ input int ClaimOpenRetryMs = 20;       // wait between those attempts
 #define SE_RETRY_SLEEP_MS  50
 #define SE_LADDER_SLEEP_MS ((SE_SEND_TRIES + SE_MODIFY_TRIES + SE_ROLLBACK_TRIES) * SE_RETRY_SLEEP_MS)
 #define SE_BROKER_CALLS    (SE_SEND_TRIES + SE_MODIFY_TRIES + SE_ROLLBACK_TRIES)
+// SendRetry returns this when a send TIMED OUT and the book could not settle it.
+// Distinct from -1, which is a clean rejection: -1 means nothing is on the book
+// and -2 means we do not know. Not a count, so it stays out of the ladder
+// arithmetic above, which is what the desk derives its send budget from.
+#define SE_SEND_UNKNOWN    -2
 
 // The stale-request fence. A request carries `ttl_ms`, the budget the desk is
 // waiting; once that has elapsed the desk has ALREADY given up and reported a
@@ -517,6 +522,21 @@ string FailTrade(string id, int err, string msg, int survivor)
    return Fail(id, err, msg) + "survivor_ticket=" + IntegerToString(survivor) + "\n";
 }
 
+// A send whose OUTCOME IS UNKNOWN, which is not the same reply as a failure.
+//
+// `survivor_ticket` is OMITTED on purpose, and this is the one trade reply that
+// omits it. docs/MT4.md already defines an absent field as COULD NOT MEASURE and
+// the adapter maps it to None, which is exactly this state. Answering 0 would
+// assert the book was checked and nothing survived -- the single thing we do not
+// know here -- and the desk would close its in-flight entry on that assertion.
+// So no new ICD field is needed; the existing absent-is-unmeasured rule carries
+// it. The error token is what the adapter keys its unmeasured mapping on
+// (constants.MT4_SEND_TIMEOUT_UNKNOWN).
+string FailUnresolved(string id, int err, string msg)
+{
+   return Fail(id, err, msg);
+}
+
 int Tf(string name)
 {
    if(name == "M1" || name == "1") return PERIOD_M1;
@@ -620,10 +640,51 @@ bool StopsOk(string sym, int typ, double price, double sl, double tp)
    return true;
 }
 
+// Find an order THIS send created, by the desk's client order id.
+//
+// A HIT is definitive. The desk stamps its client order id into the comment
+// (`stamped_comment`, src/straightedge/inflight.py) and MT4 returns the comment
+// on the book, so an order carrying it is this send and nothing else.
+//
+// A MISS PROVES NOTHING, and no caller may read it as "not sent". Brokers append
+// to and overwrite OrderComment -- this repo ships a test for one rewritten to
+// `rb-1/from #123` -- and a fill may simply not be in the local pool yet. That is
+// why the caller answers UNKNOWN on a miss rather than failing: a lookup that
+// re-sent on "not found" would have its failure in the dangerous direction,
+// which is the reasoning already recorded in inflight.py.
+//
+// MODE_TRADES is the open AND pending pool, so one helper serves both send
+// handlers. This reads the terminal's own pool, so it costs no broker round trip
+// and no Sleep, and the Expert's declared ladder is unchanged.
+int FindByClientId(string sym, int typ, int magic, string clientId)
+{
+   if(clientId == "")
+      return -1;
+   for(int i = OrdersTotal() - 1; i >= 0; i--)
+   {
+      if(!OrderSelect(i, SELECT_BY_POS, MODE_TRADES))
+         continue;
+      if(OrderMagicNumber() != magic)
+         continue;
+      if(OrderSymbol() != sym)
+         continue;
+      if(OrderType() != typ)
+         continue;
+      if(StringFind(OrderComment(), clientId) < 0)
+         continue;
+      return OrderTicket();
+   }
+   return -1;
+}
+
 // `err` carries the error OUT. GetLastError() clears the register on read, so
 // a caller that reads it a second time gets 0 and reports a rejection with no
 // reason. The loop is the only place that can still see it.
-int SendRetry(string sym, int typ, double vol, double price, int slip, string comment, int magic, int &err)
+//
+// Returns a ticket, -1 for a clean rejection, or SE_SEND_UNKNOWN when the
+// outcome could not be established. The three are different facts and the
+// callers report them differently.
+int SendRetry(string sym, int typ, double vol, double price, int slip, string comment, int magic, string clientId, int &err)
 {
    int ticket = -1;
    err = 0;
@@ -636,7 +697,26 @@ int SendRetry(string sym, int typ, double vol, double price, int slip, string co
       if(ticket >= 0)
          return ticket;
       err = GetLastError();
-      if(err != 146 && err != 128 && err != 141)
+      // 128 is ERR_TRADE_TIMEOUT and it is NOT a failure: the server has the
+      // request and the REPLY was lost, so the outcome is unknown. Re-sending is
+      // how one order becomes two, so the ladder STOPS here and the book is
+      // asked instead. MQL4's own guidance is to confirm the order did not go
+      // through before re-sending.
+      //
+      // 146 (ERR_TRADE_CONTEXT_BUSY) and 141 (ERR_TOO_MANY_REQUESTS) are
+      // refusals taken BEFORE the request goes out, so repeating those is the
+      // same order's next attempt and they keep their retry.
+      if(err == 128)
+      {
+         int settled = FindByClientId(sym, typ, magic, clientId);
+         if(settled > 0)
+         {
+            err = 0;
+            return settled;
+         }
+         return SE_SEND_UNKNOWN;
+      }
+      if(err != 146 && err != 141)
          break;
       Sleep(SE_RETRY_SLEEP_MS);
    }
@@ -991,7 +1071,7 @@ string CheckMarket(string id, string body, bool send)
    if(!send)
       return Ok(id) + "ticket=0\nprice=" + DoubleToString(price, (int)MarketInfo(sym, MODE_DIGITS)) + "\n";
    int sendErr = 0;
-   int ticket = SendRetry(sym, typ, vol, price, slip, ClipComment(KV(body, "comment")), magic, sendErr);
+   int ticket = SendRetry(sym, typ, vol, price, slip, ClipComment(KV(body, "comment")), magic, KV(body, "client_id"), sendErr);
    // The desk's client order id, logged on every outcome. This is what lets a
    // post-incident reconcile join this log to the desk's journal after a send the
    // desk never got an answer for, which is the only case where the two records
@@ -999,6 +1079,8 @@ string CheckMarket(string id, string body, bool send)
    Print("mt4riskbot send op=market client_id=", KV(body, "client_id"),
          " symbol=", sym, " lots=", DoubleToString(vol, 2),
          " ticket=", ticket, " err=", sendErr);
+   if(ticket == SE_SEND_UNKNOWN)
+      return FailUnresolved(id, 128, "send_timeout_outcome_unknown");
    if(ticket < 0)
       return FailTrade(id, sendErr, "OrderSend", 0);
    if(sl > 0 || tp > 0)
@@ -1057,7 +1139,9 @@ string CheckWorking(string id, string body, bool send)
    if(!send)
       return Ok(id) + "ticket=0\n";
    int sendErr = 0;
-   int ticket = SendRetry(sym, typ, vol, price, slip, ClipComment(KV(body, "comment")), magic, sendErr);
+   int ticket = SendRetry(sym, typ, vol, price, slip, ClipComment(KV(body, "comment")), magic, KV(body, "client_id"), sendErr);
+   if(ticket == SE_SEND_UNKNOWN)
+      return FailUnresolved(id, 128, "send_timeout_outcome_unknown");
    if(ticket < 0)
       return FailTrade(id, sendErr, "OrderSend", 0);
    if(sl > 0 || tp > 0)

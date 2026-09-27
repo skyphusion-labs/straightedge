@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from straightedge.constants import (
+    MT4_SEND_TIMEOUT_UNKNOWN,
     EA_CLAIM_RETRY_MS,
     EA_LADDER_SLEEP_MS,
     MAILBOX_ROUND_TRIP_CEILING_MS,
@@ -214,12 +215,24 @@ def _truthy(v: Any) -> bool:
 def _survivor_ticket(d: dict[str, Any], ok: bool) -> int | None:
     """What the Expert said about exposure left behind by a failed send.
 
-    The Expert states this on every reply from a trade handler, including
-    the ordinary rejections where the answer is zero. Absence therefore
-    means one thing only: the Expert predates this contract and cannot
-    answer. That is COULD NOT MEASURE, and it is reported as None.
-    Returning 0 there would turn an unanswered question into a clean bill
-    of health, which is the defect this field exists to close.
+    Absence means COULD NOT MEASURE and is reported as None. Returning 0
+    there would turn an unanswered question into a clean bill of health,
+    which is the defect this field exists to close.
+
+    TWO different states produce that absence, and a caller that renders one
+    message for both will misinstruct the operator:
+
+    1. An Expert OLDER than this contract, which states the field on no reply
+       and cannot answer at all. The remedy is to update the Expert.
+    2. A CURRENT Expert reporting a send timeout, which omits the field ON
+       PURPOSE because it could not settle the book. It is the one trade reply
+       that omits it, and it carries `MT4_SEND_TIMEOUT_UNKNOWN` as its reason.
+       The remedy is to check the terminal; the Expert is already current.
+
+    The reason field is what separates them, so `engine._operator_text` keys
+    on the comment rather than on the absence alone. This docstring used to
+    say absence meant one thing only, and that sentence is what let the
+    "update the Expert" instruction leak onto the timeout path.
     """
     if "survivor_ticket" in d:
         return int(d.get("survivor_ticket") or 0)
@@ -1050,11 +1063,27 @@ class Mt4Broker:
             return replace(unknown, survivor_ticket=None)
         ok = _truthy(d.get("ok"))
         raw = int(d.get("retcode", 0) or 0)
+        reported = str(d.get("error") or "")
+        reason_destroyed = False
         if ok:
             if raw in {TRADE_RETCODE_DONE, TRADE_RETCODE_PLACED}:
                 code = raw
             else:
                 code = TRADE_RETCODE_PLACED if placed else TRADE_RETCODE_DONE
+        elif reported == MT4_SEND_TIMEOUT_UNKNOWN:
+            # ERR_TRADE_TIMEOUT. The Expert put the request on the wire, the
+            # reply was lost, and it looked on the book and could not find the
+            # order. That is COULD NOT MEASURE, not a rejection: `_MT4_RET` has
+            # no entry for 128, so the fallback below would make it
+            # TRADE_RETCODE_REJECT, and a rejection is a VERDICT that closes the
+            # desk's in-flight entry and tells the operator the venue refused an
+            # order that may be filling.
+            #
+            # Keyed on the TOKEN, never on the bare code 128: an Expert older
+            # than this contract reports a timeout as a plain `OrderSend`
+            # failure, and it has already re-sent by then. Those are different
+            # facts and only the new Expert can promise this one.
+            code = RETCODE_UNKNOWN
         elif raw == 0:
             # A failure carrying no MT4 error. The Expert destroyed the reason:
             # GetLastError() clears the register on read, so a second read for
@@ -1062,12 +1091,25 @@ class Mt4Broker:
             # refused the order, and nothing measured that. It is COULD NOT
             # MEASURE, and it reuses #19's vocabulary rather than a second one.
             code = RETCODE_UNKNOWN
+            reason_destroyed = True
         else:
             code = _MT4_RET.get(raw, raw if raw >= 10004 else TRADE_RETCODE_REJECT)
             if code == 0:
                 code = TRADE_RETCODE_REJECT
         detail = str(d.get("error") or d.get("comment") or "")
-        if code == RETCODE_UNKNOWN and not ok:
+        # Gated on `reason_destroyed`, the branch that set the code, NOT on the
+        # code itself. Two branches now produce RETCODE_UNKNOWN and they differ
+        # exactly here, so re-deriving the difference from the text afterwards
+        # gets it wrong both ways: `raw == 0` still carries a handler NAME in
+        # `error` (so the text is not empty even though the reason is gone,
+        # because GetLastError cleared the register), while a send timeout
+        # carries a real reason. Keying on the text would drop the sentence
+        # where it is needed and add it where it is false, producing
+        # `send_timeout_outcome_unknown (reason not reported by the Expert)` in
+        # the journal and in the desk reply the operator reads mid-incident.
+        # A flag set where the decision is made also forces any third
+        # unmeasured branch to choose rather than inherit.
+        if reason_destroyed:
             detail = (detail + " (reason not reported by the Expert)").strip()
         return OrderResult(
             retcode=code,
