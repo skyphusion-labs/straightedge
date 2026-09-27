@@ -107,7 +107,7 @@ Auto EMA trading is off until `/auto on`.
 | `/close TICKET\|SYMBOL\|all [VOL]` | Flatten or partial close. |
 | `/closeby TICKET OTHER` | Hedge-account only. `TRADE_ACTION_CLOSE_BY` offsets two opposite tickets. Same symbol, opposite sides. Remainder 0 or at least `volume_min`. Not a new send. Netting terminals refuse CLOSE_BY. Paper always hedges. |
 | `/reverse TICKET [sl=] [tp=]` | Two market sends: close the ticket, then the opposite side. `/confirm` is the send. Stage and preview exclude that ticket. Mirrors SL/TP distances if omitted. The circuit and `risk_pct` still refuse. After flatten they can leave you flat. |
-| `/sl` TICKET PRICE | Modify a position or a working order. Success only if the broker applied it. |
+| `/sl` TICKET PRICE | Modify a position or a working order. Success only if the broker applied it. On an OPEN position: tightening always applies, including when the circuit has tripped. `0` (or any value at or below zero) is REFUSED as `stop_removal_refused`, because `/sl` sets a stop to a price and `0` is the venue encoding for "no stop"; there is no way to un-protect a position through this command. Widening applies only within `risk_pct * max_risk_multiple` of equity AND the remaining loss room, else `stop_exceeds_risk`. Adding a stop to a position that has none is always allowed. Refusals are journaled as `modify_refused`. |
 | `/tp` TICKET PRICE `[VOL]` | Full TP, or scale-out VOL at PRICE (partial close when hit). The circuit still refuses. |
 | `/be TICKET` | Move SL to entry. Never loosen. |
 | `/trail on\|off\|TICKET` | on: `manage()` existing positions every tick. No EMA entries. Default off. TICKET: one-shot. Never loosen. |
