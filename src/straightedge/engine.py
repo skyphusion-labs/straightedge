@@ -51,6 +51,16 @@ def _pending_label(order: PendingOrder) -> str:
     return order.side.value
 
 
+#: The working-order book could not be READ, so commitment is unmeasured.
+#:
+#: `broker.orders()` raises on MT4 when the Expert answers an error, and the
+#: gates that count commitments cannot run without it. Reading a failed read as
+#: "no working orders" would fail OPEN in exactly the case those gates exist for,
+#: so it refuses instead. Same partition as `OrderResult.measured`: PASSED,
+#: REFUSED, COULD NOT MEASURE.
+ORDERS_UNMEASURED = "orders_unmeasured"
+
+
 class Engine:
     def __init__(
         self,
@@ -766,7 +776,23 @@ class Engine:
             self._modify(pos, new_sl, new_tp)
 
         positions = self.broker.positions(magic=self.cfg.risk.magic)
-        if any(p.symbol == symbol for p in positions):
+        orders, orders_measured = self._read_working(self.cfg.risk.magic)
+        if not orders_measured:
+            # The auto leg is unattended, so it is the LAST place that may read
+            # an unreadable book as an empty one.
+            self.journal.write(
+                "reject",
+                stage="auto",
+                source="auto",
+                reason=ORDERS_UNMEASURED,
+                symbol=symbol,
+            )
+            return
+        # The auto leg carries its OWN same-symbol check, independent of
+        # `already_in_symbol`, and it was positions-only: auto could stack a
+        # market entry on top of a working order it had placed itself.
+        committed: list[Position | PendingOrder] = [*positions, *orders]
+        if any(x.symbol == symbol for x in committed):
             return
 
         sig = self.strategy.signal(symbol, bars, spec)
@@ -780,6 +806,7 @@ class Engine:
             spec=spec,
             tick=tick,
             positions=positions,
+            orders=orders,
             now=now,
         )
         if decision.excluded_from_currency_limit:
@@ -882,14 +909,19 @@ class Engine:
         exclude_ticket: int | None = None,
     ) -> RiskDecision:
         positions = self.broker.positions(magic=self.cfg.risk.magic)
+        orders, measured = self._read_working(self.cfg.risk.magic)
+        if not measured:
+            return RiskDecision(allowed=False, reason=ORDERS_UNMEASURED)
         if exclude_ticket is not None:
             positions = [p for p in positions if p.ticket != exclude_ticket]
+            orders = [o for o in orders if o.ticket != exclude_ticket]
         return self.risk.evaluate(
             account=self.broker.account(),
             signal=signal,
             spec=self.broker.symbol(signal.symbol),
             tick=self.broker.tick(signal.symbol),
             positions=positions,
+            orders=orders,
             now=self.now_fn(),
             manual=manual,
         )
@@ -1455,9 +1487,17 @@ class Engine:
         daily_cap = snap.day_start_equity * r.daily_loss_pct
         dd = snap.peak_equity - acct.equity
         dd_cap = snap.peak_equity * r.max_drawdown_pct if snap.peak_equity else 0.0
-        n = len(self.broker.positions(magic=r.magic))
+        held = len(self.broker.positions(magic=r.magic))
+        working, measured = self._read_working(r.magic)
+        # COMMITTED, not "positions". This line read `positions=0/3` with three
+        # working orders resting on the book, so the display an operator checks
+        # before deciding the gate is fine corroborated the wrong number. An
+        # unreadable book shows `?` rather than a total it cannot stand behind.
+        total = f"{held + len(working)}" if measured else f"{held}+?"
+        breakdown = f" ({held} open, {len(working)} working)" if measured else ""
         return (
-            f"risk_pct={r.risk_pct:.2%}  positions={n}/{r.max_positions}\n"
+            f"risk_pct={r.risk_pct:.2%}  "
+            f"committed={total}/{r.max_positions}{breakdown}\n"
             f"daily_loss={daily_loss:.2f}/{daily_cap:.2f}  "
             f"drawdown={dd:.2f}/{dd_cap:.2f}\n"
             f"equity={acct.equity:.2f} peak={snap.peak_equity:.2f} "

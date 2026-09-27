@@ -73,6 +73,7 @@ def _gate(rm: RiskManager, account: Account, signal: Signal | None = None, spec=
         spec=spec,
         tick=Tick(time=0, bid=1.0999, ask=1.1001),
         positions=[],
+        orders=[],
         now=WED_NOON,
         manual=True,
     )
