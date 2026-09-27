@@ -79,6 +79,7 @@ def _gate(rm: RiskManager, equity: float, now: datetime = DAY1):
         spec=default_spec("EURUSD"),
         tick=Tick(time=0, bid=1.0999, ask=1.1001),
         positions=[],
+        orders=[],
         now=now,
     )
 
