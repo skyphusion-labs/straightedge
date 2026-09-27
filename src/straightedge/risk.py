@@ -36,6 +36,7 @@ from __future__ import annotations
 import functools
 import math
 import os
+from collections.abc import Sequence
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -43,6 +44,7 @@ from straightedge.config import BotConfig, SessionConfig
 from straightedge.currencies import CURRENCY_CODES
 from straightedge.models import (
     Account,
+    PendingOrder,
     EquitySnapshot,
     Position,
     RiskDecision,
@@ -178,8 +180,15 @@ class UnclassifiedSymbol(ValueError):
     in issue #10, and so caller/classifier divergence fails loudly.
     """
 
-def currency_exposure(positions: list[Position], extra: tuple[str, Side] | None = None) -> dict[str, int]:
-    """Net count of positions touching each currency. Buy EURUSD: +EUR, -USD.
+def currency_exposure(
+    positions: Sequence[Position | PendingOrder],
+    extra: tuple[str, Side] | None = None,
+) -> dict[str, int]:
+    """Net count of COMMITMENTS touching each currency. Buy EURUSD: +EUR, -USD.
+
+    Takes working orders as well as positions. Only `symbol` and `side` are read,
+    which both carry, and a resting order commits the same legs a filled one
+    does. The parameter keeps its name because callers pass it positionally.
 
     One bucket per code and no other kind of bucket, so a crypto leg, a metal
     leg and a fiat leg land in the same place: buy BTCUSD and the USD leg is
@@ -517,6 +526,7 @@ class RiskManager:
         spec: SymbolSpec,
         tick: Tick,
         positions: list[Position],
+        orders: Sequence[PendingOrder],
         now: datetime,
         manual: bool = False,
     ) -> RiskDecision:
@@ -532,7 +542,17 @@ class RiskManager:
             return RiskDecision(allowed=False, reason="outside_session")
 
         ours = [p for p in positions if p.magic == r.magic]
-        if len(ours) >= r.max_positions:
+        # A WORKING ORDER IS COMMITTED EXPOSURE. It is not a hypothesis: it rests
+        # at the broker and becomes a position without anyone being asked again,
+        # so every gate that counts commitments has to count it. Reproduced
+        # before this: four buy limits on one symbol, all accepted, 2% of equity
+        # committed and past max_positions, because none had left a Position yet.
+        #
+        # `orders` has no default on purpose. A new caller that forgets it gets a
+        # TypeError rather than the old fail-OPEN behaviour.
+        ours_orders = [o for o in orders if o.magic == r.magic]
+        committed: list[Position | PendingOrder] = [*ours, *ours_orders]
+        if len(committed) >= r.max_positions:
             return RiskDecision(allowed=False, reason="max_positions")
         # Before sizing and before the spec gates: this is a budget on ACTIONS,
         # not on the market, so nothing about the instrument can change it.
@@ -540,14 +560,14 @@ class RiskManager:
         # churn that gets there.
         if r.max_trades_per_day and self.snapshot.trades_today >= r.max_trades_per_day:
             return RiskDecision(allowed=False, reason="max_trades_per_day")
-        if any(p.symbol == signal.symbol for p in ours):
+        if any(x.symbol == signal.symbol for x in committed):
             return RiskDecision(allowed=False, reason="already_in_symbol")
 
         staged_fx = classify_symbol(signal.symbol) == SYMBOL_FX
-        fx_ours = [p for p in ours if classify_symbol(p.symbol) == SYMBOL_FX]
+        fx_ours = [x for x in committed if classify_symbol(x.symbol) == SYMBOL_FX]
         excluded = tuple(
             ([] if staged_fx else [signal.symbol])
-            + [p.symbol for p in ours if classify_symbol(p.symbol) != SYMBOL_FX]
+            + [x.symbol for x in committed if classify_symbol(x.symbol) != SYMBOL_FX]
         )
         extra = (signal.symbol, signal.side) if staged_fx else None
         try:

@@ -79,6 +79,7 @@ def _evaluate(tmp_path, staged: str, positions: list[Position], **risk):
         spec=default_spec(staged),
         tick=Tick(time=0, bid=1.0999, ask=1.1001),
         positions=positions,
+        orders=[],
         now=_now(),
     )
 

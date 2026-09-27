@@ -169,6 +169,7 @@ def _gate(rm: RiskManager, **kw):
         spec=kw.get("spec", default_spec("EURUSD")),
         tick=kw.get("tick", _tick()),
         positions=kw.get("positions", []),
+        orders=kw.get("orders", []),
         now=kw.get("now", WED_NOON),
         manual=kw.get("manual", True),
     )
