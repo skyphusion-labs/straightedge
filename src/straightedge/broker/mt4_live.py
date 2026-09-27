@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from straightedge.constants import (
+    MT4_SEND_TIMEOUT_UNKNOWN,
     EA_CLAIM_RETRY_MS,
     EA_LADDER_SLEEP_MS,
     MAILBOX_ROUND_TRIP_CEILING_MS,
@@ -1050,11 +1051,26 @@ class Mt4Broker:
             return replace(unknown, survivor_ticket=None)
         ok = _truthy(d.get("ok"))
         raw = int(d.get("retcode", 0) or 0)
+        reported = str(d.get("error") or "")
         if ok:
             if raw in {TRADE_RETCODE_DONE, TRADE_RETCODE_PLACED}:
                 code = raw
             else:
                 code = TRADE_RETCODE_PLACED if placed else TRADE_RETCODE_DONE
+        elif reported == MT4_SEND_TIMEOUT_UNKNOWN:
+            # ERR_TRADE_TIMEOUT. The Expert put the request on the wire, the
+            # reply was lost, and it looked on the book and could not find the
+            # order. That is COULD NOT MEASURE, not a rejection: `_MT4_RET` has
+            # no entry for 128, so the fallback below would make it
+            # TRADE_RETCODE_REJECT, and a rejection is a VERDICT that closes the
+            # desk's in-flight entry and tells the operator the venue refused an
+            # order that may be filling.
+            #
+            # Keyed on the TOKEN, never on the bare code 128: an Expert older
+            # than this contract reports a timeout as a plain `OrderSend`
+            # failure, and it has already re-sent by then. Those are different
+            # facts and only the new Expert can promise this one.
+            code = RETCODE_UNKNOWN
         elif raw == 0:
             # A failure carrying no MT4 error. The Expert destroyed the reason:
             # GetLastError() clears the register on read, so a second read for
