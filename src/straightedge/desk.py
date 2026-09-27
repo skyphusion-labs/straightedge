@@ -436,7 +436,20 @@ class Desk:
                 "the terminal, then /cancel and re-stage if nothing moved."
             )
         result = self._submit_once(sig, decision.volume, pending)
-        if result is None:
+        # `None` is a send that RAISED; an unmeasured result is a send that
+        # RETURNED without a verdict. Both mean the same thing about the money,
+        # so both take this path. Letting the second one fall through to the
+        # branch below reported "send failed retcode=-1" -- telling the operator
+        # the venue rejected an order that may be filling, which is the exact
+        # substitution the comment above this method's `_already_attempted`
+        # branch says must never happen. The pending is NOT cleared here: the key
+        # is what makes the next `/confirm` refusable.
+        if result is not None and not result.transmitted:
+            # The engine declined to transmit (its own duplicate control, which
+            # covers callers this branch does not). Nothing left the process, so
+            # it gets the refusal's words and not a lost reply's.
+            return f"refused: {result.comment}"
+        if result is None or not result.measured:
             return (
                 f"send unresolved: no verdict came back for {pending.client_id}. "
                 "It may already be on the book. Check /positions and the terminal; "
@@ -612,7 +625,9 @@ class Desk:
                 "on the book. Check /positions and the terminal."
             )
         result = self._submit_once(sig, decision.volume, pending)
-        if result is None:
+        if result is not None and not result.transmitted:
+            return f"closed #{ticket}; refused: {result.comment}"
+        if result is None or not result.measured:
             return (
                 f"closed #{ticket}; send unresolved: no verdict came back for "
                 f"{pending.client_id}. The replacement may be on the book. Check "
