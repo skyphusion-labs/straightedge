@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 import time
 from datetime import datetime, timezone
@@ -50,6 +51,36 @@ def _pending_label(order: PendingOrder) -> str:
     if suffix:
         return f"{order.side.value.upper()}_{suffix}"
     return order.side.value
+
+
+#: A stop modification refused on an OPEN position.
+#:
+#: Deliberately NOT the sizing refusal (spelled size-exceeds-risk here, with
+#: hyphens, because `tests/test_refusal_reasons.py` counts occurrences of that
+#: exact token per module and a mention in a comment counts). That reason names a
+#: SEND the sizer produced and has exactly one live site; an operator who typed
+#: `/sl` and was handed it would go looking for a sizing problem that is not
+#: there. Two words here rather than one, because removing a stop and widening
+#: one past the cap are different acts with different fixes.
+STOP_REMOVAL_REFUSED = "stop_removal_refused"
+STOP_EXCEEDS_RISK = "stop_exceeds_risk"
+
+
+def _loss_distance(pos: Position, sl: float) -> float:
+    """How far `sl` sits on the LOSING side of the entry. Negative past breakeven.
+
+    `abs(price_open - sl)` is the obvious form and it is WRONG, because it is not
+    monotonic in risk: as a long's stop rises toward the entry the distance
+    shrinks and so does the risk, but once the stop passes the entry the distance
+    grows again while the risk has become locked-in PROFIT. An abs() comparison
+    therefore reads a breakeven-plus trail as a widening. Measured: it refused
+    `/trail` on a winning position (`test_trail_on_manages_without_auto_entries`).
+
+    Signed, so one comparison covers tightening, breakeven and beyond.
+    """
+    if pos.side.value == "buy":
+        return pos.price_open - sl
+    return sl - pos.price_open
 
 
 class Engine:
@@ -472,9 +503,109 @@ class Engine:
         )
         return result
 
+    def _stop_guard(self, pos: Position, sl: float) -> str:
+        """Whether this stop may be applied to an OPEN position. "" means yes.
+
+        ASYMMETRIC by design, and that is the whole of it. A change that REDUCES
+        worst-case loss always passes, including when the circuit has tripped and
+        the desk is halted, because an operator must never be prevented from
+        tightening a stop on a live position and that is exactly the moment they
+        most need to. Only an INCREASE is measured against the cap.
+
+        The three arms are in this order for a reason each:
+
+        1. An ALREADY-UNPROTECTED position cannot be made worse from here. Any
+           real stop is a reduction from unbounded to bounded, so a cap must
+           never stand between an operator and protecting a live position. It
+           also keeps `set_tp`, which passes `pos.sl` straight through, working
+           on a position that has no stop.
+        2. `sl <= 0` on a PROTECTED position REMOVES the protection. `/sl` sets a
+           stop to a price and 0 is not a price, it is the venue encoding for "no
+           stop". `_modify_pending` has always refused this for working orders,
+           so the position path was the inconsistent one and this aligns them
+           rather than inventing policy.
+        3. Anything NOT WIDER than what is already there is a tightening. It is
+           decided on raw DISTANCES, which needs no `SymbolSpec` because both
+           distances are on the same instrument. That is what keeps `trail`,
+           `breakeven` and the strategy `manage()` off the broker-read path: they
+           only ever tighten, and on MT4 a `symbol()` call is a mailbox round
+           trip that would then be paid on every managed position every step.
+
+        Only a genuine widening pays for the spec and the account read.
+        """
+        # FIRST, before the unprotected-position arm. NaN is not a price and it
+        # is not caught by any comparison below: every IEEE-754 comparison
+        # against NaN is False, so `sl <= 0`, `proposed <= 0`, the tighten
+        # comparison and the cap test ALL fall through and the guard returns "".
+        # `float("nan")` succeeds, so `/sl <ticket> nan` reached the broker and
+        # the desk answered `sl #1 -> nan`, which reads as success. `+inf` fell
+        # through the breakeven arm the same way (price_open - inf is -inf).
+        # Measured: an unstopped long ran to -$58,058 on a $10,000 account.
+        # This arm has to precede arm 1 because on an UNPROTECTED position arm 1
+        # returns "" and would wave NaN straight through.
+        if not math.isfinite(sl):
+            return STOP_REMOVAL_REFUSED
+        if pos.sl <= 0:
+            return ""
+        if sl <= 0:
+            return STOP_REMOVAL_REFUSED
+        proposed = _loss_distance(pos, sl)
+        # At or beyond breakeven there is no loss left to bound, so nothing about
+        # a cap applies. This arm has to come BEFORE the comparison: past
+        # breakeven `money_per_lot_at_stop` still reports a positive number,
+        # because `ticks_between` is unsigned.
+        if proposed <= 0:
+            return ""
+        if proposed <= _loss_distance(pos, pos.sl) + 1e-12:
+            return ""
+        spec = self.broker.symbol(pos.symbol)
+        # Fail CLOSED before the arithmetic, exactly as `risk.evaluate` does at
+        # its own spec read. This gate needs points, and `ticks_between` returns
+        # 0.0 when `trade_tick_size or point` is <= 0, so an unmeasured spec
+        # makes `worst` 0.0 and `0.0 > min(per_trade, loss_room)` False: every
+        # widening passed. The arithmetic here was copied from `risk.evaluate`
+        # and the precondition was left behind, which is how a correct rule
+        # becomes a fail-open. `models.SymbolSpec.points` states the invariant
+        # that every gate needing points runs after this refusal, and CLAUDE.md
+        # states the rule: unmeasured specs refuse, they never default.
+        #
+        # The asymmetry survives: a tightening returns above without ever
+        # reaching this read, so a stop can still be tightened on a symbol whose
+        # specs the broker has not streamed. Only a WIDENING refuses.
+        not_measured = spec.unmeasured_for_sizing()
+        if not_measured:
+            return "spec_not_measured:" + ",".join(sorted(not_measured))
+        account = self.broker.account()
+        r = self.cfg.risk
+        worst = money_per_lot_at_stop(pos.price_open, sl, spec) * pos.volume
+        per_trade = account.equity * r.risk_pct * r.max_risk_multiple
+        # The same pair `risk.evaluate` measures a NEW order against. Carrying
+        # the loss-room term here is what makes a spent daily budget refuse a
+        # widening by arithmetic alone rather than by a second circuit check: once
+        # the budget is gone `loss_room` is negative, so no wider stop fits.
+        # (`replace_pending` uses only the per-trade half; that gap is filed
+        # separately and is not widened by matching the stricter form here.)
+        if worst > min(per_trade, self.risk.loss_room(account)) + 1e-6:
+            return STOP_EXCEEDS_RISK
+        return ""
+
     def _modify(self, pos: Position, sl: float, tp: float) -> OrderResult:
         if abs(sl - pos.sl) < 1e-12 and abs((tp or 0) - (pos.tp or 0)) < 1e-12:
             return OrderResult.unchanged()
+        reason = self._stop_guard(pos, sl)
+        if reason:
+            # Journaled with BOTH stops, because "refused" is only auditable
+            # next to what was already on the position.
+            self.journal.write(
+                "modify_refused",
+                ticket=pos.ticket,
+                symbol=pos.symbol,
+                sl=sl,
+                tp=tp,
+                current_sl=pos.sl,
+                reason=reason,
+            )
+            return OrderResult.invalid_stops(reason)
         result = self.broker.modify_position(pos.ticket, sl, tp, symbol=pos.symbol)
         self.journal.write(
             "modify",
