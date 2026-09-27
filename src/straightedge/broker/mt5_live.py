@@ -11,6 +11,7 @@ from typing import Any
 
 from straightedge.constants import (
     FILLING_RETRY_ORDER,
+    IDEMPOTENT_TRADE_ACTIONS,
     ORDER_TIME_GTC,
     ORDER_TYPE_BUY,
     ORDER_TYPE_SELL,
@@ -199,6 +200,19 @@ class Mt5Broker:
         return "ipc" in desc.lower()
 
     def _with_reconnect(self, call: Any, what: str) -> Any:
+        """Call; on a dead link, reconnect and call ONCE more.
+
+        READS ONLY, plus the idempotent trade actions. The retry is sound only
+        where repeating the call is free: a read, or an action that states a
+        TARGET (`IDEMPOTENT_TRADE_ACTIONS`) and so leaves the same book when it
+        arrives twice.
+
+        It is NOT sound for an order that creates or consumes volume. A falsy
+        result means the REPLY is missing; it never means the request failed to
+        arrive, and no reading of `last_error()` can recover which side of the
+        request the link died on. Calling again there is how 0.55 lots becomes
+        1.10. Those go through `_send_once`.
+        """
         result = call()
         if result is not None and not self._ipc_error():
             return result
@@ -494,18 +508,50 @@ class Mt5Broker:
     def order_check(self, request: dict) -> OrderResult:
         return self._result(self._mt5.order_check(request), request)
 
+    def _send_once(self, request: dict) -> Any:
+        """Put a non-idempotent request on the wire EXACTLY once.
+
+        The link is proved up BEFORE the send and never after, and that ordering
+        is the entire mechanism. `ensure_connected` is a read, so moving the
+        reconnect ahead of the request costs nothing and puts it on the only
+        side where a reconnect carries no risk. It narrows the window; it cannot
+        close it, and nothing can.
+
+        Once the request has left, a missing reply is an OPEN QUESTION, and this
+        adapter's job is to report it as one rather than resolve it by guessing.
+        `_result` turns the absent reply into `OrderResult.unknown`, which is
+        `measured` False and carries no retcode a caller can retry on.
+
+        A failure to reconnect propagates unchanged: nothing was sent, and the
+        engine's send-exception path already keeps the in-flight entry open.
+        """
+        self.ensure_connected()
+        return self._mt5.order_send(request)
+
     def order_send(self, request: dict) -> OrderResult:
-        raw = self._with_reconnect(lambda: self._mt5.order_send(request), "order_send")
+        action = int(request.get("action", 0) or 0)
+        if action in IDEMPOTENT_TRADE_ACTIONS:
+            raw = self._with_reconnect(
+                lambda: self._mt5.order_send(request), "order_send"
+            )
+        else:
+            raw = self._send_once(request)
         result = self._result(raw, request)
         if result.retcode != TRADE_RETCODE_INVALID_FILL:
             return result
+        # INVALID_FILL is a CONCLUSIVE rejection: the server refused the request
+        # over its filling policy and placed nothing, so re-sending under a
+        # different policy is this order's next attempt, not a second order.
+        # An unmeasured result cannot reach this loop, because RETCODE_UNKNOWN is
+        # not INVALID_FILL and returned above -- which is what keeps the one
+        # retry in this method off the ambiguous path.
         tried = {request.get("type_filling")}
         for filling in FILLING_RETRY_ORDER:
             if filling in tried:
                 continue
             retry = dict(request)
             retry["type_filling"] = filling
-            result = self._result(self._mt5.order_send(retry), retry)
+            result = self._result(self._send_once(retry), retry)
             if result.retcode in RETCODE_OK or result.retcode != TRADE_RETCODE_INVALID_FILL:
                 return result
             tried.add(filling)
