@@ -10,7 +10,7 @@ from straightedge.inflight import new_key
 from straightedge.journal import redact_text
 from straightedge.llm import Advice, Advisor
 from straightedge.models import OrderResult, Signal, SignalKind
-from straightedge.telegram import HELP, TgCommand
+from straightedge.telegram import HELP, NOT_ADVICE, TgCommand
 
 
 @dataclass
@@ -830,7 +830,19 @@ class Desk:
             ticket=advice.ticket,
             staged=staged,
         )
-        return "\n".join(x for x in lines if x)
+        # Unconditional, and deliberately not a branch. The alternative was to
+        # skip it when the reply is not really advice ("no AI key", a provider
+        # error), but a branch that decides when a disclaimer is unnecessary is
+        # the thing that later drops it from a reply that needed it. One line
+        # on every reply out of this method cannot be wrong in that direction.
+        #
+        # NOT on `_stage`, which `/buy` and `/sell` also reach: the operator
+        # who typed those chose the instrument and the direction themselves,
+        # nothing advised them, and a not-advice line on a trade nobody
+        # proposed is noise that teaches a reader to skip the line. An
+        # advice-staged order is already inside this reply and so already
+        # carries it.
+        return "\n".join([NOT_ADVICE, *(x for x in lines if x)])
 
     def _model(self, args: str) -> str:
         if self.advisor is None:
