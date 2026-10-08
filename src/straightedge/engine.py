@@ -163,6 +163,20 @@ class Engine:
         self._hb_last_mono: float | None = None
         self._hb_gap_max_s = 0.0
         self._hb_over_warned = False
+        #: This process's identity, published in the heartbeat so that a
+        #: supervised restart is observable from OUTSIDE the process. Assigned
+        #: in __init__ and never reassigned: a desk that re-read its own config
+        #: and kept running is the same desk, and only a new process is a
+        #: restart.
+        #:
+        #: Why it is needed at all. Before this field, the only trace a restart
+        #: left in the heartbeat was the arming state falling back to
+        #: `live_not_accepted`, and that is visible ONLY on a real-money desk.
+        #: On a demo account nothing needs arming, so every field read
+        #: identically either side of a crash and `watch` had nothing to
+        #: compare: see straightedge#133 requirement 3.
+        self._hb_run_id = watchdog.new_run_id()
+        self._hb_started_at = self.now_fn()
         self.telegram = telegram
         if self.telegram is not None and self.telegram.audit_fn is None:
             self.telegram.audit_fn = self._audit_telegram
@@ -1892,6 +1906,8 @@ class Engine:
                 stale_after_s=watchdog.stale_after_seconds(self.cfg),
                 tick_budget_s=budget,
                 tick_gap_max_s=self._hb_gap_max_s,
+                run_id=self._hb_run_id,
+                started_at=self._hb_started_at.isoformat(),
             ),
             encoding="utf-8",
         )

@@ -1,0 +1,66 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  straightedge-watch: the task that watches the desk.
+
+  This is the half that was never deployed. src/straightedge/watchdog.py landed
+  in PR#80 and reads journal.heartbeat; measured on the live box 2026-10-08, no
+  task ran it, so the reader existed and nothing read.
+
+  Read deploy/windows/README.md before changing anything in this file.
+
+  Replace every REPLACE_ME before registering. Leave the tokens in the
+  committed copy; tests/test_supervision.py asserts they are still here.
+-->
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Description>straightedge watch: reads journal.heartbeat and tells the locked Telegram chat when the desk is not ticking, is not armed, or has restarted. A desk cannot report its own death. See deploy/windows/README.md.</Description>
+    <URI>\straightedge-watch</URI>
+  </RegistrationInfo>
+  <Triggers>
+    <LogonTrigger>
+      <Enabled>true</Enabled>
+      <UserId>REPLACE_ME</UserId>
+    </LogonTrigger>
+    <TimeTrigger>
+      <Repetition>
+        <Interval>PT5M</Interval>
+        <StopAtDurationEnd>false</StopAtDurationEnd>
+      </Repetition>
+      <StartBoundary>2026-01-01T00:00:00</StartBoundary>
+      <Enabled>true</Enabled>
+    </TimeTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <UserId>REPLACE_ME</UserId>
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>LeastPrivilege</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
+    <IdleSettings>
+      <StopOnIdleEnd>false</StopOnIdleEnd>
+      <RestartOnIdle>false</RestartOnIdle>
+    </IdleSettings>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>true</Enabled>
+    <Hidden>false</Hidden>
+    <RunOnlyIfIdle>false</RunOnlyIfIdle>
+    <WakeToRun>false</WakeToRun>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <Priority>7</Priority>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>C:\REPLACE_ME\python.exe</Command>
+      <Arguments>-m straightedge --config C:\REPLACE_ME\config.toml watch --loop --ok-every 3600</Arguments>
+      <WorkingDirectory>C:\REPLACE_ME</WorkingDirectory>
+    </Exec>
+  </Actions>
+</Task>

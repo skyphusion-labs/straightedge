@@ -87,6 +87,7 @@ control.
 from __future__ import annotations
 
 import math
+import secrets
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -98,6 +99,12 @@ from straightedge.telegram import POLL_TIMEOUT_MARGIN_S, RETRY_CAP_S, RETRY_TRIE
 
 #: Named so the desk and the watcher cannot disagree about where the file is.
 HEARTBEAT_SUFFIX = ".heartbeat"
+
+#: Bytes of process identity. 4 is 32 bits, and the only question asked of a
+#: run_id is "is this the same string as last time", over a handful of
+#: observations minutes apart. A collision would mean one restart went
+#: unreported; the staleness path still covers a desk that is actually down.
+RUN_ID_BYTES = 4
 
 #: `step_all` reaches `_write_heartbeat` through `ensure_connected()` then
 #: `account()`. Two venue commands, each on the per-command budget.
@@ -112,6 +119,10 @@ STATE_NOT_TRADING = "ALIVE NOT TRADING"
 STATE_STALE = "STALE"
 STATE_UNKNOWN = "UNKNOWN"
 
+#: Printed where a run_id should be. A literal in the message would read as a
+#: value the desk published.
+_UNKNOWN_RUN = "unknown"
+
 #: Exit codes. Distinct per state on purpose: a scheduled task, a batch file or
 #: a human can branch on the state without parsing prose, and collapsing
 #: "ticking but disarmed" into either 0 or 1 is the conflation this module
@@ -120,6 +131,17 @@ EXIT_ARMED = 0
 EXIT_NOT_TRADING = 3
 EXIT_STALE = 4
 EXIT_UNKNOWN = 5
+
+
+def new_run_id() -> str:
+    """One identity per desk process.
+
+    Not the PID. A PID is recycled by the operating system, so two different
+    desks can carry the same one and a restart would read as continuity. Not
+    the start timestamp either: a restart inside the clock's own resolution
+    would collapse, and the comparison has to be exact to be worth making.
+    """
+    return secrets.token_hex(RUN_ID_BYTES)
 
 
 def heartbeat_path_for(journal_path: str | Path) -> Path:
@@ -188,6 +210,8 @@ def render(
     stale_after_s: int,
     tick_budget_s: int,
     tick_gap_max_s: float,
+    run_id: str,
+    started_at: str,
 ) -> str:
     """The heartbeat file's whole content.
 
@@ -195,6 +219,16 @@ def render(
     and every reader that predates this module keeps working, and the fields
     that follow are `key=value`, one per line, in the same shape as the MT4
     mailbox wire. `docs/CONTRACT.md` carries the format.
+
+    `run_id` is what makes a restart visible, and it is here rather than a PID
+    because a PID is recycled and a restart has to be unambiguous. The gap it
+    closes: a supervised restart only announced itself through the arming state
+    going to `live_not_accepted`, which is a change this file can show ONLY on a
+    real-money desk. On the demo account (`trade_mode=0`) no arming is needed,
+    so `blocked` was empty before the crash and empty after it, every other
+    field read the same, and the restart was invisible in the one configuration
+    the end user is being shown. A crash loop was therefore silent exactly where
+    it was most likely to be watched.
     """
     over = 1 if tick_gap_max_s > tick_budget_s else 0
     lines = [
@@ -205,6 +239,8 @@ def render(
         f"tick_budget_s={int(tick_budget_s)}",
         f"tick_gap_max_s={tick_gap_max_s:.1f}",
         f"over_budget={over}",
+        f"run_id={run_id}",
+        f"started_at={started_at}",
     ]
     return "\n".join(lines) + "\n"
 
@@ -265,6 +301,12 @@ class Report:
     #: The threshold this observation was judged against, so the caller can
     #: re-tell a persisting bad state on the same timescale the desk set.
     stale_after_s: float
+    #: The desk process that wrote the heartbeat. Empty when the desk predates
+    #: this field, which is NOT the same as unchanged: see `watch`.
+    run_id: str = ""
+    #: When that process started, verbatim from the file. Reported, never
+    #: compared: `run_id` is the identity and this is the human-readable part.
+    started_at: str = ""
 
     @property
     def key(self) -> tuple[str, str]:
@@ -374,6 +416,16 @@ def decide(path: str | Path, *, now: datetime, cfg: Any = None) -> Report:
                 f"the desk published {stale_after}s. Two different configs are "
                 "in play; the desk's number is the one used here."
             )
+    run_id = hb.fields.get("run_id", "")
+    started_at = hb.fields.get("started_at", "")
+    if not run_id:
+        notes.append(
+            "NOTE: this desk publishes no run_id, so a restart that does not "
+            "change the arming state cannot be seen from the heartbeat. On a "
+            "demo account that is EVERY restart. Upgrade the desk; until then "
+            "this watcher can report that the desk is ticking and cannot "
+            "report that it is the same desk."
+        )
     if hb.fields.get("over_budget") == "1":
         notes.append(
             "NOTE: the desk has observed a gap between ticks longer than its "
@@ -388,6 +440,8 @@ def decide(path: str | Path, *, now: datetime, cfg: Any = None) -> Report:
             exit_code=EXIT_STALE,
             next_sleep_s=float(stale_after),
             stale_after_s=float(stale_after),
+            run_id=run_id,
+            started_at=started_at,
             text="\n".join(
                 [
                     f"straightedge {STATE_STALE}: no completed tick for "
@@ -421,6 +475,8 @@ def decide(path: str | Path, *, now: datetime, cfg: Any = None) -> Report:
             exit_code=EXIT_NOT_TRADING,
             next_sleep_s=next_sleep,
             stale_after_s=float(stale_after),
+            run_id=run_id,
+            started_at=started_at,
             text="\n".join(
                 [
                     f"straightedge {STATE_NOT_TRADING}: ticking, and it will "
@@ -437,11 +493,92 @@ def decide(path: str | Path, *, now: datetime, cfg: Any = None) -> Report:
         exit_code=EXIT_ARMED,
         next_sleep_s=next_sleep,
         stale_after_s=float(stale_after),
+        run_id=run_id,
+        started_at=started_at,
         text="\n".join(
             [f"straightedge {STATE_ARMED}: ticking, and the circuit is clear", detail]
             + notes
         ),
     )
+
+
+def _started_at_utc(text: str) -> datetime | None:
+    """A heartbeat `started_at` as an aware datetime, or None if it is not one.
+
+    ONE copy, used by the loop and by the message it composes. Two copies of a
+    parse are two places for a naive stamp to be read differently, and the one
+    that mattered here is the comparison behind the crash-loop claim: a stamp
+    read as local time on one side and UTC on the other would invent or erase
+    hours of apparent uptime. Naive reads as UTC and never as local, the same
+    rule `read` already applies to line one of the file.
+    """
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def restart_text(
+    *,
+    previous_run_id: str,
+    previous_started_at: datetime | None,
+    report: Report,
+    restarts: int,
+    watching_since: datetime,
+) -> str:
+    """Announce that the desk is a NEW process, and say if it is looping.
+
+    Requirement 3 of straightedge#133 in Conrad's terms: a supervisor that
+    quietly papers over repeated crashes converts a loud failure into a slow
+    one. So the count is in the message. One restart overnight is information;
+    the same line with `restart 46` is a different fact entirely, and an
+    operator should not have to scroll a chat to tell them apart.
+
+    The crash-loop claim is deliberately conservative. The elapsed time between
+    two processes' `started_at` stamps is the previous run's lifetime PLUS
+    however long the box took to restart it, so it is an UPPER BOUND on how long
+    that desk lived. Calling a loop only when even the upper bound is under the
+    staleness threshold means this line can be believed; the quiet case is a
+    restart that is reported without the loop claim, never a loop reported as a
+    restart.
+    """
+    head = (
+        f"straightedge RESTARTED: this is a new desk process (restart "
+        f"{restarts} seen by this watcher since {watching_since.isoformat()})"
+    )
+    lines = [head]
+    if report.started_at:
+        lines.append(f"this run started {report.started_at}")
+    this_started = _started_at_utc(report.started_at)
+    if previous_started_at is not None and this_started is not None:
+        lived = (this_started - previous_started_at).total_seconds()
+        # Negative means the clock moved backwards between the two processes,
+        # which says nothing about how long the previous one lived, so no claim
+        # is made. A desk with a wrong clock is already alarmed by `_age_seconds`
+        # taking the worse of the stamp and the filesystem.
+        if 0 <= lived < report.stale_after_s:
+            lines.append(
+                f"the previous run lasted at most {lived:.0f}s, under the "
+                f"{report.stale_after_s:.0f}s staleness threshold. That is a "
+                "CRASH LOOP, not a restart: the box is starting a desk that "
+                "cannot stay up. Read desk stderr and the journal; a desk "
+                "whose start() raises never reaches Telegram on its own."
+            )
+    lines.append(
+        f"previous run_id {previous_run_id or _UNKNOWN_RUN}, this run_id "
+        f"{report.run_id}"
+    )
+    lines.append(
+        "Arming is per process and never survives a restart (fc34). A "
+        "real-money desk is back DISARMED until a human sends "
+        "/live on I-ACCEPT-RISK."
+    )
+    return "\n".join(lines)
 
 
 def watch(
@@ -476,6 +613,14 @@ def watch(
     last_key: tuple[str, str] | None = None
     last_told: datetime | None = None
     last_ok_beat: datetime | None = None
+    #: Process identity of the last heartbeat this watcher saw. Only ever
+    #: assigned from a NON-EMPTY run_id: a desk that publishes none must not
+    #: look like a desk that restarted, and must not clear the identity of one
+    #: that did.
+    last_run_id = ""
+    last_started_at: datetime | None = None
+    restarts = 0
+    watching_since: datetime | None = None
     checks = 0
     while True:
         # One clock for the verdict AND for the cadence. `time.monotonic` would
@@ -487,6 +632,14 @@ def watch(
         now = clock()
         report = decide(path, now=now, cfg=cfg)
         checks += 1
+        if watching_since is None:
+            watching_since = now
+        # A restart needs TWO observed identities. A first sighting is not a
+        # restart, and neither is an empty run_id from a desk that predates the
+        # field: `decide` already notes that case rather than inferring from it.
+        restarted = bool(report.run_id) and bool(last_run_id) and report.run_id != last_run_id
+        if restarted:
+            restarts += 1
         changed = report.key != last_key
         repeat_due = (
             not report.ok
@@ -497,10 +650,29 @@ def watch(
             last_ok_beat is None
             or (now - last_ok_beat).total_seconds() >= float(ok_every)
         )
-        tell = changed or repeat_due or (report.ok and ok_beat_due)
+        # A restart ALWAYS tells, whatever the state. That is the whole fix:
+        # ARMED -> ARMED across a new process is not a change of state and was
+        # silent, which is every restart of a demo desk.
+        tell = changed or restarted or repeat_due or (report.ok and ok_beat_due)
+        text = report.text
+        if restarted:
+            text = (
+                restart_text(
+                    previous_run_id=last_run_id,
+                    previous_started_at=last_started_at,
+                    report=report,
+                    restarts=restarts,
+                    watching_since=watching_since,
+                )
+                + "\n"
+                + report.text
+            )
+        if report.run_id:
+            last_run_id = report.run_id
+            last_started_at = _started_at_utc(report.started_at)
         if tell:
-            emit(report.text)
-            if send is not None and not send(report.text):
+            emit(text)
+            if send is not None and not send(text):
                 emit(
                     "watch: the Telegram send FAILED, so this alert reached "
                     "stdout only. Nothing on this host can page you while "

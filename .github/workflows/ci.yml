@@ -32,6 +32,68 @@ jobs:
       - run: pytest -q -rs --override-ini addopts=
       - run: python -m straightedge doctor
 
+  # The pytest suite audits the DECLARED task XML on every platform, which
+  # proves the declaration satisfies its own rule. It cannot prove that Task
+  # Scheduler accepts the file, and an XML this repo can parse but Windows
+  # rejects is a deploy artifact that fails for the first time on the live
+  # real-money box. So this job registers both declarations for real, dumps
+  # them back out of Task Scheduler, and audits the DUMP: the round trip is
+  # what makes the artifact trustworthy. It is also the only coverage the two
+  # PowerShell scripts get.
+  supervision-xml:
+    name: supervision-xml
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -e ".[dev]"
+      - name: register both declared tasks from their XML
+        shell: pwsh
+        run: |
+          $python = (Get-Command python).Source
+          .\deploy\windows\Install-Supervision.ps1 `
+            -PythonExe $python `
+            -ConfigPath "$PWD\config.example.toml" `
+            -WorkingDirectory "$PWD" `
+            -BackupDir "$PWD\tasks-before" `
+            -Confirm
+      - name: dump what Task Scheduler actually holds, and audit THAT
+        shell: pwsh
+        run: |
+          .\deploy\windows\Export-Tasks.ps1 -OutDir "$PWD\tasks"
+          # Every declared task must have produced a dump. An empty directory
+          # would audit as task_missing, which is a red this step would then
+          # be reporting as a schema problem.
+          foreach ($name in @("straightedge-desk", "straightedge-watch")) {
+            if (-not (Test-Path "$PWD\tasks\$name.xml")) {
+              throw "$name was registered and did not dump; the round trip is broken"
+            }
+          }
+          python -m straightedge --config config.example.toml supervision --tasks "$PWD\tasks"
+          if ($LASTEXITCODE -ne 0) { throw "the audit failed on a dump of the declarations this repo ships" }
+      - name: the audit can still go red on this runner
+        shell: pwsh
+        run: |
+          # The control of the control. A green audit above proves nothing
+          # unless the same command on the same runner can fail, so the desk
+          # task loses its repeating trigger and the audit must red.
+          Set-ScheduledTask -TaskName straightedge-desk -Trigger (New-ScheduledTaskTrigger -AtLogOn) | Out-Null
+          .\deploy\windows\Export-Tasks.ps1 -OutDir "$PWD\tasks-red"
+          python -m straightedge --config config.example.toml supervision --tasks "$PWD\tasks-red"
+          if ($LASTEXITCODE -eq 0) { throw "the audit passed a desk task with no repeating trigger, which is the measured 2026-10-08 defect" }
+          Write-Host "the audit went red on a logon-only desk task, as it must"
+      - name: unregister
+        if: always()
+        shell: pwsh
+        run: |
+          foreach ($name in @("straightedge-desk", "straightedge-watch")) {
+            Unregister-ScheduledTask -TaskName $name -Confirm:$false -ErrorAction SilentlyContinue
+          }
+
   lint:
     name: lint
     runs-on: ubuntu-latest
@@ -58,21 +120,23 @@ jobs:
   # is not the red this check exists to produce.
   ci:
     name: ci
-    needs: [ci-matrix, lint, agent, agent-test]
+    needs: [ci-matrix, lint, agent, agent-test, supervision-xml]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 2
     steps:
-      - name: require ci-matrix, lint, agent-typecheck and agent-test to have succeeded
+      - name: require every upstream job to have succeeded
         run: |
           echo "ci-matrix result: ${{ needs.ci-matrix.result }}"
           echo "lint result: ${{ needs.lint.result }}"
           echo "agent-typecheck result: ${{ needs.agent.result }}"
           echo "agent-test result: ${{ needs.agent-test.result }}"
+          echo "supervision-xml result: ${{ needs.supervision-xml.result }}"
           if [ "${{ needs.ci-matrix.result }}" != "success" ] || \
              [ "${{ needs.lint.result }}" != "success" ] || \
              [ "${{ needs.agent.result }}" != "success" ] || \
-             [ "${{ needs.agent-test.result }}" != "success" ]; then
+             [ "${{ needs.agent-test.result }}" != "success" ] || \
+             [ "${{ needs.supervision-xml.result }}" != "success" ]; then
             echo "an upstream job did not succeed; failing the required ci check"
             exit 1
           fi

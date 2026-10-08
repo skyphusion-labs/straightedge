@@ -255,7 +255,14 @@ The lock is released on exit or crash.
 Each `step_all` that reaches `account` writes `journal.heartbeat`.
 Line 1 is an ISO timestamp, and that has not changed since 1.0.0.
 After it, one `key=value` per line: `blocked=`, `mode=`, `stale_after_s=`,
-`tick_budget_s=`, `tick_gap_max_s=`, `over_budget=`.
+`tick_budget_s=`, `tick_gap_max_s=`, `over_budget=`, `run_id=`, `started_at=`.
+`run_id=` is one value per desk PROCESS, assigned at construction and never
+reassigned, and `started_at=` is when that process started.
+A reader compares `run_id` across observations to see a RESTART. It is not the
+PID, which the operating system recycles, and not the timestamp, which two
+restarts inside one clock tick would collapse.
+A reader that finds no `run_id` says so and reports that a restart cannot be
+observed from the file; it does NOT read the absence as continuity.
 `blocked=` is the reason `RiskManager.circuit_reason` gave for the same account
 at the same instant, and it is EMPTY when the desk would trade. It is not a
 second copy of the gate; it is the gate's own answer, so a heartbeat cannot
@@ -270,6 +277,13 @@ A failed reconnect does not.
 `straightedge watch` reads the file. It exits 0 for `ALIVE ARMED`, 3 for
 `ALIVE NOT TRADING` (with the gate named), 4 for `STALE`, and 5 for `UNKNOWN`.
 It never calls `getUpdates` and never takes `journal.lock`.
+`watch --loop` announces a RESTART whenever `run_id` changes, whatever the
+state, and carries a count so a crash loop is not one line. A restart is not a
+change of STATE: on a demo account nothing needs arming, so without `run_id`
+every field reads the same either side of a crash.
+It names a crash loop only when the time between two processes' `started_at`
+stamps, which is an upper bound on the previous run's life, is under
+`stale_after_s`.
 Before a journal write that would exceed 10 MiB, the live file is renamed to `<name>.1`.
 That replaces any previous `.1`.
 The new live file is chmod 0600.

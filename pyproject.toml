@@ -76,6 +76,13 @@ exclude_lines = [
 # SECOND process nobody else is watching. A branch in here that stops being
 # reached is a watchdog that has quietly stopped distinguishing two states.
 "src/straightedge/watchdog.py" = 99
+# 100% measured. This file is the audit of the supervision itself, and the
+# reason it exists is that a control which is never exercised reads exactly
+# like one that works: `docs/RUNBOOK.md` documented the right scheduled tasks
+# for weeks while the box had neither. Every check in here has a case that
+# drives it red, including the measured 2026-10-08 live state, and a branch
+# that stops being reached is a check that has stopped being able to go red.
+"src/straightedge/supervision.py" = 99
 
 [tool.ruff]
 target-version = "py312"
