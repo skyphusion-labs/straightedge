@@ -212,6 +212,7 @@ def render(
     tick_gap_max_s: float,
     run_id: str,
     started_at: str,
+    deployed: str,
 ) -> str:
     """The heartbeat file's whole content.
 
@@ -219,6 +220,12 @@ def render(
     and every reader that predates this module keeps working, and the fields
     that follow are `key=value`, one per line, in the same shape as the MT4
     mailbox wire. `docs/CONTRACT.md` carries the format.
+
+    `deployed` names what is RUNNING, written by the deploy and read by the
+    desk; see `straightedge.deployed`. It is in the heartbeat as well as in
+    `/status` because the two have different readers: `/status` answers a
+    person in the chat, and the heartbeat answers a process on the box, which
+    is what lets a deploy verify itself without going through Telegram.
 
     `run_id` is what makes a restart visible, and it is here rather than a PID
     because a PID is recycled and a restart has to be unambiguous. The gap it
@@ -241,6 +248,7 @@ def render(
         f"over_budget={over}",
         f"run_id={run_id}",
         f"started_at={started_at}",
+        f"deployed={deployed}",
     ]
     return "\n".join(lines) + "\n"
 
