@@ -59,15 +59,19 @@ on the Cloudflare account that runs the Worker. Files, from
 | --- | --- | --- |
 | `/workspace/snapshot.md` | The desk context from the latest turn. | Overwritten on every turn. |
 | `/workspace/history.json` | The journal tail from the latest turn. | Overwritten on every turn. |
-| `/workspace/log.md` | Every turn, appended: `## <UTC timestamp> user` and the question, then `## <timestamp> assistant` and the full reply. | **No cap, no rotation, no age limit, no delete route.** The Worker answers `GET /health` and `POST /ask` only (`agent/src/index.ts`). It grows for the life of the Durable Object, until the Worker's operator deletes that object. |
-| `/workspace/notes.md` | Whatever the model writes as durable notes. | Same as `log.md`. |
+| `/workspace/log.md` | Every turn, appended: `## <UTC timestamp> user` and the question, then `## <timestamp> assistant` and the full reply. | **Capped at the 40 most recent entries, within 32 KiB and 800 lines** (`agent/src/log-retention.ts`, straightedge#131). An entry is one role's message, so 40 is the same unit and the same number as the desk's own `llm.KEEP_TURNS`; the byte and line caps are the read tool's own limits, so the whole log fits in one read. Older entries are DELETED on the next turn and the drop is named on the file's first line with cumulative totals. There is still no delete route and no age limit: the Worker answers `GET /health` and `POST /ask` only (`agent/src/index.ts`), so a session's most recent 40 entries stay until the Worker's operator deletes that Durable Object. |
+| `/workspace/notes.md` | Whatever the model writes as durable notes. | **Not capped by us**, and unlike `log.md` nothing appends to it: the model rewrites it whole through the write tool. In practice it settles around the read window, because the model can only see 32 KiB of it to carry forward, and the edit tool refuses a file over that cap outright. No delete route, same as above. |
 
-So, with the agent, **every question you have ever asked and every reply you
-have ever received is kept, in full, on the Worker operator's account, with no
-expiry.** If that operator is the maintainer (the compose default), deleting it
+So, with the agent, **your most recent 40 messages are kept on the Worker
+operator's account, and everything older is deleted on the next turn.** That is
+a cap, not an expiry: a session that stops being used keeps its last 40 entries
+indefinitely, because there is no age limit and nothing runs when nobody asks.
+`notes.md` is whatever the model chose to keep, and that stays too.
+
+If that operator is the maintainer (the compose default), deleting what remains
 means asking the maintainer. If you run `agent/` yourself, you delete the
-Durable Object storage yourself. A retention cap for `log.md` would be a code
-change, and the issue that proposes one is linked from straightedge#91.
+Durable Object storage yourself. straightedge#131 decided the cap; a delete
+route and an age limit are still not implemented.
 
 **Inference from the agent.** The agent calls the gateway REST API with
 `cf-aig-collect-log-payload: false` (`desk-agent.ts`), which asks the gateway
