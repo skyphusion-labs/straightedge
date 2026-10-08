@@ -155,12 +155,14 @@ KEY_TERMINAL_PATH = 6
 #: are not one number.
 KEY_TIMEOUT_MS = 122
 #: the official Windows pip package, named in the extra, the adapter import, the doctor
-#: advice and the mypy override.
-METATRADER5 = 21
+#: advice and the mypy override, plus four sites in docs/THIRD-PARTY.md (the licence table,
+#: the pip download command, the paragraph under the table, and the MetaQuotes contact note).
+METATRADER5 = 25
 #: the optional-dependency extras. `mt5-win` is the pyproject extra; `mt5-mac` is both an
-#: extra and the macOS package name, so it appears in advice and docs too.
-EXTRA_MT5_WIN = 1
-PACKAGE_MT5_MAC = 13
+#: extra and the macOS package name, so it appears in advice and docs too. docs/THIRD-PARTY.md
+#: adds one mt5-win site (its table row) and three mt5-mac sites (two in the row, one in prose).
+EXTRA_MT5_WIN = 2
+PACKAGE_MT5_MAC = 16
 #: the doctor line that reports whether a binding is present at all.
 DOCTOR_MT5_BINDING = 3
 #: the MT4 file-mailbox basenames. MQL4 Expert and Python adapter must agree exactly.
