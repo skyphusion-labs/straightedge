@@ -15,6 +15,57 @@ Docs only; no behaviour change.
 - The Production/Stable classifier is scoped to the bot in README; the agent is a preview because `@cloudflare/computer` is one (its README: "provided as a preview for feedback").
 - "Advice is not financial advice" joins the README and RUNBOOK WARNING blocks. The reply footer is a code change tracked separately.
 - `SECURITY.md` lists `journal.advice.json` with the other 0600 files.
+### The desk now has a supervised restart, and a restart is visible (issue #133)
+
+Measured on the live box 2026-10-08: `mt4-terminal-supervisor` had a time
+trigger and ran every two minutes, while `straightedge-desk` had a logon
+trigger only, `RestartCount=0`, no next run, and had run exactly once in twelve
+days. The MT4 terminal, which holds no risk state, was supervised. The desk,
+which owns halt, daily-loss, drawdown, stop management and every refusal gate,
+was not. `straightedge-watch` did not exist, so `watchdog.py` (PR#80) was a
+reader that nothing ran.
+
+`docs/RUNBOOK.md` had documented the correct two-task arrangement the whole
+time. **That is the finding: the procedure was prose, it was typed once, and
+nothing ever compared the box to it again.** A runbook is not a control.
+
+- **`deploy/windows/` declares both tasks** as Task Scheduler XML, with
+  `Install-Supervision.ps1` (registers them, recording the previous definitions
+  FIRST so a rollback is a rollback) and `Export-Tasks.ps1` (read-only dump).
+  `deploy/windows/README.md` is the decision record.
+- **`python -m straightedge supervision` is the control.** It reads live task
+  definitions and goes red: no repeating trigger, a disabled task, a repeat
+  slower than the derived staleness threshold, `MultipleInstancesPolicy`
+  `StopExisting` (which would make the task END the healthy desk every
+  interval), the `schtasks` default `ExecutionTimeLimit` of `PT72H` (which ends
+  a healthy desk three days in), a non-interactive principal for a task that
+  has to see an MT4 GUI, `--i-accept-risk` in a task (fc34), and an action
+  whose arguments are hidden in a wrapper so neither of the last two can be
+  checked AT ALL. Read-only: it never registers, starts, stops or edits a task,
+  never touches `journal.lock` and never sends to Telegram, so it is safe
+  mid-session. `tests/test_supervision.py` reproduces the measured 2026-10-08
+  state and asserts it FAILS.
+- **The heartbeat carries `run_id` and `started_at`**, one value per desk
+  process, so `watch --loop` reports a RESTART whatever the state and counts
+  them. Before this, the only trace a restart left was the arming state falling
+  back to `live_not_accepted`, and that exists ONLY on a real-money desk: on a
+  demo account nothing needs arming, every field read the same either side of a
+  crash, and **a crash loop was silent in exactly the configuration the end
+  user is shown**. Close restarts are named as a `CRASH LOOP`, because a
+  supervisor that papers over repeated crashes converts a loud failure into a
+  slow one. A desk too old to publish `run_id` is reported as such, never as
+  unchanged.
+- The restart interval stays DERIVED: it must be at or under
+  `watchdog.stale_after_seconds` computed from the config the desk runs with
+  (`#68` is the standing reminder). With no Telegram configured that figure is
+  missing its long-poll term, so the audit reports the interval rather than
+  judging it against a number no running desk can produce.
+
+Not changed, and deliberately: a desk whose process is alive and whose ticks
+have stopped is ALARMED as `STALE`, never killed. Telling alive-but-stalled
+apart from dead needs `journal.lock`, and a watcher that can hold that lock for
+a moment can make a restarting desk exit `already running`. That boundary is
+PR#80's.
 
 ### Tickers longer than three characters resolve as pairs (issue #77)
 

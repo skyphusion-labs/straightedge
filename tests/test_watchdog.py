@@ -29,6 +29,7 @@ from __future__ import annotations
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -637,7 +638,14 @@ def test_decide_works_with_no_config_at_all(tmp_path: Path) -> None:
     path.write_text(f"{now.isoformat()}\nblocked=\nstale_after_s=428\n", encoding="utf-8")
     report = watchdog.decide(path, now=now)
     assert report.state == watchdog.STATE_ARMED
-    assert "NOTE:" not in report.text
+    # Narrowed from `"NOTE:" not in text` when run_id landed. What this test is
+    # about is that passing no config costs you no CONFIG-MISMATCH note, and
+    # that note is the one naming a second config. The hand-written heartbeat
+    # above carries no run_id, so it now also earns the run_id note, which is
+    # correct and is asserted by its own test; a blanket "no notes at all" here
+    # would have made this test fail for a reason it never claimed to cover.
+    assert "two different configs" not in report.text.lower()
+    assert "derives" not in report.text
     missing = watchdog.decide(tmp_path / "gone.heartbeat", now=now)
     assert missing.state == watchdog.STATE_UNKNOWN
 
@@ -660,3 +668,352 @@ def test_doctor_line_does_not_print_a_number_a_running_desk_cannot_get(
     assert "telegram unset" in quiet
     assert "telegram unset" not in live
     assert f"stale after {MT4_STALE}s" in live
+
+
+# --- the restart itself, which used to be invisible ------------------------------------
+#
+# straightedge#133 requirement 3: a restart is reported, not silent. Before
+# `run_id`, the only trace a restart left in the heartbeat was the arming state
+# falling back to `live_not_accepted`, and that state exists ONLY on a
+# real-money desk. `test_disarmed_after_restart_is_not_reported_healthy` above
+# covers that path, and it is the reason this gap survived review: it reads as
+# full coverage of "a restart is visible". On a demo account nothing needs
+# arming, so every field read the same either side of a crash and the restart
+# was silent in exactly the configuration an end user is shown. These tests are
+# the demo-account half.
+
+
+def _engine_at(cfg: BotConfig, tmp_path: Path, clock: Any) -> Engine:
+    """`_engine`, with the process clock injected.
+
+    A separate builder rather than a parameter on `_engine` because the clock
+    has to be in place for `start()` as well as for the ticks: an engine whose
+    `start()` ran on the wall clock and whose heartbeat ran on a driven one
+    would be measuring a desk whose own day boundary moved under it.
+    """
+    broker = PaperBroker(balance=10_000)
+    broker.seed_bars("EURUSD", generate_bars(80, drift=0.0004, seed=3))
+    engine = Engine(cfg, broker, halt_dir=str(tmp_path), now_fn=clock)
+    engine.start()
+    return engine
+
+
+def _published_run_id(cfg: BotConfig) -> str:
+    """What the heartbeat FILE says, never what the object remembers.
+
+    The contract under test is the published one: `watch` is a separate process
+    and the file is all it ever gets.
+    """
+    hb = watchdog.read(watchdog.heartbeat_path_for(cfg.journal_path))
+    assert hb is not None, "no heartbeat was written at all, so this proves nothing"
+    return hb.fields.get("run_id", "")
+
+
+def test_the_heartbeat_names_the_process_that_wrote_it(tmp_path: Path) -> None:
+    cfg = _cfg(tmp_path, mode="mt4")
+    first_engine = _engine(cfg, tmp_path)
+    first_engine.step_all()
+    first_engine.stop()
+    first = _published_run_id(cfg)
+    started = watchdog.read(watchdog.heartbeat_path_for(cfg.journal_path))
+    assert started is not None and started.fields.get("started_at")
+    second_engine = _engine(cfg, tmp_path)
+    second_engine.step_all()
+    second_engine.stop()
+    second = _published_run_id(cfg)
+    print(f"watchdog: run_id {first} -> {second}")
+    assert first and second
+    assert second != first, (
+        "two desk processes published the same identity, so no restart between "
+        "them could ever be detected"
+    )
+
+
+def test_one_process_keeps_its_identity_across_ticks(tmp_path: Path) -> None:
+    """Otherwise every tick reads as a restart, and an alarm that fires every
+    tick is one an operator mutes."""
+    cfg = _cfg(tmp_path, mode="mt4")
+    engine = _engine(cfg, tmp_path)
+    engine.step_all()
+    first = _published_run_id(cfg)
+    engine.step_all()
+    engine.stop()
+    assert _published_run_id(cfg) == first
+
+
+def _watch_across_restarts(
+    cfg: BotConfig,
+    tmp_path: Path,
+    *,
+    restarts: int = 1,
+    gap_s: float = 5.0,
+) -> tuple[list[str], int]:
+    """Drive ONE `watch` loop over `restarts + 1` desk processes.
+
+    The replacement desk ticks from inside `sleep_fn`, which is the only hook
+    the loop offers for "the world changed between two checks", and the clock
+    the whole arrangement shares is driven by the same function. `gap_s` is
+    what lets a test choose whether the previous run lived long enough to be a
+    restart or briefly enough to be a crash loop.
+    """
+    client, transport = _client()
+    path = watchdog.heartbeat_path_for(cfg.journal_path)
+    now = [datetime.now(timezone.utc)]
+    done = [0]
+
+    def clock() -> datetime:
+        return now[0]
+
+
+    first = _engine_at(cfg, tmp_path, clock)
+    first.step_all()
+    first.stop()
+
+    def advance(_seconds: float) -> None:
+        if done[0] >= restarts:
+            return
+        done[0] += 1
+        now[0] = now[0] + timedelta(seconds=gap_s)
+        engine = _engine_at(cfg, tmp_path, clock)
+        engine.step_all()
+        engine.stop()
+
+    code = watchdog.watch(
+        path,
+        cfg,
+        send=client.send,
+        out=lambda line: None,
+        now_fn=clock,
+        loop=True,
+        sleep_fn=advance,
+        max_checks=restarts + 1,
+    )
+    return [payload["text"] for _url, payload in transport.sent], code
+
+
+def test_a_restart_that_changes_no_state_is_still_announced(tmp_path: Path) -> None:
+    """THE gap: a demo desk, ARMED before and ARMED after, must still tell.
+
+    Without the process identity in the heartbeat both observations are
+    identical apart from the timestamp, `Report.key` is the same tuple, and
+    `watch` says nothing the second time. Deleting the two `run_id` lines from
+    `watchdog.render` drives this red, which is how it was checked.
+    """
+    cfg = _cfg(tmp_path, mode="mt4")
+    texts, code = _watch_across_restarts(cfg, tmp_path)
+    print(f"watchdog: {len(texts)} alerts across one restart, exit {code}")
+    assert len(texts) == 2, (
+        f"a restart produced {len(texts)} alert(s). ARMED -> ARMED is not a "
+        "change of state, so with no process identity this is 1"
+    )
+    assert "ALIVE ARMED" in texts[0]
+    assert "RESTARTED" not in texts[0], "a first sighting is not a restart"
+    assert "RESTARTED" in texts[1]
+    assert "ALIVE ARMED" in texts[1], "the restart line must not displace the state"
+    assert "restart 1" in texts[1]
+    assert "I-ACCEPT-RISK" in texts[1], "a restarted real-money desk is disarmed"
+
+
+def test_a_crash_loop_is_named_as_one_and_counted(tmp_path: Path) -> None:
+    """Requirement 3's other half: a supervisor must not quieten a crash loop.
+
+    One restart overnight is information. The same line reading `restart 3` is
+    a different fact, and an operator should not have to scroll a chat to tell
+    them apart.
+    """
+    cfg = _cfg(tmp_path, mode="mt4")
+    texts, _code = _watch_across_restarts(cfg, tmp_path, restarts=3, gap_s=5.0)
+    assert len(texts) == 4
+    assert "restart 1" in texts[1]
+    assert "restart 3" in texts[3], (
+        "the count does not rise, so three crashes read as one event"
+    )
+    assert "CRASH LOOP" in texts[3]
+    assert "at most 5s" in texts[3]
+
+
+def test_a_restart_after_a_long_healthy_run_is_not_called_a_loop(tmp_path: Path) -> None:
+    """The positive control for the line above: it has to be able NOT to fire.
+
+    A claim made on every restart carries no information. This gap is longer
+    than the derived staleness threshold, so even the UPPER bound on the
+    previous run's life clears it.
+    """
+    cfg = _cfg(tmp_path, mode="mt4")
+    texts, _code = _watch_across_restarts(cfg, tmp_path, gap_s=MT4_STALE + 60)
+    assert "RESTARTED" in texts[1]
+    assert "CRASH LOOP" not in texts[1]
+
+
+def test_a_desk_with_no_run_id_never_reads_as_restarting_and_says_why(
+    tmp_path: Path,
+) -> None:
+    """The live box runs a desk that predates this field, so this is not
+    hypothetical.
+
+    An absent field must not read as an unchanged one, and must not read as a
+    restart either. It reads as "this cannot be measured here", in the report,
+    where an operator sees it.
+    """
+    path = tmp_path / "journal.heartbeat"
+    cfg = _cfg(tmp_path, mode="mt4")
+    client, transport = _client()
+    now = [datetime.now(timezone.utc)]
+
+    def rewrite(_seconds: float) -> None:
+        now[0] = now[0] + timedelta(seconds=5)
+        path.write_text(
+            f"{now[0].isoformat()}\nblocked=\nmode=mt4\nstale_after_s={MT4_STALE}\n",
+            encoding="utf-8",
+        )
+
+    rewrite(0.0)
+    code = watchdog.watch(
+        path,
+        cfg,
+        send=client.send,
+        out=lambda line: None,
+        now_fn=lambda: now[0],
+        loop=True,
+        sleep_fn=rewrite,
+        max_checks=3,
+    )
+    texts = [payload["text"] for _url, payload in transport.sent]
+    assert code == watchdog.EXIT_ARMED
+    assert len(texts) == 1, "an old desk ticking along is one state, told once"
+    assert "RESTARTED" not in texts[0]
+    assert "publishes no run_id" in texts[0]
+    assert "EVERY restart" in texts[0]
+
+
+def test_the_identity_survives_every_state(tmp_path: Path) -> None:
+    """A STALE or a disarmed desk still names its process.
+
+    Otherwise a restart OUT of a bad state would be the one nobody hears
+    about, which is the restart that matters most.
+    """
+    cfg = _cfg(tmp_path, mode="mt4")
+    cfg.live_accepted = False
+    engine = _engine(cfg, tmp_path, real_money=True)
+    engine.step_all()
+    engine.stop()
+    path = watchdog.heartbeat_path_for(cfg.journal_path)
+    published = _published_run_id(cfg)
+    now = datetime.now(timezone.utc)
+    disarmed = watchdog.decide(path, now=now, cfg=cfg)
+    assert disarmed.state == watchdog.STATE_NOT_TRADING
+    assert disarmed.run_id == published
+    stale = watchdog.decide(path, now=now + timedelta(seconds=MT4_STALE + 10), cfg=cfg)
+    assert stale.state == watchdog.STATE_STALE
+    assert stale.run_id == published
+
+
+# --- the started_at parse, which the crash-loop claim turns on -------------------------
+
+
+@pytest.mark.parametrize(
+    "text,expected_tz",
+    [
+        ("2026-10-08T12:00:00+00:00", timezone.utc),
+        ("2026-10-08T12:00:00", timezone.utc),
+        ("", None),
+        ("not a timestamp", None),
+    ],
+)
+def test_started_at_is_parsed_once_and_naive_reads_as_utc(
+    text: str, expected_tz: timezone | None
+) -> None:
+    """One parse, used by the loop AND by the message it composes.
+
+    Two copies would be two places for a naive stamp to be read differently,
+    and the comparison behind the crash-loop claim is where that would bite: a
+    stamp read as local on one side and UTC on the other invents or erases
+    hours of apparent uptime.
+    """
+    parsed = watchdog._started_at_utc(text)
+    if expected_tz is None:
+        assert parsed is None
+    else:
+        assert parsed is not None and parsed.tzinfo == expected_tz
+
+
+def test_an_unparseable_started_at_still_reports_the_restart() -> None:
+    """The restart is the fact; the loop claim is the embellishment.
+
+    A desk whose `started_at` is junk has still restarted, and losing the
+    announcement because one field would not parse would be the silent case
+    coming back through a side door.
+    """
+    report = watchdog.Report(
+        state=watchdog.STATE_ARMED,
+        reason="",
+        exit_code=watchdog.EXIT_ARMED,
+        text="straightedge ALIVE ARMED",
+        next_sleep_s=10.0,
+        stale_after_s=float(MT4_STALE),
+        run_id="bbbbbbbb",
+        started_at="not a timestamp",
+    )
+    text = watchdog.restart_text(
+        previous_run_id="aaaaaaaa",
+        previous_started_at=datetime.now(timezone.utc),
+        report=report,
+        restarts=2,
+        watching_since=datetime.now(timezone.utc),
+    )
+    assert "RESTARTED" in text
+    assert "restart 2" in text
+    assert "CRASH LOOP" not in text
+
+
+def test_a_first_run_with_no_previous_stamp_makes_no_loop_claim() -> None:
+    """`previous_started_at` is None when the earlier heartbeat predated the field."""
+    report = watchdog.Report(
+        state=watchdog.STATE_ARMED,
+        reason="",
+        exit_code=watchdog.EXIT_ARMED,
+        text="straightedge ALIVE ARMED",
+        next_sleep_s=10.0,
+        stale_after_s=float(MT4_STALE),
+        run_id="bbbbbbbb",
+        started_at=datetime.now(timezone.utc).isoformat(),
+    )
+    text = watchdog.restart_text(
+        previous_run_id="",
+        previous_started_at=None,
+        report=report,
+        restarts=1,
+        watching_since=datetime.now(timezone.utc),
+    )
+    assert "RESTARTED" in text
+    assert "CRASH LOOP" not in text
+    assert "previous run_id unknown" in text
+
+
+def test_a_clock_that_moved_backwards_makes_no_loop_claim() -> None:
+    """A negative lifetime says nothing about how long the previous run lived.
+
+    Asserting a crash loop from it would be reading a clock fault as a
+    diagnosis. The wrong clock is already alarmed by `_age_seconds`, which
+    takes the worse of the desk's stamp and the filesystem.
+    """
+    now = datetime.now(timezone.utc)
+    report = watchdog.Report(
+        state=watchdog.STATE_ARMED,
+        reason="",
+        exit_code=watchdog.EXIT_ARMED,
+        text="straightedge ALIVE ARMED",
+        next_sleep_s=10.0,
+        stale_after_s=float(MT4_STALE),
+        run_id="bbbbbbbb",
+        started_at=(now - timedelta(hours=3)).isoformat(),
+    )
+    text = watchdog.restart_text(
+        previous_run_id="aaaaaaaa",
+        previous_started_at=now,
+        report=report,
+        restarts=1,
+        watching_since=now,
+    )
+    assert "RESTARTED" in text
+    assert "CRASH LOOP" not in text

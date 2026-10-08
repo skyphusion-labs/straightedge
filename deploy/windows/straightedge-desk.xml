@@ -1,0 +1,69 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  straightedge-desk: the task that restarts the desk.
+
+  Read deploy/windows/README.md before changing anything in this file. Every
+  setting below is load-bearing and the reasons are there, not here (an XML
+  comment cannot contain a double hyphen, so it cannot even quote a command
+  line, which is why the rationale lives in the README).
+
+  Fill in the placeholder paths and the user id before registering, or let
+  Install-Supervision.ps1 do it. Leave the placeholders in the committed copy;
+  tests/test_supervision.py asserts they are still there, because a real path
+  committed once is a path that rots silently. The installer checks the VALUES
+  with these comments stripped, so prose here deliberately does not spell the
+  token out.
+-->
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Description>straightedge desk: restarts the Telegram trading desk if it is not running. The desk owns halt, daily-loss, drawdown and every refusal gate, so a dead desk is not a paused desk. See deploy/windows/README.md.</Description>
+    <URI>\straightedge-desk</URI>
+  </RegistrationInfo>
+  <Triggers>
+    <LogonTrigger>
+      <Enabled>true</Enabled>
+      <UserId>REPLACE_ME</UserId>
+    </LogonTrigger>
+    <TimeTrigger>
+      <Repetition>
+        <Interval>PT5M</Interval>
+        <StopAtDurationEnd>false</StopAtDurationEnd>
+      </Repetition>
+      <StartBoundary>2026-01-01T00:00:00</StartBoundary>
+      <Enabled>true</Enabled>
+    </TimeTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <UserId>REPLACE_ME</UserId>
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>LeastPrivilege</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
+    <IdleSettings>
+      <StopOnIdleEnd>false</StopOnIdleEnd>
+      <RestartOnIdle>false</RestartOnIdle>
+    </IdleSettings>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>true</Enabled>
+    <Hidden>false</Hidden>
+    <RunOnlyIfIdle>false</RunOnlyIfIdle>
+    <WakeToRun>false</WakeToRun>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <Priority>7</Priority>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>C:\REPLACE_ME\python.exe</Command>
+      <Arguments>-m straightedge --config C:\REPLACE_ME\config.toml run --mode mt4 --loop</Arguments>
+      <WorkingDirectory>C:\REPLACE_ME</WorkingDirectory>
+    </Exec>
+  </Actions>
+</Task>

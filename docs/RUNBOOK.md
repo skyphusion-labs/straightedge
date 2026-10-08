@@ -296,6 +296,15 @@ Zero is off. Zero is the default.
 Set it. Then silence is a signal too.
 Nothing on the computer can see this watcher die.
 
+It also alerts on a RESTART, which is not a change of state.
+The heartbeat carries `run_id`, one value per desk process.
+When that value changes, the desk is a new process, and the alert says so and
+counts how many it has seen.
+Without it a restart was visible only through the arming state falling back to
+`live_not_accepted`, and that exists only on a real-money desk: on a demo
+account every field read the same either side of a crash.
+A desk too old to publish `run_id` is reported as such, never as unchanged.
+
 ### The threshold is measured, not chosen
 
 `doctor` prints the threshold on every run.
@@ -352,8 +361,21 @@ Nothing on the computer can page you then.
 ## Unattended (Windows scheduled task)
 
 Use this for a run of days with nobody at the computer.
-You need two tasks.
-One starts the desk. One watches it.
+You need two tasks. One starts the desk. One watches it.
+
+**The definitions live in `deploy/windows/`, not in this paragraph.**
+That is the whole lesson of this section. The procedure used to be prose here,
+it was typed once, and nothing ever compared the result to it again. Measured
+on the live box 2026-10-08: the MT4 terminal was supervised every two minutes,
+the desk had a logon trigger only and had run once in twelve days, and the
+watcher task did not exist at all. A runbook is not a control.
+
+Read `deploy/windows/README.md` for why each setting is what it is. The three
+that are easiest to get wrong and hardest to notice:
+`MultipleInstancesPolicy` must be `IgnoreNew` (`StopExisting` makes the task
+END the healthy desk every interval), `ExecutionTimeLimit` must be `PT0S`
+(`schtasks /create` defaults it to `PT72H`, which kills a healthy desk three
+days in), and `LogonType` must be `InteractiveToken` (MT4 is a GUI program).
 
 WARNING
 Never put `--i-accept-risk` in either task (fc34).
@@ -361,44 +383,65 @@ A scheduled task re-runs its arguments on every restart.
 That would arm real money again on every crash, with nobody there.
 The desk comes back DISARMED on purpose.
 A human arms it from the chat.
+`supervision` below fails a task that carries the flag.
 
-1. Read the threshold.
-   `python -m straightedge --config config.toml doctor`
-   Write down the `stale after` seconds.
-2. Pick the restart interval.
-   Use whole minutes at or below that number.
-   The shipped example config gives 428s, so use 5 minutes.
-3. Create the desk task.
+### Install
 
 ```bat
-schtasks /create /tn straightedge-desk /sc minute /mo 5 ^
-  /tr "C:\path\to\venv\Scripts\python.exe -m straightedge --config C:\path\to\config.toml run --mode mt4 --loop" ^
-  /ru %USERNAME% /it
+cd deploy\windows
+powershell -ExecutionPolicy Bypass -File .\Install-Supervision.ps1 ^
+  -PythonExe "C:\Program Files\Python312\python.exe" ^
+  -ConfigPath "C:\bot\config.toml" ^
+  -WorkingDirectory "C:\bot"
 ```
 
-4. Create the watcher task.
+That is a dry run; it changes nothing and says so. Add `-Apply` to register.
+It records the previous definitions in `.\tasks-before` FIRST, because a
+rollback is only a rollback if the previous state was captured before the
+change and not reconstructed after it.
+
+### Audit it, do not assume it
 
 ```bat
-schtasks /create /tn straightedge-watch /sc minute /mo 5 ^
-  /tr "C:\path\to\venv\Scripts\python.exe -m straightedge --config C:\path\to\config.toml watch --loop --ok-every 3600" ^
-  /ru %USERNAME% /it
+powershell -ExecutionPolicy Bypass -File .\Export-Tasks.ps1 -OutDir .\tasks
+python -m straightedge --config C:\bot\config.toml supervision --tasks .\tasks
 ```
 
-5. Set the working directory for both tasks.
-   Task Scheduler calls it Start in.
-   `HALT` and the journal are relative to it.
+Read-only. It does not register, start, stop or edit a task, does not touch the
+desk or `journal.lock`, and does not send to Telegram, so it is safe to run
+mid-session. An audit an operator is afraid to run during trading hours is one
+that only ever runs after the outage.
 
-The repeating trigger IS the restart on failure.
-Task Scheduler does not start a second instance of a running task.
-So the trigger does nothing while the desk is up.
-When the desk is gone, the next trigger starts it.
-`journal.lock` is the second barrier.
-A second desk exits 2 with `already running` before it touches MT4 or Telegram.
+Exit 0 means every declared task is supervision. Non-zero names each failure
+and says what it costs. `WARN` lines are hardening and do not change the exit
+code.
+
+Pass the DESK's own config. The restart interval has to be at or under the
+desk's staleness threshold, `doctor` prints that threshold on every run, and
+`supervision` derives the same number from the config it is given; auditing
+with a different config measures a different desk. With no Telegram configured
+the derived figure is missing its long-poll term, so the audit reports the
+interval instead of judging it against a number no running desk can produce.
+
+### Why the repeating trigger is safe while the desk is up
+
+Task Scheduler does not start a second instance of a running task
+(`MultipleInstancesPolicy` `IgnoreNew`), so the trigger does nothing while the
+desk is alive. When the desk is gone, the next trigger starts it.
+`journal.lock` is the second barrier: a second desk exits 2 with
+`already running` before it touches MT4 or Telegram.
+
+The first barrier only holds if the process the task launches STAYS ALIVE for
+the desk's lifetime. A wrapper script that launches python and returns
+immediately makes Task Scheduler mark the task complete, and then only
+`journal.lock` is protecting you. The declared definitions launch python
+directly for this reason, and because it keeps the command line where the audit
+can read it.
 
 CAUTION
 MT4 is a GUI program.
 It needs a logged-in Windows session.
-`/it` runs the task in that session.
+`InteractiveToken` runs the task in that session.
 A task set to run whether the user is logged on or not cannot see MT4.
 
 ### What you will see after a crash
@@ -406,7 +449,14 @@ A task set to run whether the user is logged on or not cannot see MT4.
 The desk restarts inside the interval.
 The heartbeat starts moving again.
 You may never get a `STALE` alert. That is correct.
-You WILL get `ALIVE NOT TRADING (live_not_accepted)`.
+You WILL get a `RESTARTED` line, with a count: the heartbeat carries a `run_id`
+per process, so `watch --loop` reports a new process whatever the state. That
+matters most on a demo account, where nothing needs arming and every other
+field reads the same either side of the crash.
+If the restarts are close together you also get `CRASH LOOP`, because a
+supervisor that quietly papers over repeated crashes converts a loud failure
+into a slow one.
+On a real account you ALSO get `ALIVE NOT TRADING (live_not_accepted)`.
 That is the desk telling you it came back disarmed.
 Send `/live on I-ACCEPT-RISK` to arm it.
 Until you do, the desk sizes and refuses. It does not trade.
@@ -415,14 +465,12 @@ Until you do, the desk sizes and refuses. It does not trade.
 
 Do this once, on the demo account.
 
-1. Start both tasks.
+1. Install both tasks. Confirm `supervision` exits 0 against the live export.
 2. Wait for the first `watch` message in the chat.
 3. End the desk process in Task Manager.
 4. Wait for the restart interval.
-5. Read the chat.
-   You get a state change.
-   The desk is back, and it is disarmed.
-6. Send `/live on I-ACCEPT-RISK`.
+5. Read the chat. You get `RESTARTED` and the state.
+6. On a real account, send `/live on I-ACCEPT-RISK`.
 7. Read the chat. `ALIVE ARMED`.
 
 A watchdog you have never seen fire is not a watchdog.

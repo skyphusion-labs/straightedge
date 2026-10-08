@@ -36,6 +36,7 @@ from straightedge.journal import (
 )
 from straightedge.models import Bar
 from straightedge.strategy import TrendStrategy
+from straightedge import supervision
 from straightedge.synthetic import generate_bars, generate_ranging
 from straightedge.telegram import TelegramClient, TgCommand, offset_path_for
 from straightedge.watchdog import (
@@ -171,6 +172,42 @@ def cmd_watch(args: argparse.Namespace) -> int:
         loop=bool(args.loop),
         ok_every=float(args.ok_every),
     )
+
+
+def cmd_supervision(args: argparse.Namespace) -> int:
+    """Are the scheduled tasks that keep the desk alive actually supervision.
+
+    READ-ONLY. It parses task definitions that something else dumped; it never
+    registers, starts, stops or edits a task, and it never touches the desk,
+    `journal.lock` or Telegram. Safe to run against a live box mid-session,
+    which is the whole point: an audit an operator is afraid to run during
+    trading hours is an audit that gets run after the outage.
+
+    The interval ceiling is derived from the config THIS invocation loaded, so
+    running it on the box measures the box. See `straightedge.supervision`.
+    """
+    cfg = _cfg(args)
+    ceiling, measurable = supervision.interval_ceiling(cfg)
+    source = Path(args.tasks)
+    if not source.exists():
+        print(
+            f"supervision: no such path {source}. Dump the live definitions "
+            "first with deploy\\windows\\Export-Tasks.ps1, or point --tasks at "
+            "deploy/windows to audit the DECLARED ones. An audit with nothing "
+            "to read is not a pass",
+            file=sys.stderr,
+        )
+        return 2
+    views = supervision.load_views(source)
+    findings = supervision.audit(
+        views, max_interval_s=ceiling, measurable=measurable
+    )
+    print(
+        supervision.report(
+            findings, max_interval_s=ceiling, measurable=measurable
+        )
+    )
+    return supervision.exit_code(findings)
 
 
 def telegram_ping(cfg: BotConfig, *, transport=None) -> str:
@@ -613,6 +650,21 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     w.set_defaults(func=cmd_watch)
+
+    v = sub.add_parser(
+        "supervision",
+        help="do the Windows scheduled tasks actually restart and watch the desk",
+    )
+    v.add_argument(
+        "--tasks",
+        default="deploy/windows",
+        help=(
+            "directory of <task-name>.xml dumps, or one dump file. Defaults to "
+            "the DECLARED definitions in deploy/windows; point it at the output "
+            "of deploy/windows/Export-Tasks.ps1 to audit the live box"
+        ),
+    )
+    v.set_defaults(func=cmd_supervision)
 
     t = sub.add_parser("telegram", help="send a test message to the configured chat")
     t.add_argument("--message", default="straightedge ping")

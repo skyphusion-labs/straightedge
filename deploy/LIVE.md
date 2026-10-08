@@ -1,5 +1,13 @@
 # Live MT5 / MT4
 
+> **This file predates the 2026-09 infrastructure change and names hosts that no
+> longer exist** (`jello`, `dischord`, "this fleet is Linux"). Read the Docker
+> and fleet steps as history. The live desk runs on one Windows box; the
+> supervision that keeps it alive is declared in
+> [`deploy/windows/`](windows/README.md) and the operator procedure is in
+> [`docs/RUNBOOK.md`](../docs/RUNBOOK.md). Those two are the contract, not this
+> file. Its MT5 and MT4 command lines are still correct.
+
 Paper Docker on jello is the Telegram desk. It is not live execution.
 
 Live execution needs a host that runs MetaTrader 4 or 5 and the Python

@@ -153,7 +153,15 @@ KEY_TERMINAL_PATH = 6
 #: `config.py`'s loader: `timeout_ms` and `send_timeout_ms`. Everything else is a
 #: field declaration, a derivation, a test, or prose explaining why the two numbers
 #: are not one number.
-KEY_TIMEOUT_MS = 122
+#:
+#: 122 -> 124 with the supervision audit (#133), and NEITHER new site is a
+#: config read: `deploy/windows/README.md` names the key as one of the three
+#: terms the restart interval is derived from, and
+#: `tests/test_supervision.py` names it in the same sentence to say why the
+#: interval cannot be a constant. Both are prose about the key. The count of
+#: live reads in `config.py` is unchanged at two, which is the number this pin
+#: actually guards.
+KEY_TIMEOUT_MS = 124
 #: the official Windows pip package, named in the extra, the adapter import, the doctor
 #: advice and the mypy override, plus four sites in docs/THIRD-PARTY.md (the licence table,
 #: the pip download command, the paragraph under the table, and the MetaQuotes contact note).
