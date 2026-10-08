@@ -217,6 +217,7 @@ Send `/help` for the rest.
 
 `docs/CONTRACT.md` is the behaviour that tests enforce.
 `docs/VENUE.md` is the provider-agnostic execution API (`MarketOrder`, `WorkingOrder`).
+`docs/THIRD-PARTY.md` is every third-party component and the licence terms it carries.
 `docs/MT4.md` is the MT4 file-mailbox ICD.
 `docs/RUNBOOK.md` is paper, live, `/live on I-ACCEPT-RISK`, `/approve always`, `poll_seconds=1`, HALT, confirm-on-restart, lock, heartbeat, `watch`, the unattended Windows scheduled task, journal rotate, and launchd.
 `docs/launchd.plist.example` is a user LaunchAgent.
@@ -225,4 +226,5 @@ Tokens stay `REPLACE_ME` in the example.
 
 ## License
 
-MIT.
+MIT. Third-party terms, including the MetaQuotes EULA that governs the terminal
+and MetaEditor, are in `docs/THIRD-PARTY.md`.
