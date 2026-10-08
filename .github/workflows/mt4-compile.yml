@@ -46,6 +46,71 @@ name: mt4-compile
 # rotation would otherwise block every unrelated PR in the repo, which is the exact defect class
 # this sprint closed elsewhere. Promoting it to a required context is a ruleset decision and belongs
 # to whoever owns the ruleset, after the pin has been observed stable.
+#
+# THE TRUST MODEL, NAMED (straightedge#136)
+#
+# MetaQuotes republished mt4setup.exe at the same URL on or before 2026-10-08 and the sha256 pin
+# refused it, correctly. The question that red raised is what a re-pin actually ASSERTS, and the
+# honest answer about the old arrangement is: less than it looked.
+#
+# A sha256 pin gives IMMUTABILITY. It says "these are the same bytes as last time". It does not say
+# where those bytes came from, and the legitimacy of the ORIGINAL pinned build rested on nothing
+# more than "it arrived over HTTPS from their CDN" -- exactly the evidence a re-pin would have, which
+# is why rollins was right that bumping the number would have changed the number without changing
+# what is verified.
+#
+# An Authenticode check gives PROVENANCE. It says "MetaQuotes signed this, the chain validates, and
+# a timestamp authority countersigned it". That is a cryptographic statement about origin, and it is
+# the property the pin never had.
+#
+# These are not stronger-versus-weaker, they are different properties, so the gate now asserts BOTH
+# and trades neither:
+#
+#   - Authenticode `Valid` plus the pinned publisher subject is a HARD gate. No human waves it
+#     through, and a republish signed by anyone else fails closed.
+#   - The sha256 pin stays, so a legitimately republished build still stops the run and still needs
+#     a person. What changed is that the person now has something real to assert: the job prints the
+#     signer subject, issuer, thumbprint, certificate validity window, countersignature and file
+#     version, and the re-pin commit quotes them.
+#
+# Accepted cost, stated rather than discovered: pinning the SUBJECT and not the thumbprint means a
+# certificate renewal by the same publisher does not break the build, and in exchange a cert
+# mis-issued to that subject by any trusted CA would pass provenance. The thumbprint is therefore
+# REPORTED on every run and belongs in the re-pin commit, so a rotation is visible to a reader even
+# though it is not a gate. Pinning the thumbprint instead would hand the vendor's certificate
+# calendar the power to red this repo, which is the failure this job's own design already rejects
+# two paragraphs up.
+#
+# RE-PINNING CHECKLIST, because the next person should not have to re-derive this.
+#
+# When MT4_SETUP_SHA256 reds and provenance PASSED, that is a legitimately signed MetaQuotes build
+# that this repo has not reviewed. It is a review trigger, not a bypass. Do all four:
+#
+#   1. Read the Authenticode block this job printed in the step BEFORE the hash gate. If the run
+#      died before printing it, re-run; do not re-pin from a hash alone.
+#   2. Confirm status Valid, the publisher subject, and that the countersignature is present.
+#   3. Update MT4_SETUP_SHA256 in a commit whose body QUOTES the signer subject, thumbprint,
+#      countersigner and file version, and names the run id they were read from. A pin whose
+#      update rule is "whatever the CDN served today" is a checksum, not a control.
+#   4. Confirm the re-run is green AND that the negative controls still fire: the byte-flipped
+#      copy must not validate, and mt4/tests/fixtures/negative-control.mq4 must still fail to
+#      compile. A green job that cannot go red is worth less than the red one it replaced.
+#
+# Never: a fallback download source, a widened or removed path filter, continue-on-error, or a
+# re-pin with no statement of what was verified (straightedge#87, straightedge#136).
+#
+# WHAT THIS DOES NOT ESTABLISH, stated so it is not over-read: the 873af0c7 build's signature was
+# never recorded and the vendor overwrote it at the same URL, so it cannot be fetched now. This
+# commit therefore sets the publisher BASELINE; it does not prove the new build carries the same
+# publisher as the old one. From here a publisher change is detectable. Before here it was not.
+#
+# WHY A SCHEDULE. The PR trigger is path-filtered to mt4/** on purpose, so a vendor republish does
+# not red every unrelated PR. The cost of that, measured: the last run before 2026-10-08 was
+# 2026-09-27, so the broken pin was LATENT for eleven days and surfaced inside a PR about reconnect
+# observability that had nothing to do with it. `main` was not green on this check, it was
+# unmeasured on it. The weekly schedule makes a republish surface as its own attributable red, on
+# our clock, without widening the path filter -- which #136 rules out, because a job that stops
+# running is not a gate.
 
 on:
   pull_request:
@@ -57,6 +122,11 @@ on:
     paths:
       - "mt4/**"
       - ".github/workflows/mt4-compile.yml"
+  # See WHY A SCHEDULE in the header. Weekly, not daily: the purpose is to make a vendor
+  # republish attributable and bounded in latency, not to alert within hours. A republish is a
+  # review trigger, not an incident.
+  schedule:
+    - cron: "17 6 * * 1"
   workflow_dispatch: {}
 
 permissions:
@@ -67,10 +137,28 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  # MetaQuotes CDN web stub. Measured 2026-09-26: 4699304 bytes, sha256 below, on two independent
-  # downloads. No fallback URL by design.
+  # MetaQuotes CDN web stub. No fallback URL by design (straightedge#87).
   MT4_SETUP_URL: https://download.mql5.com/cdn/web/metaquotes.software.corp/mt4/mt4setup.exe
-  MT4_SETUP_SHA256: 873af0c7f5ca67eb937a6c609a8317eeb60969073e81a67064fb6f00f84b3e0a
+  # Measured on run 37801966568, the EXECUTED output lines and not the echoed script:
+  #   bytes=5197480  version 5.0.0.6236  Authenticode Valid, "Signature verified."
+  # It replaces 873af0c7... at 4699304 bytes (2026-09-26), which MetaQuotes overwrote at the same
+  # URL. A 498KB size change on a vendor stub is consistent with a real new build rather than a
+  # truncated or corrupted download, and the signature is what actually establishes that.
+  MT4_SETUP_SHA256: 8088bafcbe17aa98c5c3ac7028533caeb97b37ede99a5e59907161edbe5a0eeb
+  # Authenticode signer subject. PROVENANCE, where the hash above is immutability; see THE TRUST
+  # MODEL in the header. Matched as a substring of the signer's full Subject, measured on run
+  # 37801966568 as:
+  #   CN=MetaQuotes Ltd., O=MetaQuotes Ltd., S=Lemesos, C=CY
+  # The ORGANISATION field is pinned rather than the whole subject or the CN. O is the field a CA
+  # validates for an OV code-signing certificate, so it is the part that carries the identity
+  # claim, and pinning it survives a CN edit or a field reordering that would break a
+  # whole-string compare for no security gain.
+  MT4_SETUP_PUBLISHER: "O=MetaQuotes Ltd."
+  # RECORDED, NOT GATED. A renewal by the same publisher rotates this and must not red the repo;
+  # see the accepted cost in the header. A change produces a ::warning so it is visible to a
+  # reader rather than silent. Issued by CN=Sectigo Public Code Signing CA E36, valid
+  # 2026-02-10 to 2029-02-09, countersigned by CN=Certum Timestamp 2026.
+  MT4_SETUP_PUBLISHER_THUMBPRINT_SEEN: "5A64A7AED24C33DED342D01D01FA5286F06DA6DC"
   METAEDITOR: C:\Program Files (x86)\MetaTrader 4\metaeditor.exe
   EXPERT_SOURCE: mt4\Experts\Mt4RiskBot.mq4
   NEGATIVE_CONTROL: mt4\tests\fixtures\negative-control.mq4
@@ -85,21 +173,117 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Fetch mt4setup.exe from the MetaQuotes CDN and check the pin
+      - name: Fetch mt4setup.exe from the MetaQuotes CDN
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
           $dest = Join-Path $env:RUNNER_TEMP "mt4setup.exe"
+          # No fallback URL, by design (straightedge#87): a silent failover would move us onto
+          # terms nobody read.
           Invoke-WebRequest -Uri $env:MT4_SETUP_URL -OutFile $dest -UseBasicParsing
           $fi = Get-Item $dest
           $sha = (Get-FileHash -Algorithm SHA256 $dest).Hash.ToLower()
           Write-Host "mt4setup.exe bytes=$($fi.Length) sha256=$sha"
-          if ($sha -ne $env:MT4_SETUP_SHA256) {
-            Write-Host "::error::mt4setup.exe sha256 is $sha, pinned MT4_SETUP_SHA256 is $($env:MT4_SETUP_SHA256)."
-            Write-Host "::error::A third-party executable in this repo's build path changed. Review the new stub and update the pin in a commit that says why. Do NOT add a fallback download source (straightedge#87)."
+
+      - name: Report the Authenticode block, then gate on provenance
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $dest = Join-Path $env:RUNNER_TEMP "mt4setup.exe"
+
+          # REPORT FIRST, GATE SECOND, and the order is the point: when the hash pin reds on a
+          # legitimate republish, the operator needs these fields in the SAME run to be able to
+          # write a re-pin commit that asserts something. A gate that exits before printing its
+          # evidence makes the remediation a second round trip.
+          $sig = Get-AuthenticodeSignature -LiteralPath $dest
+          $cert = $sig.SignerCertificate
+          Write-Host "authenticode status      = $($sig.Status)"
+          Write-Host "authenticode message     = $($sig.StatusMessage)"
+          if ($null -ne $cert) {
+            Write-Host "signer subject           = $($cert.Subject)"
+            Write-Host "signer issuer            = $($cert.Issuer)"
+            Write-Host "signer thumbprint        = $($cert.Thumbprint)"
+            Write-Host "signer not before        = $($cert.NotBefore.ToString('o'))"
+            Write-Host "signer not after         = $($cert.NotAfter.ToString('o'))"
+          } else {
+            Write-Host "signer subject           = (no signer certificate)"
+          }
+          $ts = $sig.TimeStamperCertificate
+          if ($null -ne $ts) {
+            Write-Host "countersigned by         = $($ts.Subject)"
+          } else {
+            # Reported, not gated. An unsigned-timestamp build is worth a human looking at it, but
+            # refusing it would be a new policy, and this job is not the place to invent one.
+            Write-Host "countersigned by         = (none; the signature is not timestamped)"
+          }
+          $v = (Get-Item -LiteralPath $dest).VersionInfo
+          Write-Host "file version             = $($v.FileVersion)"
+          Write-Host "product version          = $($v.ProductVersion)"
+          Write-Host "company name             = $($v.CompanyName)"
+
+          # NEGATIVE CONTROL for this gate, on every run, same discipline as the compile step.
+          # Flipping one byte of a copy must make the signature stop validating. Without this, a
+          # runner whose trust store or revocation path was misconfigured could return Valid for
+          # anything, and `status -eq Valid` would be a decoration that cannot go red. It is also
+          # the only way to know the check is reading the FILE rather than a cached verdict.
+          $tampered = Join-Path $env:RUNNER_TEMP "mt4setup-tampered.exe"
+          Copy-Item -LiteralPath $dest -Destination $tampered -Force
+          $fs = [System.IO.File]::Open($tampered, "Open", "ReadWrite")
+          try {
+            # Inside the PE, past the headers, so the edit lands in signed content rather than in
+            # a field the signature excludes.
+            $fs.Seek(4096, "Begin") | Out-Null
+            $b = $fs.ReadByte()
+            $fs.Seek(4096, "Begin") | Out-Null
+            $fs.WriteByte([byte](($b + 1) % 256))
+          } finally {
+            $fs.Close()
+          }
+          $control = (Get-AuthenticodeSignature -LiteralPath $tampered).Status
+          Write-Host "negative control status  = $control (a tampered copy)"
+          Remove-Item -LiteralPath $tampered -Force
+          if ($control -eq "Valid") {
+            Write-Host "::error::a byte-flipped copy of the stub ALSO validated, so this signature check cannot go red and proves nothing about the real file. Do not treat this run as having verified provenance."
             exit 1
           }
-          Write-Host "pin matches"
+
+          # GATE 1: provenance. Hard, and no human waves it through.
+          if ($sig.Status -ne "Valid") {
+            Write-Host "::error::mt4setup.exe Authenticode status is $($sig.Status), not Valid. The stub is unsigned, tampered, or its chain does not validate on this runner. Do NOT re-pin a hash to make this pass and do NOT add a fallback download source (straightedge#87)."
+            exit 1
+          }
+          if ($null -eq $cert) {
+            Write-Host "::error::Authenticode reported Valid with no signer certificate, which this gate cannot interpret; treating as unverified."
+            exit 1
+          }
+          if ($env:MT4_SETUP_PUBLISHER -eq "MEASURED_IN_CI_SEE_COMMIT") {
+            Write-Host "::error::MT4_SETUP_PUBLISHER is still the placeholder, so the publisher is UNPINNED and this run verified a valid signature by ANYONE. Read the signer subject printed above and pin it. An unset pin is not a passed check (straightedge#136)."
+            exit 1
+          }
+          if ($cert.Subject -notlike "*$($env:MT4_SETUP_PUBLISHER)*") {
+            Write-Host "::error::mt4setup.exe is validly signed, but by $($cert.Subject), which does not contain the pinned publisher $($env:MT4_SETUP_PUBLISHER). A different publisher is not a pin rotation; stop and escalate."
+            exit 1
+          }
+          Write-Host "provenance ok: valid signature, publisher matches the pin"
+          if ($cert.Thumbprint -ne $env:MT4_SETUP_PUBLISHER_THUMBPRINT_SEEN) {
+            # A WARNING and not a gate, deliberately: see the accepted cost in the header. The
+            # publisher is what is pinned; the thumbprint is recorded so a rotation is visible to
+            # a reader instead of silent.
+            Write-Host "::warning::the signing certificate thumbprint is $($cert.Thumbprint), where $($env:MT4_SETUP_PUBLISHER_THUMBPRINT_SEEN) was recorded. Same publisher, different certificate. Legitimate on renewal; update MT4_SETUP_PUBLISHER_THUMBPRINT_SEEN in the next commit that touches this file and say which run you read it from."
+          }
+
+      - name: Gate on the sha256 pin, which is the exact build we reviewed
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $dest = Join-Path $env:RUNNER_TEMP "mt4setup.exe"
+          $sha = (Get-FileHash -Algorithm SHA256 $dest).Hash.ToLower()
+          if ($sha -ne $env:MT4_SETUP_SHA256) {
+            Write-Host "::error::mt4setup.exe sha256 is $sha, pinned MT4_SETUP_SHA256 is $($env:MT4_SETUP_SHA256)."
+            Write-Host "::error::Provenance PASSED, so this is a legitimately signed MetaQuotes build that is not the one this repo reviewed. That is a review trigger, not a bypass: read the Authenticode block printed in the previous step, update MT4_SETUP_SHA256 in a commit that quotes the signer subject, thumbprint, countersignature and file version you read, and say which run you read them from. Do NOT add a fallback download source (straightedge#87)."
+            exit 1
+          }
+          Write-Host "pin matches: same build this repo reviewed"
 
       - name: Install MetaTrader 4 silently
         shell: pwsh
