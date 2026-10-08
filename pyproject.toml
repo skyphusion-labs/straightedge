@@ -83,6 +83,13 @@ exclude_lines = [
 # drives it red, including the measured 2026-10-08 live state, and a branch
 # that stops being reached is a check that has stopped being able to go red.
 "src/straightedge/supervision.py" = 99
+# 100% measured, and it is 33 statements. The floor is here not because the
+# file is large but because it is the only thing that answers "what is
+# running", and every branch in it is a way of refusing to answer: a missing
+# stamp, a corrupt one, one that is valid JSON but not an object, one with no
+# commit. Each of those must read as `unstamped` rather than as a version, and
+# a branch that stops being exercised is one of them silently becoming a guess.
+"src/straightedge/deployed.py" = 99
 
 [tool.ruff]
 target-version = "py312"

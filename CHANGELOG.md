@@ -6,6 +6,59 @@ See README.md and docs/CONTRACT.md.
 
 ## Unreleased
 
+### A git deploy procedure, and a desk that can say what it is running (issue #147)
+
+Conrad's requirement: "I wanted the deployment method of this bot on the box to
+be via git." The box was already a checkout, so what was missing was a
+controlled, repeatable, reversible UPDATE procedure, and an answer to "what is
+running" that does not need someone to log into the box. The cost of not having
+one was measured: the live desk ran twelve days at 25 commits behind `main` and
+no reading an operator could get said so.
+
+- **`docs/DEPLOY.md`** is the decision record: what gets deployed and why it is
+  an immutable ref rather than `main`, the ordered stop and start, the rollback,
+  and what is deliberately out of scope. The decision to deploy is #143 and
+  Conrad's; the Expert is not touched by a desk deploy, ruled on #73; and #142's
+  "no version handshake" boundary is respected, so this is observability only.
+- **`deploy/windows/Deploy-Desk.ps1`** executes it and REFUSES at the two
+  judgement gates rather than automating them: nothing changes without `-Apply`,
+  and it stops dead without `-BookIsFlat`, because a script can report the
+  ledger but cannot decide that stopping a live autonomous desk right now is
+  acceptable. It records the rollback point BEFORE anything changes, refuses
+  outright on an open inflight entry, and never runs `git clean`.
+- **The first step is not the obvious one.** Supervision's repeating trigger
+  fires regardless of what is being done to the working tree, so a `git
+  checkout` with the task enabled can start a desk on a half-updated tree. The
+  TRIGGER is disabled, not just the process, and `straightedge-watch` goes down
+  with it rather than paging the chat about a deliberate outage. Both are
+  re-enabled at the end and then PROVEN enabled, because a deploy that leaves
+  supervision disabled returns the box to the exact state #133 existed to fix,
+  silently.
+- **The state directory being a SIBLING of the checkout is now a requirement
+  with its consequence stated, not a happy accident.** It holds the journal, the
+  inflight ledger, the equity snapshot and the heartbeat: the audit log of a
+  real-money desk. The procedure performs a hard detached checkout inside the
+  tree, so if that directory were ever a child, every trade this desk has made
+  would be deleted and no other step would notice. The script refuses to run in
+  that configuration and CI watches the refusal fire.
+- **`/status` and the heartbeat now carry what is running.** The deploy writes
+  `journal.deployed.json` with the ref and the full 40-character OID; the desk
+  reads it (`src/straightedge/deployed.py`) and publishes it in both places,
+  because a person in the chat and a process on the box are different readers.
+  `unstamped` is an ANSWER and never a blank, and it never falls back to
+  `__version__`: a hand-maintained version spanning 18 changelog sections would
+  be a confident wrong answer in place of an honest absent one.
+- **A UTF-8 BOM can no longer stop the desk.** Measured live on the real-money
+  box: an edit made with Windows PowerShell 5.1's `Set-Content -Encoding UTF8`
+  wrote a BOM, which is invisible in an editor and to `Get-Content`, and
+  `tomllib` refused the whole file with `Invalid statement (at line 1, column
+  1)`. The desk would not have started at its next restart; it was caught by
+  validating through the loader and reverted from a backup. `load_config` now
+  decodes `utf-8-sig` and reports the BOM on stderr naming the remedy, nothing
+  this repo writes writes a BOM, and `deploy/windows/assert-config-loads.py` is
+  the pre-restart check that validates through the LOADER rather than by reading
+  the file back, which is the check that cannot see this defect.
+
 ### Docs: advice data, retention, and maturity claims (issue #91)
 
 Docs only; no behaviour change.

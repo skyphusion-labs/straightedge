@@ -42,6 +42,8 @@ live definitions and goes red.
 | `straightedge-watch.xml` | declared definition of the watcher task | no |
 | `Export-Tasks.ps1` | dumps the LIVE definitions for the audit | no, read-only |
 | `Install-Supervision.ps1` | registers both from XML, after recording what was there | **yes** |
+| `Deploy-Desk.ps1` | the git deploy executor, see [`docs/DEPLOY.md`](../../docs/DEPLOY.md) | **yes, with `-Apply`** |
+| `assert-config-loads.py` | validates a config through the LOADER before a restart | no, read-only |
 
 `python -m straightedge supervision --tasks <dir>` is the audit. With no
 `--tasks` it audits the DECLARED definitions in this directory, which is what

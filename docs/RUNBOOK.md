@@ -438,6 +438,26 @@ immediately makes Task Scheduler mark the task complete, and then only
 directly for this reason, and because it keeps the command line where the audit
 can read it.
 
+MEASURED ON THE LIVE BOX 2026-10-08, so read the paragraph above as a
+requirement and not as a description of what is there.
+`C:\bot-state\run-desk-hidden.vbs` is one line:
+
+```
+CreateObject("Wscript.Shell").Run "cmd /c ""C:\bot-state\run-desk.cmd""", 0, False
+```
+
+The wait flag is `False`. It does NOT wait. So on that box wscript returns at
+once, Task Scheduler marks the task complete, and `MultipleInstancesPolicy`
+protects nothing: `journal.lock` is the only barrier against a second desk.
+
+It is harmless today only because that task's repetition has never fired. The
+repetition hangs on a LogonTrigger with `StopAtDurationEnd=true` and no
+`Duration`, so the window shuts at logon: `NextRunTime` is empty and
+`LastRunTime` is twelve days old.
+
+REPAIR THE TRIGGER WITHOUT REPLACING THE LAUNCHER and you get a fresh python
+every five minutes with only the lock in the way. Fix both or neither.
+
 CAUTION
 MT4 is a GUI program.
 It needs a logged-in Windows session.

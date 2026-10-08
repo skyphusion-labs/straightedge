@@ -547,7 +547,27 @@ def load_config(path: str | Path | None = None) -> BotConfig:
     base_dir = Path(path).resolve().parent if path is not None else Path.cwd()
     if path is not None:
         raw = Path(path).read_bytes()
-        parsed = tomllib.loads(raw.decode("utf-8"))
+        # `utf-8-sig`, not `utf-8`, and this is an outage prevented rather than
+        # a nicety. A UTF-8 BOM is not valid TOML: `tomllib` refuses the whole
+        # file with "Invalid statement (at line 1, column 1)", which names
+        # neither the cause nor the remedy. And a BOM is the DEFAULT outcome of
+        # editing this file the obvious way on the box: Windows PowerShell
+        # 5.1's `Set-Content -Encoding UTF8` writes one. Measured live on
+        # 2026-10-08, on a real-money box, where it would have stopped the desk
+        # at its next restart; the edit was reverted from backup before that
+        # happened. A pure encoding artifact must not be able to refuse a
+        # config whose MEANING is unchanged, so it is tolerated and REPORTED.
+        if raw.startswith(b"\xef\xbb\xbf"):
+            print(
+                f"config: {path} starts with a UTF-8 BOM, which is not valid "
+                "TOML. It was tolerated and the file was read. Re-save it "
+                "without one; on Windows PowerShell 5.1 "
+                "`Set-Content -Encoding UTF8` writes a BOM and "
+                "`[System.IO.File]::WriteAllText` with UTF8Encoding($false) "
+                "does not.",
+                file=sys.stderr,
+            )
+        parsed = tomllib.loads(raw.decode("utf-8-sig"))
         if not isinstance(parsed, dict):
             raise ValueError("config root must be a table")
         data = parsed
