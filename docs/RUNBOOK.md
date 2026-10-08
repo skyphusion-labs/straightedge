@@ -9,6 +9,7 @@ The circuit is halt, daily-loss, and drawdown gates.
 WARNING
 Paper is the default.
 Nothing here guarantees profit.
+Advice is not financial advice.
 
 NOTE
 Put `--config` before the subcommand.
@@ -476,7 +477,8 @@ There is no automatic fallback. Send `default` to share one desk on purpose.
 `ADVICE_SESSIONS` is optional. Set it to a comma list to serve only those keys.
 The bot sends the chat id, so it needs no change.
 Redeploy: `cd agent && npx wrangler deploy` (needs `CLOUDFLARE_API_TOKEN`).
-The agent is still a Cloudflare preview.
+The agent depends on `@cloudflare/computer`, which Cloudflare ships as an early preview with unstable APIs.
+The Production/Stable classifier in `pyproject.toml` covers the bot, not the agent.
 
 ## Demo
 
@@ -1029,7 +1031,9 @@ that fired can never look unexercised.
 `advice_turn` closes one advice turn: `provider`, `session`, `action`,
 `symbol`, `sl`, `tp`, `limit`, `stop`, `ticket`, and `staged` (whether the
 desk tried to turn the suggestion into an order).
-The question and the model reply are never journaled.
+The question and the model reply are never written to `journal.jsonl`.
+`journal.advice.json` keeps the last 40 turns. With the agent, the workspace `log.md` keeps every turn, with no cap.
+See `docs/DATA.md`.
 `advice_circuit_block` is the circuit refusing to let the model stage at all.
 `advice_stage_failed` carries `measured=false`: the order could not be built,
 so no rule said no. COULD NOT MEASURE is not REFUSED, and it is deliberately

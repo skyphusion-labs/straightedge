@@ -18,7 +18,9 @@ Default: advice is staged.
 
 WARNING
 Nothing here guarantees profit.
+Advice is not financial advice.
 Paper is the default.
+The bot is Production/Stable (the bar is in CHANGELOG 1.0.0). The agent is a preview.
 Auto EMA trading is off until `/auto on`.
 
 ## Names
@@ -217,6 +219,7 @@ Send `/help` for the rest.
 
 `docs/CONTRACT.md` is the behaviour that tests enforce.
 `docs/VENUE.md` is the provider-agnostic execution API (`MarketOrder`, `WorkingOrder`).
+`docs/DATA.md` is what the desk stores, what it sends to each provider, and for how long.
 `docs/THIRD-PARTY.md` is every third-party component and the licence terms it carries.
 `docs/MT4.md` is the MT4 file-mailbox ICD.
 `docs/RUNBOOK.md` is paper, live, `/live on I-ACCEPT-RISK`, `/approve always`, `poll_seconds=1`, HALT, confirm-on-restart, lock, heartbeat, `watch`, the unattended Windows scheduled task, journal rotate, and launchd.

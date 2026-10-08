@@ -187,8 +187,9 @@ DOCTOR_MT5_BINDING = 3
 #: function that needs it, at OnInit and never again.
 MT4_MAILBOX = 36
 #: the LIVE Cloudflare AI Gateway id. Deliberately still the old string; see the header.
-#: 13 gateway-resource references plus 2 in the RUNBOOK LaunchAgent migration note.
-GATEWAY_ID_AND_MIGRATION_NOTE = 15
+#: 13 gateway-resource references plus 2 in the RUNBOOK LaunchAgent migration note, plus the
+#: four-line vocabulary header of docs/DATA.md, which names the gateway like every other doc.
+GATEWAY_ID_AND_MIGRATION_NOTE = 16
 #: the dead product module token. Zero, forever.
 DEAD_MODULE_TOKEN = 0
 
