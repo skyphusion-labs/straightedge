@@ -43,7 +43,17 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Callable, cast
 
-from straightedge.broker.mt4_live import BridgeTimeout, FileBridge, decode, encode
+from straightedge.broker.mt4_live import (
+    PHASE_CONNECT,
+    PHASE_READ,
+    PHASE_SHIM_MAILBOX,
+    PHASE_SHIM_UNAVAILABLE,
+    TRANSPORT_NET,
+    BridgeTimeout,
+    FileBridge,
+    decode,
+    encode,
+)
 from straightedge.constants import MAILBOX_SEND_OPS
 
 #: The one path the shim serves. One path, one method: every other request is a
@@ -220,8 +230,15 @@ class HttpBridge:
         # TimeoutError, which is an OSError but is NOT a URLError.
         except TimeoutError as exc:
             raise BridgeTimeout(
-                f"mt4 net bridge timeout after {budget:.1f}s op={op}: {exc}",
+                f"mt4 net bridge timeout after {budget:.1f}s "
+                f"transport={TRANSPORT_NET} phase={PHASE_READ} op={op}: {exc}",
                 op=op,
+                transport=TRANSPORT_NET,
+                # READ, not CONNECT: this arm is reached once the request is on
+                # the wire, so the shim may have the body. `connect` below is the
+                # one that means nothing answered at all. They were one string
+                # until #127 and they are not one fact.
+                phase=PHASE_READ,
                 # The request crossed the network and this end never had the
                 # file, so nothing here can take it back. `claimed` is the
                 # honest word for that, and it is the unsafe reading on
@@ -232,10 +249,14 @@ class HttpBridge:
         except urllib.error.URLError as exc:
             if isinstance(exc.reason, TimeoutError):
                 raise BridgeTimeout(
-                    f"mt4 net bridge timeout after {budget:.1f}s op={op}: {exc.reason}",
+                    f"mt4 net bridge timeout after {budget:.1f}s "
+                    f"transport={TRANSPORT_NET} phase={PHASE_CONNECT} "
+                    f"op={op}: {exc.reason}",
                     op=op,
                     withdrawal="claimed",
                     req_id=req_id,
+                    transport=TRANSPORT_NET,
+                    phase=PHASE_CONNECT,
                 ) from exc
             # Connection refused, DNS failure, host down. URLError IS an
             # OSError, and at startup that is ordinary: the shim may not be up
@@ -263,10 +284,22 @@ class HttpBridge:
         if exc.code in RETRYABLE_STATUSES:
             # The shim answered, and what it said is "the Expert has not replied
             # yet" or "the mailbox is not writable yet". Both are the cold-boot
-            # shape, so the type is the one `startup_connect()` retries.
+            # shape, so the type is the one `startup_connect()` retries. They are
+            # NOT the same diagnosis, though, and the phase is what keeps them
+            # apart in the journal: 504 means the file leg behind the shim timed
+            # out, 503 means that leg was never usable.
+            phase = (
+                PHASE_SHIM_MAILBOX
+                if exc.code == STATUS_MAILBOX_TIMEOUT
+                else PHASE_SHIM_UNAVAILABLE
+            )
             return BridgeTimeout(
-                f"mt4 net bridge: {exc.code} from the shim ({detail})",
+                f"mt4 net bridge: {exc.code} from the shim "
+                f"transport={TRANSPORT_NET} phase={phase}"
+                f"{(' op=' + op) if op else ''} ({detail})",
                 op=op,
+                transport=TRANSPORT_NET,
+                phase=phase,
                 # A 504 IS the shim reporting a mailbox timeout, and the
                 # shim's own FileBridge has already withdrawn the request
                 # on that path. It does not say WHICH outcome it got,
