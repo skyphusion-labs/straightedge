@@ -1,4 +1,25 @@
-"""Load TOML config. Secrets never live here; MT5 login comes from env."""
+"""Load TOML config.
+
+The environment is where secrets BELONG, and for every secret but one the file
+is still accepted as a fallback (`straightedge#139`). Saying "secrets never
+live here" was the older claim and it was not true of this loader: env wins,
+and a key present in the TOML is read when its variable is unset. That is a
+deliberate convenience, not an oversight, and the cost of removing it is an
+operator whose running desk stops starting.
+
+What closes the gap is `settings_from_file` instead: the loader records WHICH of
+those keys it took from the file, by name and never by value, `doctor` and
+`run` print it, and the journal's `start` record carries it. The same shape as
+the handover posture in `docs/CONTRACT.md`, for the same stated reason: the gap
+a permissive default leaves is closed by observability, not by a stricter
+default that silently changes every existing deployment.
+
+`mt4.mailbox_token` is the one key with no TOML entry at all, so a key an
+operator writes there is discarded. That is reported through
+`settings_read_from_nowhere` rather than refused, and
+`IGNORED_FILE_SOURCED_SETTINGS` says why: the only dangerous state is already
+fail-closed in `mt4_net.require_token`, one layer down.
+"""
 
 from __future__ import annotations
 
@@ -25,6 +46,97 @@ from straightedge.constants import (
 #: or never written.
 DEVIATION_FROM_SYMBOL = "symbol"
 DEVIATION_FROM_DEFAULT = "default"
+
+#: NAMING, and it is deliberate rather than coy. Nothing in this group is
+#: called `secret`, `key`, `token`, `password` or `credential`, even though
+#: "the secret settings" is what a human would say. CodeQL classifies
+#: sensitive data by IDENTIFIER NAME, so `print(_secret_source_line(cfg))`
+#: raised two HIGH py/clear-text-logging-sensitive-data alerts while the
+#: adjacent `_presence(cfg, "telegram.token", cfg.telegram.token)` call, which
+#: handles an actual token, raised none. These fields hold key NAMES and
+#: `tests/test_config_secret_provenance.py` asserts no value reaches stdout,
+#: so the alert was wrong about the data. It was right about the SHAPE: a
+#: field named `secrets_from_file` that is printed is one careless refactor
+#: from a real leak. Suppressing it would blind that print to the real leak
+#: forever, so the names moved instead and the gate stays live. Do not
+#: "improve" these names back; the docstrings carry the meaning.
+#:
+#: Every name under "Secret names" in SECURITY.md that this loader will read
+#: from `config.toml` when its environment variable is unset, as
+#: (env var, TOML section, TOML key). The list exists so the document and the
+#: loader cannot drift again: SECURITY.md describes exactly these nine, and
+#: `tests/test_config_secret_provenance.py` asserts the correspondence in both
+#: directions rather than trusting either side's prose.
+#:
+#: `MT4_MAILBOX_TOKEN` is deliberately NOT here. It has no TOML key at all.
+FILE_SOURCED_SETTINGS: tuple[tuple[str, str, str], ...] = (
+    ("MT5_LOGIN", "mt5", "login"),
+    ("MT5_PASSWORD", "mt5", "password"),
+    ("MT5_SERVER", "mt5", "server"),
+    ("TELEGRAM_BOT_TOKEN", "telegram", "token"),
+    ("TELEGRAM_CHAT_ID", "telegram", "chat_id"),
+    ("XAI_API_KEY", "advice", "grok_key"),
+    ("ANTHROPIC_API_KEY", "advice", "claude_key"),
+    ("ADVICE_URL", "advice", "computer_url"),
+    ("ADVICE_TOKEN", "advice", "computer_token"),
+)
+
+
+def settings_taken_from_file(data: dict, environ: dict | None = None) -> tuple[str, ...]:
+    """Which `FILE_SOURCED_SETTINGS` this load would take from the FILE, by NAME.
+
+    Names only. A VALUE must never reach this return, `doctor`'s stdout or the
+    journal, which is the whole reason the loader reports provenance rather
+    than the operator reading `config.toml` by hand to find out.
+
+    The env-wins test is `is not None`, matching the `os.environ.get(VAR,
+    <file>)` form at each call site EXACTLY, including the case of a variable
+    exported as the empty string: that currently beats the file and disables
+    the feature, and quietly changing it would change behaviour on a running
+    desk rather than report on one.
+    """
+    env = os.environ if environ is None else environ
+    out: list[str] = []
+    for var, section, key in FILE_SOURCED_SETTINGS:
+        if env.get(var) is not None:
+            continue
+        sec = _section(data, section)
+        if str(sec.get(key, "") or ""):
+            out.append(f"{section}.{key}")
+    return tuple(out)
+
+
+#: Secret-bearing TOML keys the loader reads from NOWHERE. A key here is an
+#: operator instruction being discarded, which is the defect
+#: `parse_symbol_deviation_points` names below: "An override an operator wrote
+#: and the loader ignored is the worst of the three outcomes ... and nothing
+#: reports the disagreement."
+#:
+#: It is REPORTED and not refused, deliberately. The only state in which an
+#: ignored `mt4.mailbox_token` is dangerous is `mailbox_url` set with no
+#: `MT4_MAILBOX_TOKEN`, and `mt4_net.require_token` already fails closed there
+#: at startup on both ends ("An empty token is not 'auth disabled', it is a
+#: misconfiguration"). A second gate at load would catch nothing that gate
+#: misses, and it WOULD stop two working configurations from starting: the env
+#: var set with a stale key still in the file, and the co-located file mailbox,
+#: which needs no token at all. What was missing was never a refusal. It was
+#: the report.
+IGNORED_FILE_SOURCED_SETTINGS: tuple[tuple[str, str], ...] = (("mt4", "mailbox_token"),)
+
+
+def settings_read_from_nowhere(data: dict) -> tuple[str, ...]:
+    """`IGNORED_FILE_SOURCED_SETTINGS` actually present in this file, by NAME.
+
+    Independent of the environment: the key is read from nowhere, so whether a
+    variable happens to be set changes nothing about the file being wrong.
+    An EMPTY value is not reported; it overrides nothing, so there is no
+    disagreement, and a placeholder an operator left behind is not a defect.
+    """
+    out: list[str] = []
+    for section, key in IGNORED_FILE_SOURCED_SETTINGS:
+        if str(_section(data, section).get(key, "") or ""):
+            out.append(f"{section}.{key}")
+    return tuple(out)
 
 
 @dataclass(frozen=True)
@@ -404,6 +516,16 @@ class BotConfig:
     comment: str = "straightedge"
     journal_path: str = "journal.jsonl"
     live_accepted: bool = False
+    #: Secret-bearing TOML keys this config took from `config.toml` rather than
+    #: from the environment, by NAME (straightedge#139). Empty is the good
+    #: case and it is reported explicitly rather than by silence, because an
+    #: absent check reads exactly like a passed one. Never a VALUE: `doctor`
+    #: prints this and the journal's `start` record carries it.
+    settings_from_file: tuple[str, ...] = ()
+    #: Secret-bearing TOML keys present in `config.toml` that the loader reads
+    #: from NOWHERE, by name (straightedge#139). Not a refusal: see
+    #: `IGNORED_FILE_SOURCED_SETTINGS` for why reporting is the whole fix.
+    settings_read_from_nowhere: tuple[str, ...] = ()
 
     def validate(self) -> None:
         if self.mode not in {"paper", "mt5", "mt4"}:
@@ -570,6 +692,9 @@ def load_config(path: str | Path | None = None) -> BotConfig:
     elif isinstance(data.get("symbols"), list):
         names = list(data["symbols"])
 
+    settings_from_file = settings_taken_from_file(data)
+    settings_read_from_nowhere_ = settings_read_from_nowhere(data)
+
     login = int(os.environ.get("MT5_LOGIN", mt5_s.get("login", 0) or 0) or 0)
     password = os.environ.get("MT5_PASSWORD", str(mt5_s.get("password", "") or ""))
     server = os.environ.get("MT5_SERVER", str(mt5_s.get("server", "") or ""))
@@ -607,6 +732,8 @@ def load_config(path: str | Path | None = None) -> BotConfig:
         journal_path=resolve_state_path(
             str(engine_s.get("journal_path", "journal.jsonl")), base_dir=base_dir
         ),
+        settings_from_file=settings_from_file,
+        settings_read_from_nowhere=settings_read_from_nowhere_,
         risk=RiskConfig(
             risk_pct=float(risk_s.get("risk_pct", 0.005)),
             daily_loss_pct=float(risk_s.get("daily_loss_pct", 0.02)),

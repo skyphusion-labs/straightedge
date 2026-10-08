@@ -12,26 +12,58 @@ The gateway is Cloudflare AI Gateway `mt5-risk-bot`.
 
 ## Production secrets
 
-Secrets live in the environment.
-Do not put secrets in `config.toml`.
-`config.toml` is gitignored.
+Secrets BELONG in the environment. Put them there.
 
-Secret names:
+`config.toml` is accepted as a fallback for nine of them, and the environment
+wins whenever both are set. This section used to say "Do not put secrets in
+`config.toml`", which read as a control the loader does not have; it was a
+recommendation, and `straightedge#139` made the document say what the code
+does rather than the reverse. `config.toml` is gitignored and the operator
+keeps it 0600.
 
-- `MT5_LOGIN`
-- `MT5_PASSWORD`
-- `MT5_SERVER`
-- `TELEGRAM_BOT_TOKEN`
-- `TELEGRAM_CHAT_ID`
-- `XAI_API_KEY`
-- `ANTHROPIC_API_KEY`
-- `ADVICE_URL`
-- `ADVICE_TOKEN`
+Secret names, each with the TOML key the loader will read when the variable is
+unset. `src/straightedge/config.py` declares this table as `FILE_SOURCED_SETTINGS`
+and `tests/test_config_secret_provenance.py` asserts this document and that
+tuple name the same nine, in both directions, so the two cannot drift again.
+
+| Environment variable | TOML key read as a fallback |
+| --- | --- |
+| `MT5_LOGIN` | `mt5.login` |
+| `MT5_PASSWORD` | `mt5.password` |
+| `MT5_SERVER` | `mt5.server` |
+| `TELEGRAM_BOT_TOKEN` | `telegram.token` |
+| `TELEGRAM_CHAT_ID` | `telegram.chat_id` |
+| `XAI_API_KEY` | `advice.grok_key` |
+| `ANTHROPIC_API_KEY` | `advice.claude_key` |
+| `ADVICE_URL` | `advice.computer_url` |
+| `ADVICE_TOKEN` | `advice.computer_token` |
+
+`MT4_MAILBOX_TOKEN` is the one secret with NO TOML key at all. A
+`mt4.mailbox_token` written in the file is read by nothing. It is REPORTED,
+not refused: the only state where ignoring it could leave an order endpoint
+unauthenticated is `mt4.mailbox_url` set with no `MT4_MAILBOX_TOKEN`, and
+`mt4_net.require_token` already refuses that at startup on both ends.
+
+### Which source did THIS config use
+
+`doctor` and `run` both print it, by key name and never by value:
+
+```
+secrets: all from the environment
+secrets: 2 from config.toml (telegram.token, advice.grok_key); the environment overrides any of them. Values are never printed
+secrets IGNORED in config.toml: mt4.mailbox_token. The loader reads these from nowhere; put the value in the environment variable instead, and remove it from the file
+```
+
+The journal's `start` record carries the same two lists as
+`settings_from_file` and `settings_read_from_nowhere`, so the posture is readable
+live and after the fact. Same trade as the handover posture in
+`docs/CONTRACT.md`: a permissive default that every existing deployment
+already depends on is left alone, and the gap it leaves is closed by
+observability rather than by a stricter default.
 
 The agent uses `CF_AIG_TOKEN` and `ADVICE_TOKEN`.
 The agent bills through the gateway with Unified Billing.
 Do not put a provider key on the agent.
-Env vars override toml if both are set.
 
 Journal writes replace keys named `token`, `password`, `api_key`, `grok_key`, `claude_key`, `mailbox_token`, and `login` with `[REDACTED]`.
 `Journal.tail()` redacts again when it reads, so a row written by an older build is redacted too.
