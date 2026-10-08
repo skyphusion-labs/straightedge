@@ -64,7 +64,11 @@ def test_journal_write_redacts_nested_and_embedded_token(tmp_path: Path) -> None
     assert "list-secret" not in text
     assert FAKE_TOKEN not in text
     rec = Journal(path).tail(1)[0]
-    assert rec["creds"]["login"] == 42
+    # straightedge#90 added `login` to `_SECRET_KEYS`, so a nested one is now
+    # redacted too. This line read `== 42` and was the pin that said otherwise.
+    # `n` keeps the other half honest: redaction is still key-named, not a
+    # blanket over every nested field.
+    assert rec["creds"]["login"] == "[REDACTED]"
     assert rec["items"][0]["n"] == 1
     assert FAKE_TOKEN not in rec["error"]
 

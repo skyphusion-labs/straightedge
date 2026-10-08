@@ -28,7 +28,12 @@ from straightedge.broker.paper import PaperBroker
 from straightedge.config import BotConfig, load_config
 from straightedge.engine import Engine, run_backtest
 from straightedge.history import preflight
-from straightedge.journal import InstanceLock, InstanceLockError, redact_text
+from straightedge.journal import (
+    InstanceLock,
+    InstanceLockError,
+    mask_account_id,
+    redact_text,
+)
 from straightedge.models import Bar
 from straightedge.strategy import TrendStrategy
 from straightedge.synthetic import generate_bars, generate_ranging
@@ -325,7 +330,8 @@ def cmd_doctor(args: argparse.Namespace) -> int:
                 broker.connect()
                 acct = broker.account()
                 print(
-                    f"connected venue=mt4 login={acct.login} server={acct.server} "
+                    f"connected venue=mt4 login={mask_account_id(acct.login)} "
+                    f"server={acct.server} "
                     f"equity={acct.equity:.2f} {acct.currency} trade_mode={acct.trade_mode}"
                 )
                 # The two halves of the send contract, read off the LIVE Expert
@@ -365,7 +371,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
                 broker.connect()
             acct = broker.account()
             print(
-                f"connected login={acct.login} server={acct.server} "
+                f"connected login={mask_account_id(acct.login)} server={acct.server} "
                 f"equity={acct.equity:.2f} {acct.currency} trade_mode={acct.trade_mode}"
             )
             if history_check(cfg, broker):

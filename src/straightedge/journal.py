@@ -20,8 +20,20 @@ from typing import Any, TextIO
 # `mailbox_token` is spelled out because the match is exact-key, not substring:
 # "token" alone does not redact a field called "mailbox_token". Nothing journals
 # it today; it is listed so that adding such a field cannot leak one silently.
+#
+# `login` is the broker account number and it is the one entry here that is NOT
+# a credential: the password and the server are separate fields and neither is
+# journaled, so a leaked login grants nothing (straightedge#90). It is in the
+# set anyway, for two reasons. `SECURITY.md` lists `MT5_LOGIN` under "Secret
+# names", so the code and the document have to agree on something; and the
+# `start` row is rendered field-by-field into the chat by
+# `engine.history_text` (`/history`, and the daily `recap`) and shipped to an
+# external advice provider by `engine.advice_history`, which makes an account
+# identifier that nobody needs to read a thing in front of a demo audience.
+# What the journal loses by this is nothing an audit reads the row for: `mode`,
+# `equity`, `server` and `symbols` all survive.
 _SECRET_KEYS = frozenset(
-    {"token", "password", "api_key", "grok_key", "claude_key", "mailbox_token"}
+    {"token", "password", "api_key", "grok_key", "claude_key", "mailbox_token", "login"}
 )
 _REDACTED = "[REDACTED]"
 # BotFather tokens: <id>:<secret> with 8-12 digit id and 30+ url-safe chars.
@@ -68,6 +80,22 @@ class Journal:
         _chmod600(self.path)
 
     def tail(self, n: int = 20) -> list[dict[str, Any]]:
+        """Last n live records, redacted AGAIN on the way out.
+
+        Redacting on write alone would only protect rows this build wrote. An
+        append-only audit log is never rewritten, so every row already on disk
+        would keep whatever the build that wrote it did not redact, and
+        `tail()` is what feeds the two paths that show a row to somebody:
+        `engine.history_text` (`/history` and the daily `recap`, both into the
+        chat) and `engine.advice_history` (the `history` field of the advice
+        request, so off the box entirely). straightedge#90: the live journal
+        held 8 `start` rows with an unredacted `login` when that was found, and
+        no write-side fix reaches them.
+
+        `last_event()` deliberately does NOT do this. It restores a pending
+        order rather than showing anything to anyone, and a redacted value
+        there would be a wrong value in a real-money path.
+        """
         if n <= 0 or not self.path.exists():
             return []
         with self.path.open("r", encoding="utf-8") as fh:
@@ -82,7 +110,7 @@ class Journal:
             except json.JSONDecodeError:
                 continue
             if isinstance(rec, dict):
-                out.append(rec)
+                out.append(redact(rec))
         return out
 
     def last_event(self, *names: str) -> dict[str, Any] | None:
@@ -163,6 +191,31 @@ def redact_text(s: str) -> str:
     for pattern in _SECRET_PATTERNS:
         s = pattern.sub(_REDACTED, s)
     return s
+
+
+def mask_account_id(value: Any) -> str:
+    """A broker login for the OPERATOR'S OWN console, masked to the last four.
+
+    The deliberate call straightedge#90 asked for. `doctor --connect` exists to
+    answer one question -- is the terminal attached to the account I think it
+    is -- and `[REDACTED]` does not answer it, so printing nothing would break
+    the diagnostic to protect an identifier that is not a credential. The last
+    four answer it for the one person who already knows the number, and a
+    screen share, a screenshot or a `doctor` output pasted into an issue no
+    longer carries it. That is why this path masks while the journal and the
+    chat redact outright: the console has a reader with a question, and those
+    two have no reader who needs the answer.
+
+    The prefix is a fixed `***` rather than one star per hidden digit, because
+    the number of stars would publish the login's length for no benefit.
+    """
+    s = "" if value is None else str(value)
+    if len(s) < 6:
+        # A real MT4/MT5 login is six digits or more. Below that the last four
+        # leave too little hidden to be a mask at all, so show nothing rather
+        # than nearly all of it.
+        return _REDACTED
+    return "***" + s[-4:]
 
 
 def redact(v: Any) -> Any:
