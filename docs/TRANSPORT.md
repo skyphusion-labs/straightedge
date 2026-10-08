@@ -183,7 +183,9 @@ outbound-only tunnel.
 **A bearer token, required, with no off switch.**
 
 - `MT4_MAILBOX_TOKEN` in the environment on **both** ends. It is never read from a
-  config file, matching `docs/CONTRACT.md` ("Secrets live in the environment").
+  config file, matching `docs/CONTRACT.md` ("Secrets belong in the environment").
+  It is the ONE secret with no TOML key at all, so unlike the other nine there
+  is no file fallback to fall back to (straightedge#139).
 - The shim **refuses to start** with no token, or with a token shorter than 32
   characters. There is no unauthenticated mode and no flag that creates one: this
   endpoint places trades.

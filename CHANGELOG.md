@@ -4,7 +4,7 @@ NOTE: Operator docs from 1.0.0 use 8th-grade Simplified Technical English.
 Do not treat older changelog wording as the operator contract.
 See README.md and docs/CONTRACT.md.
 
-## Unreleased
+## 1.6.0
 
 ### Docs: advice data, retention, and maturity claims (issue #91)
 
