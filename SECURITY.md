@@ -59,6 +59,8 @@ A refused command gets no reply.
 `journal.lock` is chmod 0600 when `run` takes the exclusive lock (flock / msvcrt).
 `journal.heartbeat` is chmod 0600 after each write.
 `HALT` is chmod 0600 when the bot writes it.
+`journal.advice.json` is chmod 0600 on each write (written to a temp file, then replaced).
+What each file holds, where it goes, and for how long: `docs/DATA.md`.
 
 WARNING
 Two things arm a real-money account, both per process, neither restored by

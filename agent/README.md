@@ -19,7 +19,8 @@ Live:
 - The gateway: `mt5-risk-bot` (account `fabcb25d9c7eb087110ec474a03e50d2`)
 - Model: `xai/grok-4.6`
 
-The agent is an early Computer preview.
+The agent depends on `@cloudflare/computer`, which Cloudflare ships as an early preview with unstable APIs.
+The Production/Stable classifier in `pyproject.toml` covers the bot, not the agent.
 The bot still runs next to MT5.
 
 ## Inference path (docs)

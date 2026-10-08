@@ -6,6 +6,16 @@ See README.md and docs/CONTRACT.md.
 
 ## Unreleased
 
+### Docs: advice data, retention, and maturity claims (issue #91)
+
+Docs only; no behaviour change.
+
+- `docs/DATA.md` (new) says what the desk stores, where, for how long, and what an advice turn sends to each provider: `journal.advice.json` holds the last 40 advice turns in prose and is never expired; the agent workspace `log.md` holds every question and reply with no cap; `compose.yaml` defaults to the agent on the maintainer Worker.
+- `docs/CONTRACT.md` and `docs/RUNBOOK.md` no longer say the question and reply are never journaled; they say which file they are not in and which files they are in.
+- The Production/Stable classifier is scoped to the bot in README; the agent is a preview because `@cloudflare/computer` is one (its README: "provided as a preview for feedback").
+- "Advice is not financial advice" joins the README and RUNBOOK WARNING blocks. The reply footer is a code change tracked separately.
+- `SECURITY.md` lists `journal.advice.json` with the other 0600 files.
+
 ### Tickers longer than three characters resolve as pairs (issue #77)
 
 `parse_fx` took the first six alphabetic characters and split them 3 and 3, so
