@@ -66,7 +66,7 @@ from straightedge.synthetic import generate_bars
 from straightedge.telegram import TgCommand
 from straightedge.engine import Engine
 
-from refusal_scan import scan_reasons
+from refusal_scan import scan_decision_reasons, scan_reasons
 
 
 MAGIC = BotConfig().risk.magic
@@ -78,6 +78,14 @@ WED_EARLY = datetime(2024, 1, 3, 5, 0, tzinfo=timezone.utc)  # before 07:00 UTC
 # measured and not carried forward from an issue body.
 REASONS = (
     "spec_not_measured",
+    # Raised by engine.py, not risk.py, and its behavioural case lives with the
+    # gate that raises it (tests/test_working_orders_count_as_exposure.py,
+    # TestAnUnmeasuredReadRefuses) rather than being duplicated here: the
+    # helpers in this file drive `rm.evaluate`, which is not the surface this
+    # refusal comes out of. It is rostered here because the roster is the
+    # DENOMINATOR of operator-visible refusals, and that population is no
+    # longer confined to one module.
+    "orders_unmeasured",
     "deviation_below_spread",
     "state_unreadable",
     "state_unwritable",
@@ -169,6 +177,7 @@ def _gate(rm: RiskManager, **kw):
         spec=kw.get("spec", default_spec("EURUSD")),
         tick=kw.get("tick", _tick()),
         positions=kw.get("positions", []),
+        orders=kw.get("orders", []),
         now=kw.get("now", WED_NOON),
         manual=kw.get("manual", True),
     )
@@ -184,8 +193,29 @@ def test_roster_covers_every_reason_in_the_module() -> None:
     the only way a per-reason suite stays a denominator instead of becoming a
     snapshot of the day it was written.
     """
-    src = Path(__file__).resolve().parents[1] / "src" / "straightedge" / "risk.py"
+    root = Path(__file__).resolve().parents[1] / "src" / "straightedge"
+    src = root / "risk.py"
     scan = scan_reasons(src.read_text(encoding="utf-8"))
+    # engine.py builds RiskDecision too, as of the working-orders gate. On main
+    # it built ZERO, so reading risk.py alone was a COMPLETE denominator; it
+    # stopped being complete because the population moved, not because this
+    # scanner changed, and nothing here would have noticed. A refusal the
+    # operator sees as `refused: <reason>` must have a case in this file no
+    # matter which module constructs it.
+    #
+    # Narrow scan on purpose: engine.py has a dozen `reason=` kwargs that are
+    # journal fields rather than refusals, and every `-> str` method of Engine
+    # returns operator prose, so the broad scan_reasons pass would corrupt the
+    # roster instead of widening it.
+    engine_scan = scan_decision_reasons((root / "engine.py").read_text(encoding="utf-8"))
+    assert not engine_scan.unresolved, (
+        "the scanner could not read a RiskDecision reason in engine.py, so the "
+        "roster is not a denominator: " + repr(list(engine_scan.unresolved))
+    )
+    assert engine_scan.names, (
+        "engine.py names no RiskDecision reason; if that is now true, drop this "
+        "scan rather than leaving a check that cannot fail"
+    )
     # FIRST, before any comparison: did the scanner manage to read every site?
     # A reason it could not resolve is not a passed check, and a denominator
     # built on a partial read is the #61 defect wearing an AST.
@@ -198,23 +228,28 @@ def test_roster_covers_every_reason_in_the_module() -> None:
         f"pinned: found {scan.forwarded!r}, pinned "
         f"{FORWARDED_REASON_EXPRESSIONS!r}"
     )
-    found = set(scan.names)
+    found = set(scan.names) | set(engine_scan.names)
     found.discard("ok")
     assert set(PREFIX_REASONS) == scan.prefixes, (
         "prefix-shaped reasons changed: risk.py has "
         f"{sorted(scan.prefixes)}, this file pins {sorted(PREFIX_REASONS)}"
     )
     missing = found - set(REASONS)
-    assert not missing, "risk.py names refusal reasons with no case here: " + repr(sorted(missing))
+    assert not missing, (
+        "risk.py or engine.py names refusal reasons with no case here: "
+        + repr(sorted(missing))
+    )
     stale = set(REASONS) - found
-    assert not stale, "roster names reasons risk.py no longer has: " + repr(sorted(stale))
+    assert not stale, (
+        "roster names reasons neither risk.py nor engine.py has: " + repr(sorted(stale))
+    )
     # No hardcoded total. The count is DERIVED from what risk.py actually
     # names, so adding a reason to the module cannot be satisfied by editing a
     # number here. A literal count is a fact about the day it was written, and
     # this roster exists precisely to stop the denominator drifting.
     assert len(REASONS) == len(set(REASONS)) == len(found), (
-        "roster size must equal the reasons risk.py names: "
-        f"roster={len(REASONS)} module={len(found)}"
+        "roster size must equal the reasons risk.py and engine.py name: "
+        f"roster={len(REASONS)} modules={len(found)}"
     )
     assert set(UNREACHABLE) <= set(REASONS), "UNREACHABLE names a reason the roster does not"
 
