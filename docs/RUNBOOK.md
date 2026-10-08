@@ -1014,7 +1014,7 @@ A pending fill writes `open` with `fill=true`.
 A vanished ticket writes `close` with `fill=true`.
 The venue holds the live book. It is not the fill log.
 
-JSONL, one event per line: `start`, `open`, `close`, `modify`, `reject`, `halt`, `order_check_fail`, `pending`, `recap`, `reconnect`, `loop_error`, `confirm_stage`, `confirm_cancel`, `confirm_sent`, `approve_always`, `approve_off`, `auto_on`, `auto_off`, `live_on`, `live_off`, `live_not_restored`, `risk_state_error`, `advice_turn`, `advice_circuit_block`, `advice_stage_failed`, `flatten`, `flatten_incomplete`, `close_failed`, `close_partial`, `cancel_failed`, `positions_read_failed`, `orders_read_failed`, `send_unresolved`, `send_refused_unresolved`, `confirm_unresolved`, `inflight_unreadable`, `stop`.
+JSONL, one event per line: `start`, `open`, `close`, `modify`, `reject`, `halt`, `order_check_fail`, `pending`, `recap`, `reconnect`, `loop_error`, `confirm_stage`, `confirm_cancel`, `confirm_sent`, `approve_always`, `approve_off`, `auto_on`, `auto_off`, `live_on`, `live_off`, `live_not_restored`, `risk_state_error`, `advice_turn`, `advice_circuit_block`, `advice_stage_failed`, `flatten`, `flatten_incomplete`, `close_failed`, `close_partial`, `cancel_failed`, `positions_read_failed`, `orders_read_failed`, `send_unresolved`, `send_refused_unresolved`, `confirm_unresolved`, `inflight_unreadable`, `notify_truncated`, `stop`.
 `reject` is written by every gate that refuses, on every path, and it is the
 record to grep when the bot will not trade.
 It carries the NAMED `reason`, plus `source` (`auto`, `telegram`, or `advice`)

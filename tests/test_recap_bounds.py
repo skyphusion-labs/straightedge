@@ -1,0 +1,319 @@
+"""straightedge#119: the nightly recap must not compound, repeat, or burst.
+
+Three defects, one function. These tests are written to fail on the code that
+shipped them, and each one asserts a PROPERTY rather than a rendering:
+
+- The recap stored `tail=self.history_text(8)`, a rendering of OTHER journal
+  rows, as a field inside its own journal row. `history_text` renders every
+  field of every row it reads, so it re-expanded that stored `tail` on the next
+  recap: recap N contained recap N-1 contained recap N-2. Asserting that a
+  recap "mentions the right day" passes happily on a payload nested fifty deep,
+  so the assertions here are on SIZE and STRUCTURE.
+- `_maybe_daily_recap` never advanced `snap.day_key`. The rollover lives in
+  `RiskManager.observe`, reached through `_apply_circuit`, which `step_all`
+  returns BEFORE when `self.halted`. So a halted desk re-emitted the recap on
+  every tick, forever.
+- One logical message was chunked into as many Telegram sends as it took.
+
+The halted test drives the halt through the operator HALT file rather than
+setting `engine.halted` by hand: the flag is what `step_all` branches on, and
+reaching it the way production does is what makes the test evidence about the
+shipped path instead of about my own assumption.
+"""
+
+import json
+from datetime import datetime, timedelta, timezone
+
+from straightedge.broker.paper import PaperBroker
+from straightedge.config import BotConfig
+from straightedge.engine import Engine
+from straightedge.synthetic import generate_bars
+from straightedge.telegram import TelegramClient
+
+RECAP_NOTIFY = frozenset({"start", "stop", "open", "close", "halt", "recap"})
+
+
+class FakeTransport:
+    def __init__(self) -> None:
+        self.sent: list[tuple[str, dict]] = []
+        self.updates: list[dict] = []
+
+    def post_json(self, url: str, payload: dict, timeout: float = 10.0, headers=None) -> dict:
+        del timeout, headers
+        self.sent.append((url, payload))
+        if url.endswith("/getUpdates"):
+            result = self.updates
+            self.updates = []
+            return {"ok": True, "result": result}
+        return {"ok": True, "result": {"message_id": 1}}
+
+
+def _cfg(tmp_path) -> BotConfig:
+    cfg = BotConfig()
+    cfg.journal_path = str(tmp_path / "j.jsonl")
+    cfg.session.enabled = False
+    cfg.risk.max_spread_atr_frac = 10.0
+    cfg.risk.halt_file = str(tmp_path / "HALT")
+    cfg.strategy.auto = False
+    return cfg
+
+
+def _engine(tmp_path, clock, *, telegram=None, cfg=None) -> Engine:
+    cfg = cfg if cfg is not None else _cfg(tmp_path)
+    broker = PaperBroker(balance=10_000)
+    broker.seed_bars("EURUSD", generate_bars(120, drift=0.0004, vol=0.0002, seed=3))
+    return Engine(
+        cfg,
+        broker,
+        halt_dir=str(tmp_path),
+        telegram=telegram,
+        now_fn=lambda: clock[0],
+    )
+
+
+def _recaps(engine: Engine) -> list[dict]:
+    return [r for r in engine.journal.tail(10_000) if r.get("event") == "recap"]
+
+
+def _roll_days(engine: Engine, clock, days: int) -> None:
+    """Advance whole UTC days, one `step_all` each, the way a live desk ticks."""
+    for _ in range(days):
+        clock[0] = (clock[0] + timedelta(days=1)).replace(hour=0, minute=5)
+        engine.step_all()
+
+
+def test_recap_payload_does_not_grow_with_the_number_of_days(tmp_path) -> None:
+    """The property: N days of recaps, and recap N is not bigger than recap 1.
+
+    This is the assertion the stored `tail` cannot survive. Each recap embedded
+    the previous one, so the payload grew multiplicatively with N while every
+    "does it name the right day" check stayed green.
+    """
+    clock = [datetime(2024, 1, 3, 12, tzinfo=timezone.utc)]
+    engine = _engine(tmp_path, clock)
+    engine.start()
+    _roll_days(engine, clock, 8)
+    engine.stop()
+
+    rows = _recaps(engine)
+    assert len(rows) == 8, f"expected one recap per day roll, got {len(rows)}"
+    sizes = [len(json.dumps(r, sort_keys=True)) for r in rows]
+    # Not "small": FLAT. A recap's own facts (day, equity, day_start, pnl) are
+    # the same shape every day, so the last row may differ from the first only
+    # by the digits in its numbers.
+    assert max(sizes) - min(sizes) <= 32, f"recap payload grows with N: {sizes}"
+    assert max(sizes) <= 512, f"a recap row carries more than its own facts: {sizes}"
+
+
+def test_a_recap_row_never_stores_a_rendering_of_other_rows(tmp_path) -> None:
+    """The structural half: a journal row holds FACTS, never rendered rows.
+
+    Size alone could be satisfied by a cap on a field that still holds a
+    rendering. What makes the design wrong is that the field exists at all, so
+    assert on the shape: no value may be multi-line, and no value may contain
+    another row's event name or timestamp.
+    """
+    clock = [datetime(2024, 1, 3, 12, tzinfo=timezone.utc)]
+    engine = _engine(tmp_path, clock)
+    engine.start()
+    _roll_days(engine, clock, 4)
+    engine.stop()
+
+    rows = _recaps(engine)
+    assert rows, "no recap was emitted, so this test measured nothing"
+    for row in rows:
+        for key, value in row.items():
+            if key in {"ts", "event"} or not isinstance(value, str):
+                continue
+            assert "\n" not in value, f"recap field {key} holds a rendered block"
+            assert "recap" not in value, f"recap field {key} embeds another recap"
+            assert "T00:0" not in value, f"recap field {key} embeds another row's ts"
+
+
+def test_a_halted_desk_emits_exactly_one_recap_per_day(tmp_path) -> None:
+    """Defect 2, and the dangerous one: the recap re-fired on every halted tick.
+
+    `step_all` calls `_maybe_daily_recap` and THEN returns early on
+    `self.halted`, before the `_apply_circuit` path that rolls `day_key`. So
+    while halted the day never rolled and the emit condition stayed true. Ten
+    ticks across one midnight is ten recaps; it must be one.
+    """
+    tr = FakeTransport()
+    tg = TelegramClient(token="t", chat_id="1", transport=tr, notify_events=RECAP_NOTIFY)
+    clock = [datetime(2024, 1, 3, 12, tzinfo=timezone.utc)]
+    engine = _engine(tmp_path, clock, telegram=tg)
+    engine.start()
+
+    # Halt the way an operator does. This is what sets engine.halted, and the
+    # early return it causes is the whole defect.
+    engine.risk.write_halt_file("operator")
+    engine.step_all()
+    assert engine.halted, "the HALT file did not halt the desk, so nothing was tested"
+    assert not _recaps(engine), "a recap fired before any day rolled"
+
+    clock[0] = datetime(2024, 1, 4, 0, 5, tzinfo=timezone.utc)
+    for _ in range(10):
+        engine.step_all()
+    assert engine.halted, "the desk un-halted mid-test"
+
+    rows = _recaps(engine)
+    assert len(rows) == 1, f"halted desk emitted {len(rows)} recaps across one midnight"
+    assert rows[0].get("day") == "2024-01-03"
+    texts = [p.get("text", "") for _, p in tr.sent]
+    assert len([t for t in texts if t.startswith("RECAP")]) == 1
+    engine.stop()
+
+
+def test_a_restart_while_halted_does_not_re_send_the_recap(tmp_path) -> None:
+    """A crash loop must not re-send the recap, and this one PASSED before the fix.
+
+    Said plainly so nobody reads it as evidence for the marker: the emitted
+    marker is in-process memory, so a restart clears it, and this test still
+    passes either way. It passes because `start()` calls `risk.observe()` before
+    the first tick, which rolls `snap.day_key` to today; `_maybe_daily_recap`
+    then cannot owe a recap for a day that ended before the restart.
+
+    It is kept because that reasoning is load-bearing and invisible at the call
+    site. Remove the `observe()` from `start()` and this test goes red, which is
+    the reachable world in which it fails. It is a pin on the argument for NOT
+    persisting the marker, not a proof of defect 2.
+
+    It also pins the live consequence of that ordering, which is worth knowing
+    separately: a desk restarted across midnight never sends the recap for the
+    day that ended. That is a silent MISS, the opposite of this issue, and
+    changing it would add messages; it is not in scope here.
+    """
+    clock = [datetime(2024, 1, 3, 12, tzinfo=timezone.utc)]
+    cfg = _cfg(tmp_path)
+    first = _engine(tmp_path, clock, cfg=cfg)
+    first.start()
+    first.risk.write_halt_file("operator")
+    first.step_all()
+    clock[0] = datetime(2024, 1, 4, 0, 5, tzinfo=timezone.utc)
+    first.step_all()
+    assert len(_recaps(first)) == 1, "the first process did not emit its one recap"
+    first.stop()
+
+    # Same journal, same state sidecar, same still-halted day: a fresh process.
+    second = _engine(tmp_path, clock, cfg=_cfg(tmp_path))
+    second.start()
+    for _ in range(5):
+        second.step_all()
+    rows = [r for r in _recaps(second) if r.get("day") == "2024-01-03"]
+    assert len(rows) == 1, f"restart re-sent the recap for a day already recapped: {len(rows)}"
+    second.stop()
+
+
+def test_history_text_bounds_every_row_it_renders(tmp_path) -> None:
+    """The read-side guard, and it is why the live journal needs no surgery.
+
+    Conrad's VPS journal already holds compounded rows. Dropping the field at
+    the source stops NEW ones, but `/history` and `/recap` still render the old
+    ones, so the burst would come back on a pull instead of a push. The bound is
+    structural (one row's rendering is capped) rather than a denylist on the
+    field name, so it also covers the next oversized field rather than this one.
+    """
+    from straightedge.engine import HISTORY_ROW_CHARS
+
+    clock = [datetime(2024, 1, 3, 12, tzinfo=timezone.utc)]
+    engine = _engine(tmp_path, clock)
+    engine.start()
+    # Exactly the shape the live journal is full of.
+    engine.journal.write("recap", day="2024-01-03", tail="X" * 50_000)
+    text = engine.history_text(5)
+    engine.stop()
+
+    assert "XXXX" in text, "the row was dropped rather than clipped"
+    for line in text.splitlines():
+        assert len(line) <= HISTORY_ROW_CHARS + 120, f"row rendered {len(line)} chars"
+    assert "truncated" in text, "a clipped row must say that it was clipped"
+    assert len(text) < 50_000, "the oversized field reached the rendering intact"
+
+
+def test_the_already_polluted_journal_cannot_still_burst(tmp_path) -> None:
+    """The deploy condition, and the reason no journal surgery is needed.
+
+    Conrad's VPS journal is already full of compounded rows and a code fix does
+    not shrink what is already written. Two claims in the PR depend on that
+    being survivable, so neither is left as an assertion:
+
+    - the nightly PUSH is short regardless, because `_maybe_daily_recap` no
+      longer reads the journal at all; and
+    - a PULL (`/recap`, `/history`) over those same rows stays inside the send
+      bound, because `history_text` clips per row.
+
+    The fixture is the real shape: eight recap rows of 50 KB each, which is what
+    a fortnight of compounding produced.
+    """
+    from straightedge.telegram import MAX_SEND_CHUNKS
+
+    tr = FakeTransport()
+    tg = TelegramClient(token="t", chat_id="1", transport=tr, notify_events=RECAP_NOTIFY)
+    clock = [datetime(2024, 1, 3, 12, tzinfo=timezone.utc)]
+    engine = _engine(tmp_path, clock, telegram=tg)
+    engine.start()
+    for day in range(1, 9):
+        engine.journal.write(
+            "recap", day=f"2024-01-{day:02d}", tail="OLD-COMPOUNDED-ROW " * 2800
+        )
+
+    # The PUSH: roll a day and let the recap fire over the polluted journal.
+    before = len(tr.sent)
+    clock[0] = datetime(2024, 1, 4, 0, 5, tzinfo=timezone.utc)
+    engine.step_all()
+    pushed = [p for u, p in tr.sent[before:] if u.endswith("/sendMessage")]
+    assert len(pushed) == 1, f"the nightly recap took {len(pushed)} sends"
+    assert pushed[0]["text"].startswith("RECAP")
+    assert "OLD-COMPOUNDED-ROW" not in pushed[0]["text"]
+
+    # The PULL: the operator asks for the same rows by hand.
+    before = len(tr.sent)
+    assert tg.send(engine.recap_text()) is True
+    pulled = [p for u, p in tr.sent[before:] if u.endswith("/sendMessage")]
+    assert len(pulled) <= MAX_SEND_CHUNKS, f"/recap took {len(pulled)} sends"
+    engine.stop()
+
+
+def test_send_cannot_turn_one_message_into_a_burst() -> None:
+    """Defect 3: the chunk loop had no ceiling, so N chunks was N notifications."""
+    from straightedge.telegram import MAX_SEND_CHUNKS
+
+    tr = FakeTransport()
+    audited: list[tuple[str, dict]] = []
+    tg = TelegramClient(
+        token="t",
+        chat_id="1",
+        transport=tr,
+        audit_fn=lambda event, fields: audited.append((event, fields)),
+    )
+    assert tg.send("Y" * 200_000) is True
+
+    sends = [p for url, p in tr.sent if url.endswith("/sendMessage")]
+    assert len(sends) <= MAX_SEND_CHUNKS, f"one message became {len(sends)} sends"
+    # Telegram's own hard limit is 4096 characters per message.
+    for payload in sends:
+        assert len(payload["text"]) <= 4096
+
+    # A silent truncation is a worse bug than a long message: it must be
+    # visible to the operator in the chat AND recorded in the journal.
+    assert "truncated" in sends[-1]["text"]
+    assert [e for e, _ in audited] == ["notify_truncated"]
+    assert audited[0][1]["dropped_chars"] > 0
+
+
+def test_send_leaves_a_message_that_fits_completely_alone() -> None:
+    """The bound must not be able to fire on a message that was always fine.
+
+    A ceiling that clips normal traffic would be a new defect, so pin the
+    negative: the longest fixed string the desk sends is HELP, and nothing
+    about it may change.
+    """
+    from straightedge.telegram import HELP
+
+    tr = FakeTransport()
+    tg = TelegramClient(token="t", chat_id="1", transport=tr)
+    assert tg.send(HELP) is True
+    sends = [p for url, p in tr.sent if url.endswith("/sendMessage")]
+    assert len(sends) == 1
+    assert sends[0]["text"] == HELP
+    assert "truncated" not in sends[0]["text"]
