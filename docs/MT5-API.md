@@ -144,6 +144,43 @@ For USDJPY it scales with price (`contract_size * tick_size / price` when the pr
 The live adapter reads `trade_tick_value` from the terminal so it stays correct.
 The paper broker uses a static approximation.
 
+### Unmeasured specs refuse, they never default
+
+Every numeric field in `Mt5Broker.symbol` goes through one reader that records the
+field in `SymbolSpec.unmeasured` and returns `0.0` when the terminal did not answer
+it, or answered a zero where zero is not a possible measurement. Sizing then
+returns 0 lots and `risk.evaluate` refuses with `spec_not_measured:<fields>`.
+
+The names recorded are the CANONICAL spec names (`tick_value`, not
+`trade_tick_value`), because `unmeasured_for_sizing()` intersects them with
+`SPEC_SIZING_FIELDS`. A set of raw MT5 keys would look populated and gate nothing.
+
+This used to be MT4-only. The MT5 adapter filled in FX-shaped defaults instead
+(`trade_tick_value or 1.0`, `trade_contract_size or 100_000`, `point` 0.00001) and
+never set `unmeasured`, so the rule could not fire here at all. Two consequences,
+both live:
+
+* `or` fires on a legitimate ZERO as well as on absence, so an XAUUSD spec
+  arriving with zeros was sized as though gold had a 100,000 unit contract and a
+  $1 tick. See "The per-symbol trap" in `CLAUDE.md` for the ratio.
+* `trade_mode` defaulted to **4, full trading**, so a close-only or disabled
+  symbol read as fully tradable. It now defaults to `0` (DISABLED) and is recorded
+  as unmeasured, matching MT4.
+
+Zero survives as a measurement where zero is a real reading: `digits` is 0 on an
+index quoted in whole points, and `trade_stops_level` is 0 on a broker with no
+minimum stop distance. Those fields are read with `positive=False`.
+
+`trade_tick_size` is NOT defaulted to `point` any more. A derived value is not a
+measurement. `ticks_between` still falls back to `point` on its own, but the
+sizing gate fires first, which is the honest order.
+
+**Not done here, and worth a decision:** MT5 also exposes
+`trade_tick_value_loss` and `trade_tick_value_profit`. For RISK sizing the loss
+leg is the correct one, and preferring it would both be more accurate and reduce
+refusals when `trade_tick_value` is absent. That changes which number drives
+sizing, so it is a separate change rather than part of making unmeasured honest.
+
 ## Return codes the bot cares about
 
 | Code | Constant | Meaning |
