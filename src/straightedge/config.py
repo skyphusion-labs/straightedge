@@ -193,11 +193,21 @@ class Mt4Config:
     #: The READ budget, in milliseconds. Applies to every op that cannot move
     #: money: ping, account, symbol, tick, select, rates, positions, orders, and
     #: both `check_*` dry runs. Losing one of these is cheap, so the number is
-    #: sized to notice a wedged mailbox rather than to outlast anything: measured
-    #: round trip on the live rig is 205ms p50 and 223ms max, so 5000 is a 22x
-    #: margin. It is deliberately UNCHANGED from when it covered sends too,
-    #: because it was never the defect and because `watchdog.venue_timeout_seconds`
-    #: and `tests/test_mt4_claim_open_retry.py` both derive numbers from it.
+    #: sized to notice a wedged mailbox rather than to outlast anything.
+    #:
+    #: **What is actually known about it, corrected (#127).** This comment used
+    #: to read "205ms p50 and 223ms max, so 5000 is a 22x margin". The max was
+    #: not measured: `tests/live_measurements.py` is the one home for numbers off
+    #: that rig and it records the MEDIAN only, deliberately, because the pairing
+    #: that produced the latencies shifts by one after every unanswered request
+    #: and three of 2166 went unanswered. So the honest statement is 5000ms
+    #: against a measured p50 of 205ms, 24x the median, with the TAIL UNKNOWN,
+    #: and a budget is sized against the tail. `docs/RUNBOOK.md`, "Measuring the
+    #: mailbox round trip", carries the run that would settle it.
+    #:
+    #: It is deliberately UNCHANGED, and not only because the tail is unmeasured:
+    #: it was never the defect, and `watchdog.venue_timeout_seconds` and
+    #: `tests/test_mt4_claim_open_retry.py` both derive numbers from it.
     timeout_ms: int = 5000
     #: The SEND budget, in milliseconds, for the ops that can change the book.
     #:

@@ -36,6 +36,17 @@ from straightedge.strategy import TrendStrategy
 from straightedge.telegram import TelegramClient, TgCommand
 from straightedge import watchdog
 
+#: Nothing longer than this reaches the journal from a fault message. It is the
+#: clip `_reconnect_broker` already applied to its own `error`, now applied to
+#: every recorded fault: see `Engine._fault_fields` for why a journal row that
+#: records a cause has to stay bounded.
+_FAULT_CHARS = 200
+#: Fault enums (`op`, `transport`, `phase`, `withdrawal`) come from this repo's
+#: own vocabulary in `broker/mt4_live.py` and are a few characters each. The clip
+#: is insurance against a transport that one day reports something longer, not a
+#: budget anybody is expected to reach.
+_FAULT_ENUM_CHARS = 40
+
 _ORDER_TYPE_NAME = {
     "limit": "LIMIT",
     "stop": "STOP",
@@ -1852,22 +1863,103 @@ class Engine:
         # AFTER the emit: a raising `_emit` must not mark the day done.
         self._recapped_day = snap.day_key
 
-    def _reconnect_broker(self) -> bool:
+    def _fault_fields(
+        self, exc: BaseException | None, *, prefix: str
+    ) -> dict[str, Any]:
+        """One fault, as bounded scalars, under `prefix`.
+
+        Read with `getattr` rather than by importing `BridgeTimeout`: the engine
+        does not depend on a venue module, and any future transport that carries
+        the same four attributes is recorded without this file changing. An
+        attribute that is empty or zero is OMITTED rather than written blank, so
+        "the bridge did not report a phase" and "the phase was empty" cannot
+        render alike.
+
+        Bounded on purpose. #119 is open because a journal row stored a rendering
+        of other rows and compounded daily; a row that records a fault must not
+        become the next instance of that shape. What goes in is one clipped
+        message, one type name, four short enums and one integer. Nothing here
+        reads the journal.
+        """
+        if exc is None:
+            return {}
+        out: dict[str, Any] = {
+            prefix: str(exc)[:_FAULT_CHARS],
+            f"{prefix}_type": type(exc).__name__,
+        }
+        for attr in ("op", "transport", "phase", "withdrawal"):
+            value = getattr(exc, attr, "")
+            if isinstance(value, str) and value:
+                out[f"{prefix}_{attr}"] = value[:_FAULT_ENUM_CHARS]
+        req_id = getattr(exc, "req_id", 0)
+        if isinstance(req_id, int) and req_id > 0:
+            out[f"{prefix}_req_id"] = req_id
+        return out
+
+    def _reconnect_broker(self, cause: BaseException | None = None) -> bool:
+        """Drop the venue link and build it again. Returns whether that worked.
+
+        `cause` is the exception that TRIGGERED the reconnect, and recording it
+        is the whole point of #127. Until it was passed in, `step_all` caught the
+        trigger WITHOUT BINDING IT, so a recovered blip left `reconnect ok=True`
+        and no record of what had broken. Conrad's live journal from the Vultr
+        box is mostly lone `ok=True` lines for that reason, and the question he
+        actually asked -- is this bridge flaky and expected on that box, or is it
+        degrading -- cannot be put to records that threw the reason away.
+
+        **The cause goes on the `reconnect` ROW, not onto an event of its own.**
+        Four reasons, because the choice is not obvious:
+
+        * the cause and the outcome are ONE fact. Two rows can be separated by a
+          process exit, by the 10 MiB rotation, or by another write from the
+          Telegram path, and a reader then holds a cause with no outcome or an
+          outcome with no cause, which is the state this fix exists to leave.
+        * `Journal.tail(n)` reads the last n ROWS. A second row per reconnect
+          halves the history an operator sees for the same `n`, and doubles the
+          volume of precisely the condition under investigation.
+        * `reconnect` is already in the documented event list (`docs/RUNBOOK.md`,
+          `docs/CONTRACT.md`) and in the watchdog's own advice. Added FIELDS need
+          no consumer change; a new event NAME would be invisible until every one
+          of those was updated, which is this defect again one level up.
+        * `error` already means "this reconnect attempt itself failed", so the
+          trigger needs its own prefix. Overloading `error` would make an
+          `ok=True` row that carried one ambiguous.
+        """
+        fields = self._fault_fields(cause, prefix="cause")
         try:
             self.broker.disconnect()
         except (RuntimeError, OSError, ValueError):
             pass
+        unselected: list[str] = []
         try:
             self.broker.connect()
             for name in self.cfg.symbols:
                 try:
                     self.broker.select_symbol(name)
                 except (RuntimeError, OSError, ValueError):
+                    unselected.append(name)
                     continue
-            self.journal.write("reconnect", ok=True)
+            if unselected:
+                # A link that came back WITHOUT its symbols is not the same fact
+                # as a clean reconnect, and the two rendered identically: the
+                # `continue` discarded the error and `ok=True` was written
+                # anyway. The COUNT goes on the row, which keeps it one bounded
+                # integer whatever `cfg.symbols` holds; the NAMES go to stdout,
+                # where the desk's other operator warnings already are.
+                fields["unselected"] = len(unselected)
+                print(
+                    "reconnect: the venue link is back, but "
+                    f"{len(unselected)} of {len(self.cfg.symbols)} symbols "
+                    f"could not be reselected ({', '.join(unselected)}). "
+                    "Those symbols cannot trade until they can be.",
+                    flush=True,
+                )
+            self.journal.write("reconnect", ok=True, **fields)
             return True
         except (RuntimeError, OSError, ValueError) as exc:
-            self.journal.write("reconnect", ok=False, error=str(exc)[:200])
+            self.journal.write(
+                "reconnect", ok=False, error=str(exc)[:_FAULT_CHARS], **fields
+            )
             return False
 
     def _write_heartbeat(self, now: datetime | None = None, *, blocked: str = "") -> None:
@@ -1921,12 +2013,20 @@ class Engine:
             if callable(ensure):
                 ensure()
             acct = self.broker.account()
-        except (RuntimeError, OSError, ValueError):
-            if not self._reconnect_broker():
+        except (RuntimeError, OSError, ValueError) as exc:
+            if not self._reconnect_broker(exc):
                 return
             try:
                 acct = self.broker.account()
-            except (RuntimeError, OSError, ValueError):
+            except (RuntimeError, OSError, ValueError) as after:
+                # The link came back and the account still cannot be read. That
+                # is a THIRD state, neither a blip nor a dead bridge, and it used
+                # to return having written nothing at all, so the tick vanished
+                # from the record entirely while `reconnect ok=True` sat above it
+                # claiming recovery.
+                self.journal.write(
+                    "account_read_failed", **self._fault_fields(after, prefix="error")
+                )
                 return
         now = self.now_fn()
         self._maybe_daily_recap(acct, now)

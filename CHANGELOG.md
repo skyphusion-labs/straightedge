@@ -66,6 +66,80 @@ have stopped is ALARMED as `STALE`, never killed. Telling alive-but-stalled
 apart from dead needs `journal.lock`, and a watcher that can hold that lock for
 a moment can make a restarting desk exit `already running`. That boundary is
 PR#80's.
+### A reconnect records what broke, and a timeout names where (issue #127)
+
+`Engine.step_all` caught the exception that triggers every venue reconnect
+WITHOUT BINDING IT, so `_reconnect_broker` wrote `reconnect ok=True` and the
+reason was gone. The live journal from the Vultr box over 2026-09-26 to
+2026-10-07 is mostly lone `ok=True` lines because of it, and the question that
+prompted this (is the bridge flaky and expected on that box, or is it degrading)
+could not be put to twelve days of records. The cause of a reconnect is not an
+extra detail; without it, a recovered blip and a failing bridge render
+identically.
+
+- **The trigger is journaled on the `reconnect` row**, under a `cause` prefix:
+  `cause`, `cause_type`, and `cause_op`, `cause_transport`, `cause_phase`,
+  `cause_withdrawal`, `cause_req_id` when the venue reports them. Absent means
+  the exception did not carry it, never blank and never guessed. `error` on that
+  row still means the reconnect ATTEMPT failed, which is a different fault, and
+  the two are never merged. One row rather than two events, because a cause and
+  its outcome separated by a process exit or the 10 MiB rotation is the state
+  this fix exists to leave, and because `tail(n)` counts ROWS.
+- **The payload is bounded**: one clipped message, one type name, four short
+  enums, one integer, asserted by a test. Issue #119 is open because a journal
+  row stored a rendering of other rows; a row written on every blip is the
+  obvious next instance of that shape.
+- **`BridgeTimeout` names its `transport` and its `phase`**, as attributes first
+  and in its message second. Five conditions used to reach the journal as the one
+  string `mt4 bridge timeout`: the file mailbox going quiet, an HTTP call that
+  got no answer, one that began and stopped, and the shim's own `504` and `503`.
+  Measured before and after on the same probe: **1 distinct `(transport, phase)`
+  pair out of 5, then 5 of 5.** The vocabulary has one home in
+  `broker/mt4_live.py`, and the test compares the set it can produce against
+  `BRIDGE_TIMEOUT_PHASES`, so a sixth phase with no case goes red.
+- **Two defects adjacent to that one, fixed in the same pass.** A reconnect that
+  came back WITHOUT its symbols wrote `ok=True` anyway (`select_symbol` failures
+  were swallowed by a bare `continue`); it now carries `unselected` and names the
+  symbols on the desk log. And a tick whose account was still unreadable after a
+  successful reconnect returned having written NOTHING; it is now
+  `account_read_failed`.
+- **The Expert is untouched.** Nothing here needs it.
+
+### The read budget is unchanged, and the reason given for it was wrong
+
+`mt4.timeout_ms` stays at 5000. What changed is the claim attached to it.
+`config.py` said "205ms p50 and 223ms max, so 5000 is a 22x margin" and
+`docs/MT4.md` said "p50 205ms, p90 206ms, max 223ms, and zero round trips over
+1000ms", nine lines above its own paragraph explaining that nothing above the
+median was trustworthy. `tests/live_measurements.py` is the one home for that
+rig's numbers and records the median only. Both restatements are corrected: the
+honest statement is 5000ms against a measured p50 of 205ms, 24x the median, with
+the TAIL UNKNOWN, and a budget is sized against the tail.
+
+- **The instrument that found the original defect is fixed rather than
+  replaced.** `mt4/tools/measure-mailbox.ps1` paired each request with the next
+  reply, so one unanswered request shifted every later sample. It now holds the
+  open request and EXCLUDES one that got no reply, which is sound because the
+  mailbox is a strict singleton, and it reports p50, p90, p99 and max beside
+  `paired` and `unpaired`.
+- **Pairing by the request id would have been the obvious fix and is the wrong
+  one.** Reading the request file means a read handle on the shared name, which
+  on Windows can make the Expert's claiming `FileMove` fail: the instrument would
+  manufacture the `ERR_CANNOT_OPEN_FILE` failure that #82 exists to fix. The
+  script stays read-only over event names.
+- **"The median is trustworthy" was luck, not a property of the algorithm.** All
+  three losses in the 2026-09 window fell in its last 18%, so about 82% of
+  samples were never shifted. Verified by replaying both algorithms over a
+  synthetic log built with the desk's real cadence (8 back-to-back ops per step,
+  a 15s long poll between steps): with the losses in their measured position the
+  old pairing reads p50 212ms / p90 452ms / p99 15639ms against a truth of 205 /
+  239 / 1854; with one loss moved to 20% in it reads **p50 418ms against a true
+  206ms**. The new pairing matches the injected truth exactly under both.
+- **The PowerShell fix is UNRUN against a live terminal** and says so in its own
+  header. There is no Windows host and no MT4 on the machine it was written on.
+  Its arithmetic was verified by porting both algorithms to Python; its
+  PowerShell syntax was not. Do not quote a tail number from this repo until
+  Conrad has run it on the box.
 
 ### Tickers longer than three characters resolve as pairs (issue #77)
 
