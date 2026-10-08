@@ -60,7 +60,7 @@ jobs:
             -ConfigPath "$PWD\config.example.toml" `
             -WorkingDirectory "$PWD" `
             -BackupDir "$PWD\tasks-before" `
-            -Confirm
+            -Apply
       - name: dump what Task Scheduler actually holds, and audit THAT
         shell: pwsh
         run: |

@@ -395,7 +395,7 @@ powershell -ExecutionPolicy Bypass -File .\Install-Supervision.ps1 ^
   -WorkingDirectory "C:\bot"
 ```
 
-That is a dry run. Add `-Confirm` to register.
+That is a dry run; it changes nothing and says so. Add `-Apply` to register.
 It records the previous definitions in `.\tasks-before` FIRST, because a
 rollback is only a rollback if the previous state was captured before the
 change and not reconstructed after it.

@@ -57,7 +57,8 @@ powershell -ExecutionPolicy Bypass -File .\Install-Supervision.ps1 ^
   -WorkingDirectory "C:\bot"
 ```
 
-That is a DRY RUN. Add `-Confirm` to register. Then verify, do not assume:
+That is a DRY RUN; it changes nothing and says so. Add `-Apply` to register.
+Then verify, do not assume:
 
 ```bat
 powershell -ExecutionPolicy Bypass -File .\Export-Tasks.ps1 -OutDir .\tasks

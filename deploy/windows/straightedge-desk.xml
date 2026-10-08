@@ -7,8 +7,12 @@
   comment cannot contain a double hyphen, so it cannot even quote a command
   line, which is why the rationale lives in the README).
 
-  Replace every REPLACE_ME before registering. Leave the tokens in the
-  committed copy; tests/test_supervision.py asserts they are still here.
+  Fill in the placeholder paths and the user id before registering, or let
+  Install-Supervision.ps1 do it. Leave the placeholders in the committed copy;
+  tests/test_supervision.py asserts they are still there, because a real path
+  committed once is a path that rots silently. The installer checks the VALUES
+  with these comments stripped, so prose here deliberately does not spell the
+  token out.
 -->
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo>
