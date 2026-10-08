@@ -86,6 +86,11 @@ jobs:
           python -m straightedge --config config.example.toml supervision --tasks "$PWD\tasks-red"
           if ($LASTEXITCODE -eq 0) { throw "the audit passed a desk task with no repeating trigger, which is the measured 2026-10-08 defect" }
           Write-Host "the audit went red on a logon-only desk task, as it must"
+          # A pwsh step exits with $LASTEXITCODE, which is still the 1 this
+          # step WANTED from the audit. Without this the control passing looks
+          # identical to the control failing, which is the shape of defect this
+          # whole job exists to catch.
+          exit 0
       - name: unregister
         if: always()
         shell: pwsh
