@@ -247,6 +247,18 @@ def _chunks(text: str, size: int) -> list[str]:
     return [text[i : i + size] for i in range(0, len(text), size)]
 
 
+#: Goes on the FRONT of every advice reply, never the back (straightedge#130).
+#: A footer is the first thing a long reply loses: `send()` chunks at
+#: `CHUNK_CHARS` and keeps at most `MAX_SEND_CHUNKS`, fitting the truncation
+#: notice INSIDE the last chunk, so anything past ~11,700 characters is
+#: dropped from the end. An advice reply is `advice.text` from a model plus the
+#: staging lines, and the model's half has no bound at all, which means a
+#: trailing disclaimer would go missing on exactly the longest and most
+#: opinionated replies. As the first line it is in chunk one unconditionally
+#: and needs no chunk arithmetic to stay true. It also reads before the trade
+#: idea rather than after it, which is the order a reader needs.
+NOT_ADVICE = "not financial advice: you decide, you confirm, you carry the loss"
+
 HELP = (
     "straightedge  (not financial advice)\n"
     "/quote [SYMBOL]\n"
