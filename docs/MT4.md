@@ -573,8 +573,10 @@ afterwards:
 
 ```
 mt4: waiting up to 180s for the Expert to answer on the mailbox
-mt4: no reply yet, attempt 1 at 5.0s of 180s (mt4 bridge timeout); retrying in 1.0s
-mt4: no reply yet, attempt 2 at 11.0s of 180s (mt4 bridge timeout); retrying in 2.0s
+mt4: no reply yet, attempt 1 at 5.0s of 180s (mt4 bridge timeout after 5.0s
+transport=file phase=mailbox op=ping request=withdrawn); retrying in 1.0s
+mt4: no reply yet, attempt 2 at 11.0s of 180s (mt4 bridge timeout after 5.0s
+transport=file phase=mailbox op=ping request=withdrawn); retrying in 2.0s
 mt4: Expert answered on attempt 6 after 48.3s
 ```
 
@@ -584,10 +586,21 @@ A read that times out is retried by the next step. A send that times out is
 AMBIGUOUS: the order may be filled, in flight, or never sent, and the desk cannot
 tell. The two failures do not cost the same, so they do not share a number.
 
-Measured steady-state round trip on the live rig (2026-09-26 01:48Z, a
-FileSystemWatcher on the mailbox directory, `.req` renamed in to `.res` renamed
-in): p50 205ms, p90 206ms, max 223ms, and zero round trips over 1000ms. So 5000ms
-is a 22x margin for a read and was never the defect.
+Measured steady-state round trip on the live rig (2026-09-26, a FileSystemWatcher
+on the mailbox directory over 01:57:15Z to 02:21:48Z, `.req` renamed in to `.res`
+renamed in): **p50 205ms over 2166 requests, and nothing above that median.**
+`tests/live_measurements.py` is that measurement's one home and it is cited here,
+never restated.
+
+**An earlier revision of this paragraph claimed "p90 206ms, max 223ms, and zero
+round trips over 1000ms", and `config.py` claimed a "22x margin" from it. Both
+were wrong and both are corrected (#127):** the pairing that produced those
+numbers shifts by one after every unanswered request and three of the 2166 went
+unanswered, so the tail was never measured. It is stated here as well as nine
+lines below because a number is restated by being convenient, and the restatement
+is what a later reader trusts. What the read budget's 5000ms is actually known to
+be is **24x the median**, with the tail unknown; see "Is 5000ms the right read
+budget" below for what would settle it.
 
 For a send it is not a margin at all, because the Expert can spend most of it
 before it is able to reply. The send budget is therefore DERIVED, term by term,
@@ -607,6 +620,45 @@ compute latency shifts by one after every unanswered request, and three of the 2
 requests in that window went unanswered, so p90 and above are unreliable. A
 ceiling has to come from somewhere defensible, so it is a multiple of the median,
 in the conservative direction for a budget whose failure mode is expiring early.
+
+### Is 5000ms the right read budget
+
+**Unknown, and deliberately UNCHANGED (#127).** Whether 5s is right for a
+file-mailbox round trip on a loaded Windows VPS is a measurement, and the only
+statistic the rig has ever yielded is the median. 5000ms is 24x that median; a
+budget is sized against the TAIL, and the tail is the part that was not measured.
+Moving it on the strength of the median would be an opinion wearing a number.
+
+Two things make it answerable rather than permanently open:
+
+- **the journal can now distinguish the cases.** A `reconnect` row carries
+  `cause_phase` and `cause_op`, so a run of `file`/`mailbox` timeouts on `ping`
+  (a quiet mailbox) is separable from `net`/`read` (a slow link) and from a
+  single op that is always the one to expire (a budget that is genuinely short).
+  If the budget were the binding constraint, the timeouts would cluster on the
+  most expensive op, and they do not have to be guessed at any more.
+- **the pairing flaw is fixed in the instrument that found it.**
+  `mt4/tools/measure-mailbox.ps1` used to pair each request with the next reply,
+  so one unanswered request shifted every later sample. It now holds the open
+  request and EXCLUDES one that got no reply. That is sound because the mailbox
+  is a strict singleton by contract: one `.req` at a time, and the desk blocks on
+  its reply, so a `.res` landing between two `.req` renames belongs to the first
+  of them and to nothing else.
+
+  **Pairing by the request `id` would have been the obvious fix and it is the
+  wrong one.** Reading `mt4_risk_bot.req` means holding a read handle on the
+  shared name, and on Windows that can make the Expert's claiming `FileMove`
+  fail with a sharing violation: the instrument would manufacture the
+  `ERR_CANNOT_OPEN_FILE` class of failure that #82 exists to fix. The script is
+  read-only over event NAMES for that reason, and it says so in its own header.
+
+  **The median was never trustworthy as a rule, only as an accident.** All three
+  losses in the 2026-09 window fell in its last 18%, so about 82% of samples were
+  never shifted. Replayed with the desk's real cadence and one loss moved to 20%
+  in, the old pairing reads 418ms against a true 206ms.
+
+Until that run exists, this repo records 205ms p50 and says the tail is unknown.
+`docs/RUNBOOK.md`, "Measuring the mailbox round trip", is how to run it.
 
 **There are TWO claim-retry ladders, not one, and that term moved late.** #82
 retried the claim READ; #83 then gave the reply WRITE the same bounded retry, on
@@ -661,6 +713,49 @@ removes the fence. So `OnInit` writes its own probe file, reads the stamp back,
 and keeps the offset. A calibration that fails reports it, and then an
 unmeasurable age refuses a send.
 
+### A timeout says WHICH transport and WHERE on it
+
+Giving up used to report one string. `mt4 bridge timeout` was produced by the
+file mailbox, by a desk whose HTTP call to the shim never answered, and by a shim
+that reached the mailbox and got nothing back; and the `503` and `504` arms were
+one message apart from the status code. Those are different faults with different
+operator actions, and on the live desk twelve days of journal could not separate
+them (#127).
+
+`BridgeTimeout` therefore carries `transport` and `phase` as ATTRIBUTES, and
+`Engine._reconnect_broker` writes them into `journal.jsonl`. The attributes are
+primary and the message text is secondary on purpose: an operator reads the
+message, a script reads the row, and nothing should have to partition these facts
+by parsing English.
+
+| `transport` | `phase` | What happened | Where an operator looks |
+| --- | --- | --- | --- |
+| `file` | `mailbox` | no `.res` with this request's id appeared inside the budget | the terminal: is MT4 up, is the Expert attached to exactly one chart, is `files_dir` the Common Files folder, and is the Experts log showing a claim it could not read |
+| `net` | `connect` | the HTTP call got no answer at all | the shim process and the path to it: `mt4-shim` not running, the tunnel down, the host gone |
+| `net` | `read` | the response began and did not finish | the shim is alive and slow, or the link is losing the reply. The request may be executing |
+| `net` | `shim-mailbox` | the shim answered `504`: it reached the mailbox and the Expert did not reply | the terminal, exactly as for `file`/`mailbox`. The shim is fine |
+| `net` | `shim-unavailable` | the shim answered `503`: it could not use the mailbox directory | `files_dir` on the MT4 host, and whether MT4 has created Common Files yet |
+
+`straightedge.broker.mt4_live` declares the vocabulary (`TRANSPORT_FILE`,
+`TRANSPORT_NET`, `PHASE_MAILBOX`, `PHASE_CONNECT`, `PHASE_READ`,
+`PHASE_SHIM_MAILBOX`, `PHASE_SHIM_UNAVAILABLE`, and `BRIDGE_TIMEOUT_PHASES`
+listing all five). This table cites those names; it does not restate them.
+`tests/test_reconnect_cause_is_recorded.py` drives all five, asserts every
+`(transport, phase)` pair is distinct, and compares the set it can produce
+against `BRIDGE_TIMEOUT_PHASES`, so a sixth phase added without a case goes red.
+
+`file`/`mailbox` is the only pair the file transport can report, because the
+bridge's other give-up points (an unlinkable `.res`, an unwritable `.req`) raise
+`OSError` rather than `BridgeTimeout`. The field is written anyway, so a reader
+never has to know which transports have one phase and which have four.
+
+**What reaches the journal.** `reconnect` rows carry the TRIGGER under a `cause`
+prefix: `cause`, `cause_type`, and `cause_op`, `cause_transport`, `cause_phase`,
+`cause_withdrawal`, `cause_req_id` when the exception carries them. `error` on
+the same row still means the reconnect ATTEMPT itself failed, which is a
+different fault, and the two are never merged. `docs/RUNBOOK.md` has the
+operator's reading of those rows.
+
 ### A staged order is transmitted at most once
 
 `BridgeTimeout` subclasses `RuntimeError` and `Desk.handle` catches
@@ -688,7 +783,8 @@ Giving up names the elapsed time and what to check:
 
 ```
 mt4 bridge never answered: 21 ping(s) over 180.4s, budget 180s, last error:
-mt4 bridge timeout. Check that MetaTrader 4 is running, that
+mt4 bridge timeout after 5.0s transport=file phase=mailbox op=ping
+request=withdrawn. Check that MetaTrader 4 is running, that
 mt4/Experts/Mt4RiskBot.mq4 is attached to exactly one chart with AutoTrading
 enabled, and that mt4.files_dir is the Terminal Common Files folder.
 ```

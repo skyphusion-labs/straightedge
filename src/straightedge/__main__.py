@@ -63,6 +63,59 @@ def _posture_line(cfg: BotConfig) -> str:
     return f"approve always: {approve}\nauto: {auto}"
 
 
+def _settings_source_line(cfg: BotConfig) -> str:
+    """Which secrets came from `config.toml` rather than the environment.
+
+    Key NAMES, never values, exactly as `mt4_transport_line` presence-checks
+    its token without printing it. SECURITY.md tells the operator to keep
+    secrets in the environment and the loader accepts the file as a fallback
+    (straightedge#139), so the one thing an operator cannot otherwise learn
+    without opening a 0600 file by hand is which way THIS config went.
+
+    The empty case is printed, not skipped. A line that appears only when
+    something is wrong is indistinguishable from a line nobody implemented,
+    and `doctor` already refuses that trade elsewhere ("history: NOT MEASURED").
+    """
+    lines = []
+    if cfg.settings_from_file:
+        names = ", ".join(cfg.settings_from_file)
+        lines.append(
+            f"secrets: {len(cfg.settings_from_file)} from config.toml ({names}); "
+            "the environment overrides any of them. Values are never printed"
+        )
+    else:
+        lines.append("secrets: all from the environment")
+    if cfg.settings_read_from_nowhere:
+        # Louder than the line above, because this one is an operator
+        # instruction being discarded rather than a supported fallback.
+        names = ", ".join(cfg.settings_read_from_nowhere)
+        lines.append(
+            f"secrets IGNORED in config.toml: {names}. The loader reads these "
+            "from nowhere; put the value in the environment variable instead, "
+            "and remove it from the file"
+        )
+    return "\n".join(lines)
+
+
+def _presence(cfg: BotConfig, toml_key: str, value: object) -> str:
+    """`SET (env)`, `SET (config.toml)`, or `unset`. Presence and SOURCE.
+
+    These four lines in `doctor` read `os.environ` directly and reported
+    `unset` for a secret that was present in `config.toml` and that the desk
+    was about to use (straightedge#139). A false negative about a credential
+    is worse than the documentation gap the issue was filed about: the
+    operator reads "telegram token: unset", concludes the desk is not
+    configured, and goes looking for a problem that is not there.
+
+    So the check now reads the EFFECTIVE value, the one the desk will use, and
+    names where it came from. Presence only; a value is never printed, exactly
+    as `mt4_transport_line` already does for the mailbox token.
+    """
+    if not value:
+        return "unset"
+    return f"SET ({'config.toml' if toml_key in cfg.settings_from_file else 'env'})"
+
+
 def mt4_transport_line(cfg: BotConfig) -> str:
     """Which transport THIS config will use, and whether its secret is present.
 
@@ -331,6 +384,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     if args.config:
         print(f"config: mode={cfg.mode} symbols={cfg.symbols} risk_pct={cfg.risk.risk_pct}")
     print(_posture_line(cfg))
+    print(_settings_source_line(cfg))
     print("terminal: official MetaTrader5 package is Windows-only.")
     print("macOS: install MetaTrader 5.app from metatrader5.com, then pip install mt5-mac.")
     print("MT4: attach mt4/Experts/Mt4RiskBot.mq4. files_dir is Common Files.")
@@ -339,11 +393,13 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         print(mt4_transport_line(cfg))
     print(watchdog_line(cfg))
     print("Homebrew has no MetaTrader cask; Python is enough for paper/backtest.")
-    print("telegram token:", "SET" if os.environ.get("TELEGRAM_BOT_TOKEN") else "unset")
-    print("telegram chat:", "SET" if os.environ.get("TELEGRAM_CHAT_ID") else "unset")
-    print("xai key:", "SET" if os.environ.get("XAI_API_KEY") else "unset")
-    print("anthropic key:", "SET" if os.environ.get("ANTHROPIC_API_KEY") else "unset")
-    print("ai provider:", os.environ.get("AI_PROVIDER", "grok"))
+    # The EFFECTIVE value with its source, never os.environ alone: see
+    # `_presence`. A secret in config.toml used to read here as `unset`.
+    print("telegram token:", _presence(cfg, "telegram.token", cfg.telegram.token))
+    print("telegram chat:", _presence(cfg, "telegram.chat_id", cfg.telegram.chat_id))
+    print("xai key:", _presence(cfg, "advice.grok_key", cfg.advice.grok_key))
+    print("anthropic key:", _presence(cfg, "advice.claude_key", cfg.advice.claude_key))
+    print("ai provider:", cfg.advice.provider)
     ping = telegram_ping(cfg)
     print(f"telegram ping: {ping}")
     paper = paper_round_trip()
@@ -474,6 +530,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     if args.mode:
         cfg.mode = args.mode
     print(_posture_line(cfg))
+    print(_settings_source_line(cfg))
     try:
         lock = InstanceLock(cfg.journal_path)
         lock.acquire()

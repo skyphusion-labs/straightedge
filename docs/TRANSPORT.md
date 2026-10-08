@@ -183,7 +183,9 @@ outbound-only tunnel.
 **A bearer token, required, with no off switch.**
 
 - `MT4_MAILBOX_TOKEN` in the environment on **both** ends. It is never read from a
-  config file, matching `docs/CONTRACT.md` ("Secrets live in the environment").
+  config file, matching `docs/CONTRACT.md` ("Secrets belong in the environment").
+  It is the ONE secret with no TOML key at all, so unlike the other nine there
+  is no file fallback to fall back to (straightedge#139).
 - The shim **refuses to start** with no token, or with a token shorter than 32
   characters. There is no unauthenticated mode and no flag that creates one: this
   endpoint places trades.
@@ -225,17 +227,37 @@ It survives by being explicit, because the default would be wrong:
 401. `HttpBridge` catches `HTTPError` first, and `tests/test_mt4_net_transport.py`
 drives that case red on purpose.
 
-| What happened | Shim answers | `HttpBridge` raises | Retried at startup | Steady state |
-| --- | --- | --- | --- | --- |
-| EA answered | `200` + `.res` body | nothing | n/a | the reply |
-| EA did not answer in time | `504` | `BridgeTimeout` | **yes** | `_reconnect_broker()` |
-| mailbox unwritable (`OSError`) | `503` | `BridgeTimeout` | **yes** | `_reconnect_broker()` |
-| shim not started / host down | no answer (`URLError`) | `OSError` | **yes** | `_reconnect_broker()` |
-| bad or missing token | `401` | `RuntimeError` | **no** | surfaces at once |
-| wrong path or method | `401`, then `404` | `RuntimeError` | **no** | surfaces at once |
-| body over 64 KiB | `413` | `RuntimeError` | **no** | surfaces at once |
-| reply `id` does not match | `200` | `RuntimeError` | **no** | surfaces at once |
-| EA replied `ok=0` | `200` | nothing; `ok=0` reaches the adapter | **no**, by design | the refusal |
+| What happened | Shim answers | `HttpBridge` raises | `transport`/`phase` | Retried at startup | Steady state |
+| --- | --- | --- | --- | --- | --- |
+| EA answered | `200` + `.res` body | nothing | n/a | n/a | the reply |
+| EA did not answer in time | `504` | `BridgeTimeout` | `net`/`shim-mailbox` | **yes** | `_reconnect_broker()` |
+| mailbox unwritable (`OSError`) | `503` | `BridgeTimeout` | `net`/`shim-unavailable` | **yes** | `_reconnect_broker()` |
+| no answer at all inside the budget | nothing | `BridgeTimeout` | `net`/`connect` | **yes** | `_reconnect_broker()` |
+| answer began and did not finish | partial | `BridgeTimeout` | `net`/`read` | **yes** | `_reconnect_broker()` |
+| shim not started / host down | no answer (`URLError`) | `OSError` | n/a, not a timeout | **yes** | `_reconnect_broker()` |
+| bad or missing token | `401` | `RuntimeError` | n/a | **no** | surfaces at once |
+| wrong path or method | `401`, then `404` | `RuntimeError` | n/a | **no** | surfaces at once |
+| body over 64 KiB | `413` | `RuntimeError` | n/a | **no** | surfaces at once |
+| reply `id` does not match | `200` | `RuntimeError` | n/a | **no** | surfaces at once |
+| EA replied `ok=0` | `200` | nothing; `ok=0` reaches the adapter | n/a | **no**, by design | the refusal |
+
+**The `transport`/`phase` column is the #127 addition, and it is what makes this
+table readable from a journal rather than only from this file.** Five of these
+rows used to reach `journal.jsonl` as the one string `mt4 bridge timeout`, so on
+the live desk a quiet terminal, a dead shim and a slow link were one fact with
+one response. `BridgeTimeout` now carries both as attributes,
+`Engine._reconnect_broker` writes them onto the `reconnect` row as
+`cause_transport` and `cause_phase`, and `docs/MT4.md` ("A timeout says WHICH
+transport and WHERE on it") is where an operator reads what to do about each.
+
+**One thing this still cannot tell you, and it is named rather than papered
+over.** On a `504` the shim's own `FileBridge` HAS withdrawn the request and
+knows the answer (`withdrawn`, `claimed` or `locked`), but that answer goes only
+to the shim's local log: the refusal body carries `ok=0` and a reason, and no
+`withdrawal`. `HttpBridge._from_status` therefore reports `claimed`, which is the
+unsafe reading, on purpose, because not knowing must never render as a clean bill
+of health. Putting the real answer on the wire is a change to the shim's refusal
+body and is tracked separately; it is not folded into #127.
 
 **The shim times out before the desk does, on purpose.** `HttpBridge` allows the
 op's own budget plus `NET_GRACE_SEC` (2 seconds), so the desk normally receives a
