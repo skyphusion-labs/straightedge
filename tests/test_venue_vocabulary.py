@@ -57,9 +57,17 @@ SELF = Path(__file__).resolve().relative_to(ROOT).as_posix()
 
 #: `"mt5"` as a quoted literal anywhere under `src/` (mode values, dispatch, argparse
 #: choices, the `[mt5]` section lookup key).
-MODE_LITERAL_MT5_IN_SRC = 11
+#:
+#: 11 -> 14 in straightedge#139: `config.FILE_SOURCED_SETTINGS` names the `[mt5]` section
+#: once per secret key it accepts from the file, and there are three of them
+#: (`login`, `password`, `server`). Re-derive with
+#: `grep -c "\"mt5\"" src/straightedge/config.py` against that tuple.
+MODE_LITERAL_MT5_IN_SRC = 14
 #: the MT4 counterpart. The desk drives both venues; a rename that keeps one is broken.
-MODE_LITERAL_MT4_IN_SRC = 12
+#:
+#: 12 -> 13 in straightedge#139: `config.IGNORED_FILE_SOURCED_SETTINGS` names the `[mt4]`
+#: section once, for `mailbox_token`, the one secret key with no TOML entry at all.
+MODE_LITERAL_MT4_IN_SRC = 13
 #: the set-form venue test `{"mt5", "mt4"}` under `src/` (risk.py x2, desk.py code +
 #: its explaining comment).
 VENUE_SET_FORM_IN_SRC = 4
@@ -83,12 +91,28 @@ LEGAL_MODE_SET_IN_SRC = 1
 #: threshold is derived from the venue's own per-command budget, so the operator
 #: reading the alarm has to be told which section that budget lives in. It is
 #: prose about the key, not a new config site.
-CONFIG_SECTION_MT5 = 3
+#:
+#: 3 -> 4 in straightedge#139: one `[mt5]` section header in a TOML fixture in
+#: `tests/test_config_secret_provenance.py`, which writes a real config file to
+#: prove `mt5.password = ""` is not reported as a file-sourced secret. A
+#: fixture, not a config site; it has to spell the section the way the loader
+#: reads it, which is exactly what this gate is for.
+CONFIG_SECTION_MT5 = 4
 #: 11 after the read/send budget split (#37). The new site is
 #: `docs/RUNBOOK.md`, which names `[mt4] send_timeout_ms` beside
 #: `[mt4] timeout_ms` to say which of the two the watchdog derives its alarm from.
 #: Prose about the pair, not a new config section.
-CONFIG_SECTION_MT4 = 11
+#:
+#: 11 -> 14 in straightedge#139: three `[mt4]` section headers in TOML fixtures
+#: in `tests/test_config_secret_provenance.py`, one per test that writes a
+#: `mt4.mailbox_token` into a file to prove it is reported and not read. Same
+#: reasoning as `[mt5]` above: fixtures, spelled the way the loader reads them.
+#:
+#: NOTE for the next author. This scan reads the TRACKED tree, so a new test
+#: file that is not yet `git add`ed is invisible to it and the suite goes green
+#: on a count that is already wrong. Both of these numbers were caught only
+#: after the commit. Run this file again AFTER staging.
+CONFIG_SECTION_MT4 = 14
 #: the `[mt5]` section keys, and `timeout_ms` which both venue sections share.
 #: timeout_ms went 18 -> 24 with the MT4 startup wait. Only ONE of those six was a new
 #: config site (a fixture in tests/test_mt4_startup_wait.py asserting that an absent

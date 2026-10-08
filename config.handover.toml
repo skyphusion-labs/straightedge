@@ -133,4 +133,7 @@ provider = "grok"
 grok_model = "grok-4"
 claude_model = "claude-sonnet-4-5"
 computer_model = "xai/grok-4.6"
-# computer_url / computer_token: environment only (ADVICE_URL, ADVICE_TOKEN)
+# computer_url / computer_token: put them in the environment (ADVICE_URL,
+# ADVICE_TOKEN). Keys of those names here ARE read when the variables are
+# unset: a recommendation, not a control. `doctor` names any secret it took
+# from this file. See SECURITY.md.

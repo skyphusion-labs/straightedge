@@ -138,7 +138,9 @@ comment = "straightedge"
 # journal.lock is exclusive (flock / msvcrt). A second run --loop on this path exits 2.
 journal_path = "journal.jsonl"
 
-# Telegram is required for `run`. Secrets from the environment only:
+# Telegram is required for `run`. Put the secrets in the environment:
+# a `token` or `chat_id` key here is read when the variable is unset, and
+# `doctor` names it when that happens (straightedge#139).
 #   export TELEGRAM_BOT_TOKEN=...
 #   export TELEGRAM_CHAT_ID=...
 #   export XAI_API_KEY=...            # Grok
@@ -173,4 +175,7 @@ symbols = []
 grok_model = "grok-4"
 claude_model = "claude-sonnet-5"
 computer_model = "xai/grok-4.6"
-# computer_url / computer_token: environment only (ADVICE_URL, ADVICE_TOKEN)
+# computer_url / computer_token: put them in the environment (ADVICE_URL,
+# ADVICE_TOKEN). Keys named `computer_url` and `computer_token` here ARE read
+# when those variables are unset, so this is a recommendation and not a
+# control; `doctor` names any secret it took from this file. See SECURITY.md.

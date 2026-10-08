@@ -304,6 +304,15 @@ class Engine:
             # never silently missing the way an unread config key would be.
             approve_always_allowed=self.cfg.telegram.allow_approve_always,
             auto_allowed=self.cfg.telegram.allow_auto,
+            # Same argument as the two above, for the same kind of fact
+            # (straightedge#139): which secrets this session took from
+            # config.toml rather than the environment is invisible from the
+            # config alone unless someone opens a 0600 file, so it goes in the
+            # one record every session already writes. Key NAMES only; a value
+            # must never reach the journal, and `login` right above is
+            # redacted precisely because that record is rendered into the chat.
+            settings_from_file=list(self.cfg.settings_from_file),
+            settings_read_from_nowhere=list(self.cfg.settings_read_from_nowhere),
         )
         # Ask the venue for every configured symbol's series before anything
         # relies on it. On MT4 the ask IS the fix: a series exists per symbol AND
