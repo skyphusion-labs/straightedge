@@ -786,6 +786,92 @@ terminal's dialog on a box nobody is watching.
 The desk logs a loud WARNING on every ping whose declaration the budget does not
 clear.
 
+### Measuring the mailbox round trip
+
+`mt4/tools/measure-mailbox.ps1` is the instrument. It already exists. Do not
+write another one.
+
+It watches the mailbox directory from outside both processes.
+It never opens, writes or renames a mailbox file.
+That is deliberate. A read handle on `mt4_risk_bot.req` can make the Expert
+`FileMove` fail with a sharing violation.
+That is the same class of failure #82 fixed, caused by the instrument.
+So the script reads event names only, never file contents.
+
+Run it IN the session, never detached:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File mt4\tools\measure-mailbox.ps1 `
+  -FilesDir "$env:APPDATA\MetaQuotes\Terminal\Common\Files" -Seconds 1500
+```
+
+25 minutes is about 2200 requests at the measured rate.
+Run it during MARKET HOURS.
+Run it again while the box is loaded.
+A quiet closed-market window is the easy case, and the reconnects in the journal
+are not all from quiet windows.
+
+Report every line it prints, together.
+`requests_published` and `unanswered_total` are the denominators.
+A p99 from 40 samples with 300 unanswered is not a p99.
+The 2026-09 window was 3 unanswered out of 2166, which is 0.139%.
+
+What it still cannot see, and you say so whenever you quote it:
+`FileSystemWatcher` drops events on buffer overflow, and the script does not
+register the `Error` event. So a missing reply can be a missed notification.
+Corroborate every gap against `journal.jsonl`.
+A real loss appears there as a `loop_error` or `reconnect` about one adapter
+budget later.
+Two observers or it did not happen.
+
+Then read the journal for the same window:
+
+```powershell
+Select-String -Path journal.jsonl -Pattern '"event":"(reconnect|account_read_failed|loop_error)"' |
+  ForEach-Object { $_.Line } | Select-Object -Last 50
+```
+
+`cause_phase` separates a quiet mailbox from a slow link.
+`cause_op` says which op expired.
+If one op is always the one to expire, the budget is the constraint.
+If `ping` is, the mailbox is.
+
+### Is 5000ms the right read budget
+
+Unknown. It is deliberately UNCHANGED.
+
+This repo records one measured number for the round trip: p50 205ms over 2166
+requests, 2026-09-26, market CLOSED.
+`tests/live_measurements.py` is that number's one home.
+5000ms is 24x that median.
+A budget is sized against the TAIL.
+
+The tail was not measured, and two revisions of the docs said it was.
+`docs/MT4.md` claimed "p90 206ms, max 223ms" and `config.py` claimed a "22x
+margin" from it.
+Both were wrong and both are corrected (#127).
+The pairing used in 2026-09 matched each request to the NEXT reply.
+One unanswered request shifted every later sample.
+Three went unanswered, so p90 and above were not measurements.
+
+The median survived that by LUCK, not by design.
+All three losses fell in the last 18% of the window.
+About 82% of the samples were never shifted, and the median was among them.
+Replayed with one loss moved to 20% in, the old pairing reads 418ms against a
+true 206ms.
+Do not inherit "the median is trustworthy" as a rule. It was a coincidence.
+
+`measure-mailbox.ps1` now pairs within the request it is open on, and EXCLUDES a
+request that got no reply instead of shifting the ones after it.
+It reports p50, p90, p99 and max, with `paired` and `unanswered` beside them.
+That makes the tail answerable from the same events, with no file reads.
+
+**That fix has NOT been run against a live terminal.** It was written on a Mac
+with no Windows host and no MT4. It is an UNVERIFIED instrument until Conrad runs
+it on the Vultr box. Do not quote a tail number from this repo until then.
+
+Change `mt4.timeout_ms` only on that output. Say what was measured and on what.
+
 ### The Expert MUST be recompiled before any of this is trusted
 
 MQL4 does not compile in CI and does not compile on the developer seat.
@@ -1064,7 +1150,7 @@ A pending fill writes `open` with `fill=true`.
 A vanished ticket writes `close` with `fill=true`.
 The venue holds the live book. It is not the fill log.
 
-JSONL, one event per line: `start`, `open`, `close`, `modify`, `reject`, `halt`, `order_check_fail`, `pending`, `recap`, `reconnect`, `loop_error`, `confirm_stage`, `confirm_cancel`, `confirm_sent`, `approve_always`, `approve_off`, `auto_on`, `auto_off`, `live_on`, `live_off`, `live_not_restored`, `risk_state_error`, `advice_turn`, `advice_circuit_block`, `advice_stage_failed`, `flatten`, `flatten_incomplete`, `close_failed`, `close_partial`, `cancel_failed`, `positions_read_failed`, `orders_read_failed`, `send_unresolved`, `send_refused_unresolved`, `confirm_unresolved`, `inflight_unreadable`, `notify_truncated`, `stop`.
+JSONL, one event per line: `start`, `open`, `close`, `modify`, `reject`, `halt`, `order_check_fail`, `pending`, `recap`, `reconnect`, `loop_error`, `confirm_stage`, `confirm_cancel`, `confirm_sent`, `approve_always`, `approve_off`, `auto_on`, `auto_off`, `live_on`, `live_off`, `live_not_restored`, `risk_state_error`, `advice_turn`, `advice_circuit_block`, `advice_stage_failed`, `flatten`, `flatten_incomplete`, `close_failed`, `close_partial`, `cancel_failed`, `positions_read_failed`, `orders_read_failed`, `account_read_failed`, `send_unresolved`, `send_refused_unresolved`, `confirm_unresolved`, `inflight_unreadable`, `notify_truncated`, `stop`.
 `reject` is written by every gate that refuses, on every path, and it is the
 record to grep when the bot will not trade.
 It carries the NAMED `reason`, plus `source` (`auto`, `telegram`, or `advice`)
@@ -1098,7 +1184,39 @@ check never ran and the order was NOT sent. `not_measured` with `retcode=-1` is
 an IPC or bridge fault, not a trading decision; check the terminal link.
 Grep `reject` if it never trades.
 `outside_session` and `no_regime` are the usual reasons.
-`reconnect` is an MT5 IPC drop then `initialize`.
+`reconnect` is a dropped venue link, then a fresh connect.
+It is written on MT4 and on MT5.
+On MT4 it is a mailbox round trip that got no reply.
+`ok=true` means the link came back. `ok=false` means it did not.
+`error` is the reconnect ATTEMPT failing.
+`cause` is what triggered the reconnect.
+They are two different faults. Do not read one as the other.
+`cause` was added in #127. Before it, a recovered blip wrote `ok=true` alone.
+That row said a reconnect happened and never said why.
+
+| Field | Meaning |
+| --- | --- |
+| `cause` | the triggering error, clipped to 200 characters |
+| `cause_type` | its exception class, for example `BridgeTimeout` |
+| `cause_op` | the mailbox op in flight: `ping`, `account`, `rates`, `market` |
+| `cause_transport` | `file` (the mailbox) or `net` (HTTP to the shim) |
+| `cause_phase` | where on that transport it expired. See `docs/MT4.md` |
+| `cause_withdrawal` | `withdrawn`, `claimed`, or `locked`. See `Unresolved sends` |
+| `cause_req_id` | the request id, to match against the Experts log |
+| `unselected` | how many symbols could not be reselected after the connect |
+
+A missing `cause_*` field means the error did not carry it.
+It does not mean the value was empty.
+`unselected` is absent when every symbol came back.
+`unselected` present with `ok=true` is a PARTIAL recovery.
+Those symbols cannot trade until they are selected.
+The names print to the desk log, not to the row.
+
+`account_read_failed` is the third state.
+The reconnect reported `ok=true` and the account still could not be read.
+It carries `error`, `error_type`, and the same `op` / `transport` / `phase` /
+`withdrawal` fields under an `error_` prefix.
+Before #127 this tick returned with nothing written at all.
 `loop_error` is a tick that raised.
 The bot kept running.
 `journal.inflight.json` is the unresolved-send ledger (not JSONL).

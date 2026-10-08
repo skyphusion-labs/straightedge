@@ -154,14 +154,18 @@ KEY_TERMINAL_PATH = 6
 #: field declaration, a derivation, a test, or prose explaining why the two numbers
 #: are not one number.
 #:
-#: 122 -> 124 with the supervision audit (#133), and NEITHER new site is a
-#: config read: `deploy/windows/README.md` names the key as one of the three
-#: terms the restart interval is derived from, and
-#: `tests/test_supervision.py` names it in the same sentence to say why the
-#: interval cannot be a constant. Both are prose about the key. The count of
-#: live reads in `config.py` is unchanged at two, which is the number this pin
-#: actually guards.
-KEY_TIMEOUT_MS = 124
+#: Both #133 and #127 moved this pin to 124 INDEPENDENTLY and for different
+#: sites, so neither side's 124 is the merged truth and the value below is
+#: MEASURED on the merged tree rather than taken from either branch.
+#: #133 added two prose sites (`deploy/windows/README.md` naming the key as
+#: one of the three terms the restart interval is derived from, and
+#: `tests/test_supervision.py` saying why that interval cannot be a constant).
+#: #127 added two more (`docs/RUNBOOK.md` and `CHANGELOG.md`, the "is 5000ms
+#: the right read budget" section answering "unknown, unchanged, and here is
+#: the run that would settle it").
+#: NONE of the four is a config read or a new field. The count of live reads
+#: in `config.py` is unchanged at two, which is what this pin actually guards.
+KEY_TIMEOUT_MS = 126
 #: the official Windows pip package, named in the extra, the adapter import, the doctor
 #: advice and the mypy override, plus four sites in docs/THIRD-PARTY.md (the licence table,
 #: the pip download command, the paragraph under the table, and the MetaQuotes contact note).
@@ -193,7 +197,17 @@ DOCTOR_MT5_BINDING = 3
 #:      `CalibrateFileTime` writes and deletes its own `mt4_risk_bot.timeprobe`
 #: The probe is a real new mailbox file. It is created and removed inside the one
 #: function that needs it, at OnInit and never again.
-MT4_MAILBOX = 36
+#:
+#: 38 after #127, and NO new mailbox file. Both are the same sentence, written
+#: twice because it belongs in both places: `docs/MT4.md` and `docs/RUNBOOK.md`
+#: each now say that `mt4/tools/measure-mailbox.ps1` must NOT read
+#: `mt4_risk_bot.req` to pair a request to its reply. A read handle on the shared
+#: name can make the Expert's claiming `FileMove` fail on Windows, so an
+#: instrument that paired by request id would manufacture the
+#: ERR_CANNOT_OPEN_FILE failure #82 exists to fix. That is the obvious fix and the
+#: wrong one, and it is cheaper to say so at both sites than to let the next
+#: reader reinvent it.
+MT4_MAILBOX = 38
 #: the LIVE Cloudflare AI Gateway id. Deliberately still the old string; see the header.
 #: 13 gateway-resource references plus 2 in the RUNBOOK LaunchAgent migration note, plus the
 #: four-line vocabulary header of docs/DATA.md, which names the gateway like every other doc.

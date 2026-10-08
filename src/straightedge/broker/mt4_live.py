@@ -93,6 +93,47 @@ _STARTUP_GAP_MAX = 5.0
 #: `ttl_ms` fence already covers.
 _WITHDRAW_GRACE_SEC = 0.5
 
+#: Which WIRE a `BridgeTimeout` ran out of budget on, and WHERE on it. One
+#: vocabulary, declared once, next to the type that carries it: both ends of the
+#: transport raise this exception, `docs/MT4.md` and `docs/TRANSPORT.md` cite
+#: these names rather than restating them, and `Engine._reconnect_broker` writes
+#: them into the journal.
+#:
+#: `file` is the mailbox in MT4's Terminal Common Files, read either by a desk on
+#: the terminal's own host or by `mt4-shim` on a remote desk's behalf. `net` is
+#: the desk's HTTP call to that shim (#73, `docs/TRANSPORT.md`).
+TRANSPORT_FILE = "file"
+TRANSPORT_NET = "net"
+
+#: The file transport's ONLY phase: no `.res` carrying the request's own id
+#: appeared inside the budget. The bridge's other give-up points raise `OSError`
+#: rather than `BridgeTimeout`, so this field is constant for `file` by
+#: construction, and it is still written, so that a reader never has to know
+#: which transports have one phase and which have four.
+PHASE_MAILBOX = "mailbox"
+#: Net: the HTTP request got no answer at all inside the budget. The shim is not
+#: listening, or the host is gone.
+PHASE_CONNECT = "connect"
+#: Net: the response began and did not finish inside the budget.
+PHASE_READ = "read"
+#: Net: the SHIM answered `504`. It reached the mailbox and the Expert did not
+#: reply, which is the designed ordering (`NET_GRACE_SEC`): the far end gives up
+#: first and says so, rather than leaving the desk with a bare socket timeout.
+PHASE_SHIM_MAILBOX = "shim-mailbox"
+#: Net: the SHIM answered `503`. It could not use the mailbox directory at all;
+#: MT4 may not have created Common Files yet.
+PHASE_SHIM_UNAVAILABLE = "shim-unavailable"
+
+#: Every phase above, so a test can enumerate the partition instead of listing
+#: it again and drifting from it.
+BRIDGE_TIMEOUT_PHASES = (
+    PHASE_MAILBOX,
+    PHASE_CONNECT,
+    PHASE_READ,
+    PHASE_SHIM_MAILBOX,
+    PHASE_SHIM_UNAVAILABLE,
+)
+
 BAR_FIELDS = ("time", "open", "high", "low", "close", "volume")
 POS_FIELDS = (
     "ticket",
@@ -367,15 +408,33 @@ class BridgeTimeout(RuntimeError):
 
     `op` is carried for the same reason: a timed-out `tick` and a timed-out
     `market` are not the same event and must not read the same in a journal.
+
+    `transport` and `phase` are carried because until #127 they were not, and
+    the cost of that was measured on the live desk: a quiet mailbox, a shim that
+    never answered and a host that was gone all reached the journal as the one
+    string `mt4 bridge timeout`, so "is this bridge flaky or is it degrading"
+    could not be asked of twelve days of records. They are ATTRIBUTES first and
+    message text second, on purpose: the journal is the machine-readable channel
+    and a reader must never have to partition these facts by parsing English.
+    See `TRANSPORT_FILE` and `PHASE_MAILBOX` above for the vocabulary.
     """
 
     def __init__(
-        self, message: str, *, op: str = "", withdrawal: str = "", req_id: int = 0
+        self,
+        message: str,
+        *,
+        op: str = "",
+        withdrawal: str = "",
+        req_id: int = 0,
+        transport: str = "",
+        phase: str = "",
     ) -> None:
         super().__init__(message)
         self.op = op
         self.withdrawal = withdrawal
         self.req_id = req_id
+        self.transport = transport
+        self.phase = phase
 
     @property
     def withdrawn(self) -> bool:
@@ -524,11 +583,14 @@ class FileBridge:
         # NAMED on the exception rather than assumed away.
         withdrawal = self._withdraw(req)
         raise BridgeTimeout(
-            f"mt4 bridge timeout after {budget:.1f}s"
+            f"mt4 bridge timeout after {budget:.1f}s "
+            f"transport={TRANSPORT_FILE} phase={PHASE_MAILBOX}"
             f"{(' op=' + op) if op else ''} request={withdrawal}",
             op=op,
             withdrawal=withdrawal,
             req_id=req_id,
+            transport=TRANSPORT_FILE,
+            phase=PHASE_MAILBOX,
         )
 
 

@@ -30,9 +30,28 @@
         every gap against journal.jsonl, where a real loss appears as a
         loop_error or reconnect roughly one adapter budget later. Two observers
         or it did not happen.
-      * Round-trip latency is paired naively, each request to the next reply, so
-        ONE unanswered request shifts every later pairing. The MEDIAN is
-        trustworthy; p90 and above are not, once anything has gone missing.
+      * Round-trip latency USED to be paired naively, each request to the next
+        reply, so one unanswered request shifted every later pairing. The 2026-09
+        run's median survived that only because all three of its losses fell in
+        the last 18% of the window; replayed with one loss at 20% in, the old
+        pairing reads 418ms against a true 206ms. "The median is trustworthy"
+        was never a property of the algorithm. Fixed in #127: the pairing is now a single
+        pass over the same events, holding the open request, and a request that
+        got no reply is EXCLUDED rather than paired with somebody else's. That
+        is sound because the mailbox is a strict singleton by contract (one
+        .req at a time, the desk blocks on its reply), so a .res that lands
+        between two .req renames belongs to the first of them and to nothing
+        else. No file is read to achieve it; see the read-only note below, which
+        is the reason request ids are NOT used.
+      * A dropped watcher event therefore costs ONE excluded sample now instead
+        of corrupting every sample after it. It still costs that sample, and the
+        buffer-overflow caveat above still applies, so `paired` and `unanswered`
+        are printed next to every percentile and must be quoted with them.
+      * THE PAIRING FIX IS UNVERIFIED AGAINST A LIVE TERMINAL. It was written on
+        a Mac with no Windows host and no MT4, from the event log format this
+        script already produces. Treat the first live run as a test of the
+        instrument as much as of the mailbox: `paired` plus `unanswered` should
+        account for `requests_published`, give or take the final in-flight one.
       * It is read-only. It never opens, writes, renames or deletes a mailbox
         file, because doing so would perturb the claim-by-rename protocol it is
         supposed to be measuring.
@@ -117,16 +136,45 @@ $span = 0.0
 if ($reqTimes.Count -gt 1) { $span = ($reqTimes[$reqTimes.Count - 1] - $reqTimes[0]).TotalSeconds }
 if ($span -gt 0) { "request_rate_per_min = $([math]::Round($reqTimes.Count / $span * 60, 1))" }
 
+# One pass, holding the open request. A .res while a request is open is THAT
+# request reply. A second .req while one is still open means the first was never
+# answered, and it is dropped rather than paired with the next reply: the naive
+# forward walk this replaces shifted every later sample by one each time that
+# happened, which is why only the median was ever quotable (#127).
 $lat = New-Object System.Collections.Generic.List[double]
-$i = 0
-foreach ($q in $reqTimes) {
-    while ($i -lt $resTimes.Count -and $resTimes[$i] -lt $q) { $i++ }
-    if ($i -lt $resTimes.Count) { $lat.Add(($resTimes[$i] - $q).TotalMilliseconds); $i++ }
+$dropped = 0
+$openAt = $null
+foreach ($l in $lines) {
+    if ($l -notmatch '^\d{4}-') { continue }
+    $p = $l.Split('|')
+    if ($p[1] -ne 'Renamed') { continue }
+    $t = [datetime]::Parse($p[0]).ToUniversalTime()
+    if ($p[2] -eq $reqName) {
+        if ($openAt -ne $null) { $dropped++ }
+        $openAt = $t
+        continue
+    }
+    if ($p[2] -eq $resName -and $openAt -ne $null) {
+        $lat.Add(($t - $openAt).TotalMilliseconds)
+        $openAt = $null
+    }
 }
+if ($openAt -ne $null) { $dropped++ }   # the last request may still be in flight
+function Pct($sorted, $q) { $sorted[[int][math]::Floor($q * ($sorted.Count - 1))] }
 if ($lat.Count -gt 0) {
-    $s = $lat | Sort-Object
-    $med = $s[[int][math]::Floor(0.5 * ($s.Count - 1))]
-    "round_trip_p50_ms  = $([math]::Round($med, 1))  (n=$($s.Count), MEDIAN only, the tail is not trustworthy)"
+    $s = @($lat | Sort-Object)
+    "round_trip_paired  = $($s.Count)"
+    "round_trip_unpaired= $dropped  (excluded, NOT paired with a later reply)"
+    "round_trip_p50_ms  = $([math]::Round((Pct $s 0.50), 1))"
+    "round_trip_p90_ms  = $([math]::Round((Pct $s 0.90), 1))"
+    "round_trip_p99_ms  = $([math]::Round((Pct $s 0.99), 1))"
+    "round_trip_max_ms  = $([math]::Round(($s[$s.Count - 1]), 1))"
+    "NOTE: quote these ONLY with round_trip_paired and round_trip_unpaired. A"
+    "percentile without its denominator is an opinion. A dropped watcher event"
+    "costs one excluded sample and cannot shift the others, but it is still a"
+    "sample this instrument did not see."
+} else {
+    "round_trip_paired  = 0  (NOTHING was measured; this is not a clean window)"
 }
 
 "--- unanswered requests, corroborate each against journal.jsonl ---"

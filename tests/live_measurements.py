@@ -51,9 +51,25 @@ GLOBAL_DEVIATION_POINTS = 20
 #:     2163 replies published. Three requests got no reply file at all.
 #:
 #: The p50 round trip is `.req` renamed in to `.res` renamed in. The tail of that
-#: distribution is NOT recorded here: the naive pairing used to measure it shifts
-#: by one after every unanswered request, so p90 and above were unreliable and
-#: only the median is trustworthy.
+#: distribution is NOT recorded here: the pairing used to measure it shifted by
+#: one after every unanswered request, so p90 and above were unreliable.
+#:
+#: **Why the MEDIAN survived that, corrected #127. It was not a property of the
+#: algorithm; it was where the three losses happened to fall.** All three were
+#: in the last 18% of the window (the reconnects at 02:17:28, 02:20:34 and
+#: 02:21:15 of a window running 01:57:15Z to 02:21:48Z, see
+#: `tests/test_mt4_claim_open_retry.py`), so about 82% of the samples were never
+#: shifted and the median landed among them. Replayed on a synthetic log with
+#: the desk's real cadence (8 back-to-back ops per step, a 15s long poll between
+#: steps) the old pairing reads 212ms against a true 205ms with the losses in
+#: that position, and **418ms against a true 206ms with one loss moved to 20%
+#: in**. So this number carries an unquantified few-percent bias, and the next
+#: run must not inherit the reasoning: "the median is trustworthy" was luck.
+#:
+#: `mt4/tools/measure-mailbox.ps1` no longer pairs that way. It holds the open
+#: request and EXCLUDES one that got no reply, which is sound because the
+#: mailbox is a strict singleton, and it needs no file reads to do it. That fix
+#: has not been run against a live terminal; see the script's own header.
 BRIDGE_ROUND_TRIP_P50_MS = 205
 #: Measured, same window: three unanswered requests out of 2166, 0.139%. Each one
 #: matched a `reconnect` in journal.jsonl exactly one adapter budget later.
