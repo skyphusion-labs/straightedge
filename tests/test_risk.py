@@ -80,6 +80,7 @@ def test_halt_file(tmp_path: Path) -> None:
         spec=default_spec("EURUSD"),
         tick=_tick(),
         positions=[],
+        orders=[],
         now=_now(),
     )
     assert not d.allowed and d.halt and d.flatten
@@ -95,6 +96,7 @@ def test_daily_loss_halt(tmp_path: Path) -> None:
         spec=default_spec("EURUSD"),
         tick=_tick(),
         positions=[],
+        orders=[],
         now=_now(),
     )
     assert d.halt and d.reason == "daily_loss"
@@ -113,6 +115,7 @@ def test_drawdown_halt(tmp_path: Path) -> None:
         spec=default_spec("EURUSD"),
         tick=_tick(),
         positions=[],
+        orders=[],
         now=day2,
     )
     assert d.halt and d.reason == "max_drawdown"
@@ -127,6 +130,7 @@ def test_live_blocked_without_flag(tmp_path: Path) -> None:
         spec=default_spec("EURUSD"),
         tick=_tick(),
         positions=[],
+        orders=[],
         now=_now(),
     )
     assert not d.allowed and d.reason == "live_not_accepted"
@@ -141,6 +145,7 @@ def test_live_blocked_without_flag_mt4(tmp_path: Path) -> None:
         spec=default_spec("EURUSD"),
         tick=_tick(),
         positions=[],
+        orders=[],
         now=_now(),
     )
     assert not d.allowed and d.reason == "live_not_accepted"
@@ -160,6 +165,7 @@ def test_operator_halt_clears_file_not_drawdown(tmp_path: Path) -> None:
         spec=default_spec("EURUSD"),
         tick=_tick(),
         positions=[],
+        orders=[],
         now=day2,
     )
     assert d.reason == "max_drawdown"
@@ -203,6 +209,7 @@ def test_resume_after_a_poll_tick_still_reports_daily_loss(tmp_path: Path) -> No
         spec=default_spec("EURUSD"),
         tick=_tick(),
         positions=[],
+        orders=[],
         now=_now(),
     )
     assert d.reason == "daily_loss"
@@ -214,6 +221,7 @@ def test_resume_after_a_poll_tick_still_reports_daily_loss(tmp_path: Path) -> No
         spec=default_spec("EURUSD"),
         tick=_tick(),
         positions=[],
+        orders=[],
         now=_now(),
     )
     leftover = rm.clear_operator_halt()
@@ -231,7 +239,11 @@ def test_resume_after_a_poll_tick_still_reports_max_drawdown(tmp_path: Path) -> 
     rm.observe(_acct(10_000), day1)
     rm.observe(_acct(9_000), day2)
     kwargs = dict(
-        signal=_sig(), spec=default_spec("EURUSD"), tick=_tick(), positions=[]
+        signal=_sig(),
+        spec=default_spec("EURUSD"),
+        tick=_tick(),
+        positions=[],
+        orders=[],
     )
     d = rm.evaluate(account=_acct(8_900), now=day2, **kwargs)
     assert d.reason == "max_drawdown"
@@ -258,6 +270,7 @@ def test_resume_does_not_clear_a_state_unreadable_halt(tmp_path: Path) -> None:
         spec=default_spec("EURUSD"),
         tick=_tick(),
         positions=[],
+        orders=[],
         now=_now(),
     )
     leftover = rm.clear_operator_halt()
@@ -271,6 +284,7 @@ def test_resume_does_not_clear_a_state_unreadable_halt(tmp_path: Path) -> None:
         spec=default_spec("EURUSD"),
         tick=_tick(),
         positions=[],
+        orders=[],
         now=_now(),
     )
     assert d.reason == "state_unreadable" and not d.allowed
@@ -295,6 +309,7 @@ def test_resume_does_not_reopen_persist_state_after_state_unreadable(
         spec=default_spec("EURUSD"),
         tick=_tick(),
         positions=[],
+        orders=[],
         now=_now(),
     )
     rm.clear_operator_halt()
@@ -319,7 +334,14 @@ def test_persist_state_guard_survives_a_second_tick_before_any_resume(
     cfg.risk.halt_file = str(tmp_path / "HALT")
     rm = RiskManager(cfg, halt_dir=tmp_path)
     rm.write_halt_file("telegram")
-    kwargs = dict(signal=_sig(), spec=default_spec("EURUSD"), tick=_tick(), positions=[], now=_now())
+    kwargs = dict(
+        signal=_sig(),
+        spec=default_spec("EURUSD"),
+        tick=_tick(),
+        positions=[],
+        orders=[],
+        now=_now(),
+    )
     rm.evaluate(account=_acct(10_000), **kwargs)  # tick 1: clobbers _halt_reason
     assert rm._halt_reason == "halt_file"  # confirms the clobber actually happened
     rm.evaluate(account=_acct(10_500), **kwargs)  # tick 2: equity moved, would persist
@@ -334,6 +356,7 @@ def test_rr_and_size_ok(tmp_path: Path) -> None:
         spec=default_spec("EURUSD"),
         tick=_tick(),
         positions=[],
+        orders=[],
         now=_now(),
     )
     assert d.allowed
