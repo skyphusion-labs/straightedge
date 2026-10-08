@@ -33,9 +33,19 @@ The agent bills through the gateway with Unified Billing.
 Do not put a provider key on the agent.
 Env vars override toml if both are set.
 
-Journal writes replace keys named `token`, `password`, `api_key`, `grok_key`, and `claude_key` with `[REDACTED]`.
+Journal writes replace keys named `token`, `password`, `api_key`, `grok_key`, `claude_key`, `mailbox_token`, and `login` with `[REDACTED]`.
+`Journal.tail()` redacts again when it reads, so a row written by an older build is redacted too.
 Journal writes also strip BotFather token patterns from string fields.
 Loop stderr and Telegram `send` strip the same BotFather pattern.
+
+### The broker login
+
+`MT5_LOGIN` is an account IDENTIFIER, not a credential.
+It grants nothing on its own: `MT5_PASSWORD` and `MT5_SERVER` are separate and the password is never journaled.
+It is on the secret-names list anyway, because four paths used to put it in front of a reader (straightedge#90): the journal, `doctor --connect` on stdout, `/history` and the daily `recap` in the chat, and the `history` field of the advice request, which leaves the box.
+The journal and the chat now redact it outright; nothing an audit reads a `start` row for is lost, since `mode`, `equity`, `server` and `symbols` all remain.
+`doctor --connect` MASKS it instead, to `***` plus the last four digits, and shows nothing at all below six digits.
+That difference is deliberate: `doctor --connect` exists to tell the operator which account the terminal is attached to, and a full `[REDACTED]` would not answer that question, while the last four answer it for someone who already knows the number and survive a screen share, a screenshot, or `doctor` output pasted into an issue.
 
 Only `TELEGRAM_CHAT_ID` is accepted.
 Updates from any other chat are ignored.

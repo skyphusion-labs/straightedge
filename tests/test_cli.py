@@ -134,7 +134,12 @@ def test_doctor_connect_mt4(capsys, monkeypatch, tmp_path) -> None:
     out = capsys.readouterr().out
     assert created
     assert created[0].calls[0] == "connect"
-    assert "connected venue=mt4 login=42" in out
+    # straightedge#90. These fakes report a login of 42, under the six digits
+    # `mask_account_id` needs before it will show the last four, so the console
+    # prints nothing at all for it. That refusal is the behaviour being pinned
+    # here; `tests/test_login_not_leaked.py` pins the masked shape with a
+    # realistic eight-digit login.
+    assert "connected venue=mt4 login=[REDACTED]" in out
     assert "trade_mode=0" in out
     # The history check ran, named every configured symbol, and printed a
     # measured ATR rather than the word "unavailable".
@@ -175,7 +180,12 @@ def test_doctor_connect_calls_ensure_connected(capsys, monkeypatch) -> None:
     assert "connect" not in created[0].calls
     assert created[0].calls.index("ensure_connected") < created[0].calls.index("account")
     assert "disconnect" in created[0].calls
-    assert "connected login=1" in out
+    # straightedge#90. These fakes report a login of 1, under the six digits
+    # `mask_account_id` needs before it will show the last four, so the console
+    # prints nothing at all for it. That refusal is the behaviour being pinned
+    # here; `tests/test_login_not_leaked.py` pins the masked shape with a
+    # realistic eight-digit login.
+    assert "connected login=[REDACTED]" in out
     assert "trade_mode=0" in out
 
 
@@ -285,7 +295,12 @@ def test_doctor_connect_falls_back_to_connect(capsys, monkeypatch) -> None:
     out = capsys.readouterr().out
     assert created[0].calls[0] == "connect"
     assert "ensure_connected" not in created[0].calls
-    assert "connected login=2" in out
+    # straightedge#90. These fakes report a login of 2, under the six digits
+    # `mask_account_id` needs before it will show the last four, so the console
+    # prints nothing at all for it. That refusal is the behaviour being pinned
+    # here; `tests/test_login_not_leaked.py` pins the masked shape with a
+    # realistic eight-digit login.
+    assert "connected login=[REDACTED]" in out
     assert "disconnect" in created[0].calls
 
 
@@ -324,7 +339,12 @@ def test_doctor_connect_disconnect_error_still_ok(capsys, monkeypatch) -> None:
     monkeypatch.setattr("straightedge.broker.mt5_live.Mt5Broker", OkThenBoom)
     assert main(["doctor", "--connect"]) == 0
     out = capsys.readouterr().out
-    assert "connected login=3" in out
+    # straightedge#90. These fakes report a login of 3, under the six digits
+    # `mask_account_id` needs before it will show the last four, so the console
+    # prints nothing at all for it. That refusal is the behaviour being pinned
+    # here; `tests/test_login_not_leaked.py` pins the masked shape with a
+    # realistic eight-digit login.
+    assert "connected login=[REDACTED]" in out
 
 
 def test_paper_round_trip_ok() -> None:
