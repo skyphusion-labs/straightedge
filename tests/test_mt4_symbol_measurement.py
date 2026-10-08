@@ -177,6 +177,7 @@ def _decide(tmp_path: Path, spec):
         spec=spec,
         tick=_tick(),
         positions=[],
+        orders=[],
         now=_now(),
     )
 

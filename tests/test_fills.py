@@ -235,7 +235,10 @@ def test_replace_pending_price(tmp_path) -> None:
     too_high = spec.normalize_price(tick.ask + 0.001)
     bad = engine.handle_command(TgCommand("1", 1, f"/replace {order.ticket} {too_high}", 4))
     assert "below ask" in bad
-    engine.handle_command(TgCommand("1", 1, "/buy EURUSD", 5))
+    # GBPUSD, not EURUSD: a working order on EURUSD is committed exposure and
+    # `already_in_symbol` now refuses a market entry on top of it. This step only
+    # needs A position, on any symbol, to check that `/replace` refuses one.
+    engine.handle_command(TgCommand("1", 1, "/buy GBPUSD", 5))
     engine.handle_command(TgCommand("1", 1, "/confirm", 6))
     pos = engine.broker.positions()[0]
     assert "working orders" in engine.handle_command(

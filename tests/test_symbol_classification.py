@@ -301,6 +301,7 @@ def test_m_bearing_positions_reach_the_currency_limit(tmp_path) -> None:
         spec=default_spec("CADMXN"),
         tick=Tick(time=0, bid=1.0999, ask=1.1001),
         positions=positions,
+        orders=[],
         now=_now(),
     )
     assert not d.allowed
@@ -326,6 +327,7 @@ def test_non_fx_symbol_is_allowed_and_the_exclusion_is_named(tmp_path) -> None:
         spec=default_spec("US30"),
         tick=Tick(time=0, bid=1.0999, ask=1.1001),
         positions=[],
+        orders=[],
         now=_now(),
     )
     assert d.allowed, d.reason
@@ -340,6 +342,7 @@ def test_non_fx_open_position_is_excluded_not_refused(tmp_path) -> None:
         spec=default_spec("EURUSD"),
         tick=Tick(time=0, bid=1.0999, ask=1.1001),
         positions=[_pos(1, "US30")],
+        orders=[],
         now=_now(),
     )
     assert d.allowed, d.reason
@@ -363,6 +366,7 @@ def test_non_fx_position_does_not_hide_a_real_fx_breach(tmp_path) -> None:
         spec=default_spec("CADMXN"),
         tick=Tick(time=0, bid=1.0999, ask=1.1001),
         positions=positions,
+        orders=[],
         now=_now(),
     )
     assert not d.allowed

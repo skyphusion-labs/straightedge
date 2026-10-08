@@ -220,3 +220,52 @@ def scan_reasons(source: str, *, class_name: str = "RiskManager") -> ReasonScan:
         forwarded=tuple(sorted(collector.forwarded)),
         unresolved=tuple(sorted(collector.unresolved)),
     )
+
+DECISION_CLASS = "RiskDecision"
+
+
+def scan_decision_reasons(source: str) -> ReasonScan:
+    """Every reason a `RiskDecision(...)` in `source` can carry.
+
+    `scan_reasons` is deliberately broad because a RiskManager refusal comes out
+    several ways (a `reason=` kwarg, `self._halt`, `self._halt_reason`, a bare
+    return from a `-> str` method). That breadth is wrong for any OTHER module:
+    `engine.py` has more than a dozen `reason=` kwargs that are journal fields,
+    not refusals ("fill", "manual", "reverse", "closeby"), and every `-> str`
+    method of `Engine` returns operator prose. Scanning it with `scan_reasons`
+    would not widen the denominator, it would corrupt it.
+
+    So this pass is NARROW on purpose: only `reason=` on a literal
+    `RiskDecision(...)` construction. That is exactly the population the roster
+    is a denominator for, and it finds it wherever the construction lives rather
+    than only in the file the roster happened to be written against.
+
+    Needed because `engine.py` began building `RiskDecision` directly: on `main`
+    it built zero, so reading `risk.py` alone WAS complete, and it silently
+    stopped being complete when the population moved rather than when the
+    scanner changed.
+    """
+    tree = ast.parse(source)
+    collector = _Collector(_module_string_constants(tree))
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        named = (
+            func.id
+            if isinstance(func, ast.Name)
+            else func.attr
+            if isinstance(func, ast.Attribute)
+            else ""
+        )
+        if named != DECISION_CLASS:
+            continue
+        for kw in node.keywords:
+            if kw.arg == REASON_KEYWORD:
+                collector.visit(kw.value)
+    return ReasonScan(
+        names=frozenset(collector.names),
+        prefixes=frozenset(collector.prefixes),
+        forwarded=tuple(sorted(collector.forwarded)),
+        unresolved=tuple(sorted(collector.unresolved)),
+    )
