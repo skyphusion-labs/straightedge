@@ -16,7 +16,7 @@ All of them sit beside `journal.jsonl` (`engine.journal_path`, default
 
 | File | What is in it | How long it stays |
 | --- | --- | --- |
-| `journal.jsonl` | One JSON record per event: fills, refusals, risk state, `start` (mode, account `login`, equity, server, symbols, posture), and `advice_turn` (`provider`, `session`, `action`, `symbol`, `sl`, `tp`, `limit`, `stop`, `ticket`, `staged`). **The question and the reply are not in it** (`desk.py`, `_ask`, the `advice_turn` write). | Rotates to `journal.jsonl.1` at 10 MiB (`journal.py`, `_ROTATE_BYTES`); one old generation is kept. Nothing deletes either file. |
+| `journal.jsonl` | One JSON record per event: fills, refusals, risk state, `start` (mode, equity, server, symbols, posture; the account `login` field is written `[REDACTED]`, see SECURITY.md), and `advice_turn` (`provider`, `session`, `action`, `symbol`, `sl`, `tp`, `limit`, `stop`, `ticket`, `staged`). **The question and the reply are not in it** (`desk.py`, `_ask`, the `advice_turn` write). | Rotates to `journal.jsonl.1` at 10 MiB (`journal.py`, `_ROTATE_BYTES`); one old generation is kept. Nothing deletes either file. |
 | `journal.advice.json` | `{"turns": [{"role": "user" or "assistant", "content": ...}]}`. The `user` content is the question you typed. The `assistant` content is the reply prose (the text before the JSON tail, or the raw reply when there is no tail). Secrets are redacted on write and again on load (`llm.py`, `_remember`, `load`, `redact_text`). The desk snapshot is not stored here. | The last 40 turns (`KEEP_TURNS = 40`, `llm.py`), that is the last 20 questions and the last 20 replies. Rewritten after every advice turn, atomically (`save`). **No age limit and no delete path:** the most recent 40 turns stay until you delete the file. Delete it with the bot stopped; the next turn starts with no memory. |
 | `journal.tg_offset`, `journal.lock`, `journal.heartbeat`, `HALT` | Telegram update offset, the exclusive-run lock, the last tick time, the halt marker. No chat content. | See `docs/RUNBOOK.md`. |
 
@@ -31,14 +31,15 @@ Every `/ask` and every free-text message is an advice turn (`desk.py`,
 (`engine.advice_context`): status (`mode`, broker `server`, equity, balance,
 peak equity, position count, risk percent), risk room, open positions, working
 orders, the symbol list, the auto and trail flags, and a quote per symbol. The
-account login is not in the context; it is in the journal `start` record (see
-below, and straightedge#90).
+account login is in neither: the `start` record's `login` field is redacted on
+write and again on read, so what `advice_history` sends carries `[REDACTED]`
+for it, including for rows an older build wrote (straightedge#90).
 
 | `AI_PROVIDER` | Where it goes | What goes with the question |
 | --- | --- | --- |
 | `grok` (default) | `api.x.ai`, with your `XAI_API_KEY`. No gateway. | The desk context, **and the last 40 turns from `journal.advice.json` as prior messages** (`llm.py`, `_grok`). xAI's terms govern what xAI keeps. |
 | `claude` | `api.anthropic.com`, with your `ANTHROPIC_API_KEY`. No gateway. | Same shape (`_claude`). Anthropic's terms govern what Anthropic keeps. |
-| `computer` | `ADVICE_URL`, with `ADVICE_TOKEN` as a bearer token. The shipped URL is `https://mt5-risk-agent.skyphusion.workers.dev/ask`, a Worker on the maintainer's Cloudflare account (`agent/wrangler.jsonc`, `CF_ACCOUNT_ID`). | The desk context, the Telegram chat id as `session`, the model id, and **the last 40 records of `journal.jsonl`** as `history` (`engine.advice_history` is `journal.tail(40)`; `llm.py`, `_computer`). The stored advice turns are not sent on this path. The `start` record is among those 40 after a restart, and it carries the account `login`. |
+| `computer` | `ADVICE_URL`, with `ADVICE_TOKEN` as a bearer token. The shipped URL is `https://mt5-risk-agent.skyphusion.workers.dev/ask`, a Worker on the maintainer's Cloudflare account (`agent/wrangler.jsonc`, `CF_ACCOUNT_ID`). | The desk context, the Telegram chat id as `session`, the model id, and **the last 40 records of `journal.jsonl`** as `history` (`engine.advice_history` is `journal.tail(40)`; `llm.py`, `_computer`). The stored advice turns are not sent on this path. The `start` record is among those 40 after a restart; its `login` field is redacted, by `Journal.tail()` on the way out as well as on write, so a row from an older build does not leak one either (straightedge#90). |
 
 **`compose.yaml` chooses the agent.** The Docker paper desk sets
 `AI_PROVIDER: computer` and `ADVICE_URL` to the maintainer Worker above
