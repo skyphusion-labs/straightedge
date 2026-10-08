@@ -81,6 +81,29 @@ name: mt4-compile
 # calendar the power to red this repo, which is the failure this job's own design already rejects
 # two paragraphs up.
 #
+# RE-PINNING CHECKLIST, because the next person should not have to re-derive this.
+#
+# When MT4_SETUP_SHA256 reds and provenance PASSED, that is a legitimately signed MetaQuotes build
+# that this repo has not reviewed. It is a review trigger, not a bypass. Do all four:
+#
+#   1. Read the Authenticode block this job printed in the step BEFORE the hash gate. If the run
+#      died before printing it, re-run; do not re-pin from a hash alone.
+#   2. Confirm status Valid, the publisher subject, and that the countersignature is present.
+#   3. Update MT4_SETUP_SHA256 in a commit whose body QUOTES the signer subject, thumbprint,
+#      countersigner and file version, and names the run id they were read from. A pin whose
+#      update rule is "whatever the CDN served today" is a checksum, not a control.
+#   4. Confirm the re-run is green AND that the negative controls still fire: the byte-flipped
+#      copy must not validate, and mt4/tests/fixtures/negative-control.mq4 must still fail to
+#      compile. A green job that cannot go red is worth less than the red one it replaced.
+#
+# Never: a fallback download source, a widened or removed path filter, continue-on-error, or a
+# re-pin with no statement of what was verified (straightedge#87, straightedge#136).
+#
+# WHAT THIS DOES NOT ESTABLISH, stated so it is not over-read: the 873af0c7 build's signature was
+# never recorded and the vendor overwrote it at the same URL, so it cannot be fetched now. This
+# commit therefore sets the publisher BASELINE; it does not prove the new build carries the same
+# publisher as the old one. From here a publisher change is detectable. Before here it was not.
+#
 # WHY A SCHEDULE. The PR trigger is path-filtered to mt4/** on purpose, so a vendor republish does
 # not red every unrelated PR. The cost of that, measured: the last run before 2026-10-08 was
 # 2026-09-27, so the broken pin was LATENT for eleven days and surfaced inside a PR about reconnect
@@ -114,16 +137,28 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  # MetaQuotes CDN web stub. Measured 2026-09-26: 4699304 bytes, sha256 below, on two independent
-  # downloads. No fallback URL by design.
+  # MetaQuotes CDN web stub. No fallback URL by design (straightedge#87).
   MT4_SETUP_URL: https://download.mql5.com/cdn/web/metaquotes.software.corp/mt4/mt4setup.exe
-  MT4_SETUP_SHA256: 873af0c7f5ca67eb937a6c609a8317eeb60969073e81a67064fb6f00f84b3e0a
+  # Measured on run 37801966568, the EXECUTED output lines and not the echoed script:
+  #   bytes=5197480  version 5.0.0.6236  Authenticode Valid, "Signature verified."
+  # It replaces 873af0c7... at 4699304 bytes (2026-09-26), which MetaQuotes overwrote at the same
+  # URL. A 498KB size change on a vendor stub is consistent with a real new build rather than a
+  # truncated or corrupted download, and the signature is what actually establishes that.
+  MT4_SETUP_SHA256: 8088bafcbe17aa98c5c3ac7028533caeb97b37ede99a5e59907161edbe5a0eeb
   # Authenticode signer subject. PROVENANCE, where the hash above is immutability; see THE TRUST
-  # MODEL in the header. Substring match against the signer's Subject, so an Organisation field
-  # carrying address components does not have to be transcribed exactly. Measured, not guessed:
-  # the value comes from the run recorded in the commit that set it.
-  MT4_SETUP_PUBLISHER: "MEASURED_IN_CI_SEE_COMMIT"
-  MT4_SETUP_PUBLISHER_THUMBPRINT_SEEN: "MEASURED_IN_CI_SEE_COMMIT"
+  # MODEL in the header. Matched as a substring of the signer's full Subject, measured on run
+  # 37801966568 as:
+  #   CN=MetaQuotes Ltd., O=MetaQuotes Ltd., S=Lemesos, C=CY
+  # The ORGANISATION field is pinned rather than the whole subject or the CN. O is the field a CA
+  # validates for an OV code-signing certificate, so it is the part that carries the identity
+  # claim, and pinning it survives a CN edit or a field reordering that would break a
+  # whole-string compare for no security gain.
+  MT4_SETUP_PUBLISHER: "O=MetaQuotes Ltd."
+  # RECORDED, NOT GATED. A renewal by the same publisher rotates this and must not red the repo;
+  # see the accepted cost in the header. A change produces a ::warning so it is visible to a
+  # reader rather than silent. Issued by CN=Sectigo Public Code Signing CA E36, valid
+  # 2026-02-10 to 2029-02-09, countersigned by CN=Certum Timestamp 2026.
+  MT4_SETUP_PUBLISHER_THUMBPRINT_SEEN: "5A64A7AED24C33DED342D01D01FA5286F06DA6DC"
   METAEDITOR: C:\Program Files (x86)\MetaTrader 4\metaeditor.exe
   EXPERT_SOURCE: mt4\Experts\Mt4RiskBot.mq4
   NEGATIVE_CONTROL: mt4\tests\fixtures\negative-control.mq4
