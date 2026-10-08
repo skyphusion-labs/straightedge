@@ -28,7 +28,7 @@ from straightedge.broker.paper import PaperBroker
 from straightedge.config import BotConfig
 from straightedge.engine import Engine
 from straightedge.synthetic import generate_bars
-from straightedge.telegram import TelegramClient
+from straightedge.telegram import TelegramClient, TgCommand
 
 RECAP_NOTIFY = frozenset({"start", "stop", "open", "close", "halt", "recap"})
 
@@ -272,6 +272,55 @@ def test_the_already_polluted_journal_cannot_still_burst(tmp_path) -> None:
     pulled = [p for u, p in tr.sent[before:] if u.endswith("/sendMessage")]
     assert len(pulled) <= MAX_SEND_CHUNKS, f"/recap took {len(pulled)} sends"
     engine.stop()
+
+
+def test_the_row_bound_still_clears_the_widest_legitimate_row(tmp_path) -> None:
+    """HISTORY_ROW_CHARS is a MEASURED number, so measure it rather than trust it.
+
+    The bound is only honest while it sits above every row an ordinary session
+    writes; below that, a clip marker would stop meaning "this row is anomalous"
+    and start meaning "this desk runs a lot of symbols". The widest such row is
+    `history_preflight`, whose width scales with the configured book, and it was
+    797 characters at four symbols when the bound was chosen.
+
+    A comment carrying that number would drift the moment a field is added to
+    the preflight row or the default book grows. This asserts it instead, so the
+    change that invalidates the bound reds here and says so.
+    """
+    from straightedge.engine import HISTORY_ROW_CHARS
+
+    cfg = _cfg(tmp_path)
+    cfg.symbols = ["EURUSD", "GBPUSD", "USDJPY", "XAUUSD"]
+    broker = PaperBroker(balance=10_000)
+    for i, name in enumerate(cfg.symbols):
+        broker.seed_bars(name, generate_bars(120, drift=0.0004, vol=0.0002, seed=3 + i))
+    clock = [datetime(2024, 1, 3, 12, tzinfo=timezone.utc)]
+    engine = Engine(cfg, broker, halt_dir=str(tmp_path), now_fn=lambda: clock[0])
+    engine.start()
+    engine.handle_command(TgCommand("1", 1, "/buy EURUSD", 1))
+    engine.handle_command(TgCommand("1", 1, "/confirm", 2))
+    engine.step_all()
+    engine.stop()
+
+    widest = 0
+    culprit = ""
+    for rec in engine.journal.tail(500):
+        extra = " ".join(
+            f"{k}={v}"
+            for k, v in rec.items()
+            if k not in {"ts", "event"} and v not in (None, "")
+        )
+        if len(extra) > widest:
+            widest, culprit = len(extra), str(rec.get("event", ""))
+
+    assert widest > 0, "no rows were written, so this test measured nothing"
+    assert widest <= HISTORY_ROW_CHARS, (
+        f"the widest ordinary row is now {widest} chars ({culprit}), at or past the "
+        f"{HISTORY_ROW_CHARS}-char bound, so legitimate rows would be clipped: "
+        "re-measure the bound rather than raising it reflexively"
+    )
+    # And the headroom is real, not a rounding accident.
+    assert widest < HISTORY_ROW_CHARS, "no headroom left above the widest real row"
 
 
 def test_send_cannot_turn_one_message_into_a_burst() -> None:
