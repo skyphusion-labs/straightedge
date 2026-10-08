@@ -202,8 +202,8 @@ It does not turn on EMA entries.
 Default is off.
 
 SL/TP hits and pending fills still alert when `/auto` is off.
-A UTC day roll sends a recap.
-`/recap` dumps that recap now.
+A UTC day roll sends a recap: one line, equity vs `day_start`, once per day.
+`/recap` dumps that plus the last journal rows.
 A recap is not a trade.
 
 Free text is advice.

@@ -218,6 +218,27 @@ def parse_command(update: dict[str, Any]) -> TgCommand | None:
     )
 
 
+#: Telegram's own hard limit is 4096 characters per message; this is the slice
+#: the sender cuts at, left where it has always been.
+CHUNK_CHARS = 3900
+
+#: Most sends one logical message may become. The chunk loop had no ceiling, so
+#: a message that had compounded to ~100 KB became dozens of separate
+#: `sendMessage` calls, which Telegram's rate limiter then dribbled out over
+#: about ten minutes. That burst read as several bot instances running
+#: (straightedge#119).
+#:
+#: Three, because this is a NOTIFICATION channel and 3 x 3900 is already far
+#: past what anyone reads on a phone. Nothing legitimate comes close: the
+#: longest fixed string the desk sends is HELP at 618 characters, and
+#: `history_text` is bounded per row by `engine.HISTORY_ROW_CHARS`, so every
+#: real message is one chunk with room to spare. Telegram allows roughly one
+#: message per second to a chat, so three sends is a sub-second burst rather
+#: than a backlog. A message needing a fourth chunk is not a notification any
+#: more, it is a log dump, and the right answer is to see that it happened.
+MAX_SEND_CHUNKS = 3
+
+
 def _chunks(text: str, size: int) -> list[str]:
     if size <= 0:
         raise ValueError("chunk size must be > 0")
@@ -361,7 +382,7 @@ class TelegramClient:
         if not self.enabled or not text:
             return False
         ok = True
-        for chunk in _chunks(redact_text(text), 3900):
+        for chunk in self._outbound_chunks(text):
             try:
                 data = self._post(
                     "sendMessage",
@@ -375,6 +396,32 @@ class TelegramClient:
                 return False
             ok = ok and bool(data.get("ok"))
         return ok
+
+    def _outbound_chunks(self, text: str) -> list[str]:
+        """Chunk the message, and refuse to let one message become a burst.
+
+        A silent truncation would be a worse bug than a long message, so it is
+        reported twice: inline, where the operator is already looking, and to
+        the journal through the audit seam, where it is countable after the
+        fact. The notice is fitted INSIDE the last chunk rather than appended
+        to it, so the result cannot cross Telegram's 4096-character limit.
+        """
+        chunks = _chunks(redact_text(text), CHUNK_CHARS)
+        if len(chunks) <= MAX_SEND_CHUNKS:
+            return chunks
+        kept = chunks[:MAX_SEND_CHUNKS]
+        dropped = sum(len(c) for c in chunks[MAX_SEND_CHUNKS:])
+        notice = f"\n[truncated: {dropped} more chars, see the journal]"
+        kept[-1] = kept[-1][: CHUNK_CHARS - len(notice)] + notice
+        self._audit(
+            "notify_truncated",
+            {
+                "sent_chunks": len(kept),
+                "total_chunks": len(chunks),
+                "dropped_chars": dropped,
+            },
+        )
+        return kept
 
     def reject_reason(self, cmd: TgCommand) -> str | None:
         """None when the command may run; otherwise why it may not.
@@ -403,11 +450,15 @@ class TelegramClient:
             "command": cmd.name,
             "update_id": cmd.update_id,
         }
+        self._audit("command_rejected", fields)
+
+    def _audit(self, event: str, fields: dict[str, Any]) -> None:
+        """Journal-only record. Never raises: auditing must not kill a send."""
         if self.audit_fn is None:
-            print(f"command_rejected {fields}", file=sys.stderr)
+            print(f"{event} {fields}", file=sys.stderr)
             return
         try:
-            self.audit_fn("command_rejected", fields)
+            self.audit_fn(event, fields)
         except (ValueError, RuntimeError, OSError):
             return
 

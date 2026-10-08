@@ -65,6 +65,23 @@ def _pending_label(order: PendingOrder) -> str:
 STOP_REMOVAL_REFUSED = "stop_removal_refused"
 STOP_EXCEEDS_RISK = "stop_exceeds_risk"
 
+#: Longest rendering `history_text` gives any ONE journal row before it clips
+#: and says so. The journal FILE keeps the whole row either way; this bounds
+#: only what the chat renders.
+#:
+#: Measured, not chosen: the widest row an ordinary session writes is
+#: `history_preflight` at 797 characters for a four-symbol desk, and it is the
+#: only row whose width scales with configuration. 1000 keeps that headroom, so
+#: a clip marker means 'this row is anomalous' and never 'this desk runs a lot
+#: of symbols'.
+#:
+#: A bound on SIZE, deliberately not a denylist on the one field that caused
+#: straightedge#119: the recap's stored `tail` is gone at the source, but
+#: journals written before that fix still hold it, and the next oversized field
+#: would re-open the same hole. One row cannot crowd the other fourteen out of
+#: the message.
+HISTORY_ROW_CHARS = 1000
+
 
 def _loss_distance(pos: Position, sl: float) -> float:
     """How far `sl` sits on the LOSING side of the entry. Negative past breakeven.
@@ -119,6 +136,25 @@ class Engine:
         self.now_fn = now_fn or (lambda: datetime.now(timezone.utc))
         self.last_bar_time: dict[str, int] = {}
         self.halted = False
+        #: The `day_key` the daily recap has already been emitted for.
+        #:
+        #: The recap needs a marker of its OWN because it cannot use the one
+        #: thing that looks like one. `snap.day_key` is rolled by
+        #: `RiskManager.observe`, reached through `_apply_circuit`, and
+        #: `step_all` returns BEFORE that when `self.halted`. So a halted desk
+        #: never rolled the day and re-emitted the recap on every single tick
+        #: (straightedge#119). Moving the rollover earlier is NOT the fix:
+        #: `day_start_equity` resets with it, and that is the baseline the
+        #: daily-loss budget is measured against, so it would change refusal
+        #: behaviour on the real-money path.
+        #:
+        #: In memory on purpose, and this is the reachability argument for it:
+        #: `start()` calls `risk.observe()` before the first tick, so after any
+        #: restart `snap.day_key` already equals today and `_maybe_daily_recap`
+        #: cannot owe a recap for a day that ended before the restart. A
+        #: journal-restored marker would therefore guard a state no restart can
+        #: reach, which is decoration, not safety.
+        self._recapped_day = ""
         #: Heartbeat bookkeeping. `_hb_gap_max_s` is the largest gap between two
         #: heartbeat writes this process has actually seen, published so the
         #: derived staleness threshold can be checked against reality instead of
@@ -1654,6 +1690,12 @@ class Engine:
                 for k, v in rec.items()
                 if k not in {"ts", "event"} and v not in (None, "")
             )
+            if len(extra) > HISTORY_ROW_CHARS:
+                dropped = len(extra) - HISTORY_ROW_CHARS
+                extra = (
+                    extra[:HISTORY_ROW_CHARS]
+                    + f" [truncated: {dropped} more chars in the journal]"
+                )
             lines.append(f"{ts} {ev} {extra}".strip())
         return "\n".join(lines)
 
@@ -1769,16 +1811,32 @@ class Engine:
         snap = self.risk.snapshot
         if not snap.day_key or snap.day_key == key:
             return
+        if self._recapped_day == snap.day_key:
+            return
         pnl = acct.equity - snap.day_start_equity
-        tail = self.history_text(8)
+        # No `tail` here, and that is the whole of straightedge#119. A journal
+        # row records FACTS about its own event; it must never store a
+        # RENDERING of other rows. `history_text` renders every field of every
+        # row it reads, so a stored `tail` was re-expanded into the next recap:
+        # recap N contained recap N-1 contained recap N-2, compounding daily
+        # until one message was chunked into dozens of Telegram sends and the
+        # journal file grew without bound.
+        #
+        # Fixed at the source rather than by excluding `tail` inside
+        # `history_text`: that would leave the compounding in the FILE, and it
+        # would be a denylist that the next such field defeats. The day's
+        # activity is not lost, it is a PULL now: `/recap` renders it live from
+        # the journal. The nightly PUSH is the P&L summary, which is what makes
+        # it bounded by construction instead of by a cap.
         self._emit(
             "recap",
             day=snap.day_key,
             equity=round(acct.equity, 2),
             day_start=round(snap.day_start_equity, 2),
             pnl=round(pnl, 2),
-            tail="" if tail == "no history" else tail,
         )
+        # AFTER the emit: a raising `_emit` must not mark the day done.
+        self._recapped_day = snap.day_key
 
     def _reconnect_broker(self) -> bool:
         try:
@@ -1962,12 +2020,12 @@ def _format_event(event: str, fields: dict[str, Any]) -> str:
     if event == "recap":
         pnl = float(fields.get("pnl") or 0)
         sign = "+" if pnl >= 0 else ""
-        head = (
+        # Head only. The day's rows are a PULL (`/recap`), never pushed: see
+        # `_maybe_daily_recap` for why a recap carries no rendered tail.
+        return (
             f"RECAP {fields.get('day')} equity={fields.get('equity')} "
             f"day_start={fields.get('day_start')} pnl={sign}{pnl}"
         )
-        tail = str(fields.get("tail") or "")
-        return f"{head}\n{tail}".strip()
     if event == "history_preflight":
         # Journal-only. The all-clear is a denominator, not news.
         return ""
