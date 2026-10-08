@@ -64,11 +64,23 @@ foreach ($name in $tasks) {
     if ($values -match "REPLACE_ME") {
         throw "$name still has an unfilled placeholder in a VALUE after substitution; refusing to register a half-filled definition"
     }
+    # The XML DECLARATION comes off before Register-ScheduledTask sees it, and
+    # this is the one piece of Windows trivia in here worth stating in full:
+    # -Xml takes a .NET string, which is UTF-16 in memory, and the Task
+    # Scheduler parser then reads `encoding="UTF-8"` off the declaration,
+    # disagrees with the bytes it was handed and fails with
+    # `The task XML is malformed. (1,40)::ERROR: unable to switch the encoding`.
+    # Declaring UTF-16 in the file instead would fix this path and break the
+    # other one, because `schtasks /create /xml <file>` reads the FILE, whose
+    # bytes really are UTF-8. A declaration-free string is valid XML and both
+    # consumers accept it, so the script adapts and the artifact stays correct
+    # on disk for either route.
+    $forRegister = [regex]::Replace($xml, "^\s*<\?xml[^>]*\?>\s*", "")
     if (-not $Apply) {
         Write-Host "would register $name from $source (substitutions all resolved)"
         continue
     }
-    Register-ScheduledTask -TaskName $name -Xml $xml -Force | Out-Null
+    Register-ScheduledTask -TaskName $name -Xml $forRegister -Force | Out-Null
     Write-Host "registered $name"
 }
 

@@ -167,6 +167,24 @@ that can hold that lock for even a moment can make a restarting desk exit
 is ALARMED, not restarted, and a human decides. That boundary is PR#80's and
 this change does not move it.
 
+## One piece of Windows trivia, recorded so nobody re-derives it
+
+The files declare `encoding="UTF-8"` and their bytes are UTF-8, which is what
+`schtasks /create /xml <file>` needs. `Register-ScheduledTask -Xml` is a
+different route: it takes an in-memory string, which is UTF-16, and the Task
+Scheduler parser reads the declaration, disagrees with the bytes it was handed,
+and fails with
+
+```
+The task XML is malformed.  (1,40)::ERROR: unable to switch the encoding
+```
+
+Declaring UTF-16 would fix that route and break the file route. So
+`Install-Supervision.ps1` strips the declaration before it registers, which is
+valid XML either way. Caught by the `supervision-xml` CI job on its first run,
+which is the whole argument for that job existing: nothing on a Mac could have
+found it, and the alternative place to find it was the live box.
+
 ## Status of these definitions
 
 The XML parses, and `python -m straightedge supervision --tasks deploy/windows`
