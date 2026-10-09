@@ -178,16 +178,52 @@ checks the assertion rejects it. A test that cannot be shown failing is not a
 control.
 
 **The bundle half has to be re-checked by hand, and the zero is a MEASURED
-negative rather than an absence.** Importing
-`@cloudflare/computer/backends/worker-shell`, which is what registering a real
-exec backend does and which imports `just-bash` directly, moves every number:
+negative rather than an absence.** The procedure is below as code, because the
+obvious version of it DOES NOT WORK and would make you conclude the instrument
+cannot fire.
+
+**Importing the module is not enough. esbuild tree-shakes it.** Measured, four
+variants, each bundled for real:
+
+| mutation to `src/desk-agent.ts` | Total Upload | sprintf lines |
+| --- | --- | --- |
+| none, as shipped | 2118.84 KiB | 0 |
+| `import { WorkerShellBackend } from ".../worker-shell";` alone | **2118.84 KiB** | **0** |
+| that import plus a module-scope `void WorkerShellBackend;` | **2118.84 KiB** | **0** |
+| the import plus a reference RETAINED through the exported function | 5119.18 KiB | 44 |
+| the same, instantiated | 5119.19 KiB | 44 |
+
+So a re-checker who adds the import, sees 2118.84 and concludes the grep cannot
+go positive has been misled by the procedure rather than by the code. Use this,
+which is the mutation the numbers below came from:
+
+```ts
+import { WorkerShellBackend } from "@cloudflare/computer/backends/worker-shell";
+const _probe: unknown = new WorkerShellBackend({} as never);
+export function deskTools(workspace: Workspace) {
+  void _probe;        // retains it; without this the import is dropped
+```
+
+Then:
 
 ```
-                              as shipped    with the backend imported
-Total Upload                  2118.84 KiB   5119.18 KiB
-grep -ci sprintf\|vsprintf\|not_primitive\|numeric_arg          0            44
-grep -c "format width limit exceeded\|printf: usage"             0             4
+$ npx wrangler deploy --dry-run --outdir /tmp/b
+                                                               shipped   with the backend
+Total Upload                                                   2118.84      5119.19 KiB
+grep -ci 'sprintf|vsprintf|not_primitive|numeric_arg' (LINES)        0               44
+grep -oi  same pattern | wc -l                  (OCCURRENCES)        0              120
+grep -c  'format width limit exceeded|printf: usage'  (LINES)        0                3
+grep -o   same pattern | wc -l                  (OCCURRENCES)        0                4
 ```
+
+**Each figure is labelled with the command that produces it, and that is not
+pedantry.** Two reviewers of this file reported 44 against 120 and 4 against 3
+for the same bundle and read it as a disagreement; it was `grep -c` counting
+LINES against `grep -o | wc -l` counting OCCURRENCES, with neither stating
+which. A bare count in a re-check procedure is a number the next person cannot
+reproduce. The size also moves in its last decimal with the exact shape of the
+mutation (5119.18 retained, 5119.19 instantiated, 5119.27 with a `shell` option
+as well), so treat the megabyte as the signal and not the hundredths.
 
 So the instrument can be shown going positive on exactly the change that would
 invalidate this, which is what makes the shipped zero worth quoting.
