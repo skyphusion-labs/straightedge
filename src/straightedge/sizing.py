@@ -148,6 +148,46 @@ def normalize_volume(raw: float, spec: SymbolSpec) -> float:
     return stepped
 
 
+def unusable_volume(volume: float) -> str | None:
+    """The refusal reason this volume earns, or None if it can be sent.
+
+    ONE REASON WORD, NOT TWO, and that is a decision AGAINST the shape #208
+    landed for stops rather than an oversight. `unusable_stop` splits
+    `sl_required` from `sl_not_measured` because a stop has two sources: the
+    operator omits one, or the VENUE reports a field that cannot be a price,
+    and those send the operator to two different places to look. A close volume
+    has ONE source. Both paths that reach here carry an operator-typed number
+    (`/close TICKET VOL` and `/tp TICKET PX VOL`, each parsed by a bare
+    `float()`), because the only COMPUTED volume on the close path is a stored
+    scale-out and `normalize_volume` validates that before it is stored. Both
+    kinds therefore call for the identical action, retype the number, and a
+    second reason word would grow the vocabulary without changing what anyone
+    does.
+
+    The VALUE carries the diagnosis, which is the half of #208's argument that
+    does transfer: `volume_unusable:nan` and `volume_unusable:-0.5` are
+    different mistakes and read as different mistakes, with one name.
+
+    DELIBERATELY NOT `volume_not_measured`. That word is the house term for a
+    venue that "sent a value that cannot be a measurement" (`spec_not_measured`,
+    `sl_not_measured`). Nothing measured this one; the operator typed it, and
+    naming it after a venue failure would send them to the wrong place.
+
+    BOTH TESTS ARE REQUIRED, AND THE ORDER IS NOT. The finiteness test cannot
+    be dropped, because `nan <= 0` is False and so a magnitude test alone
+    cannot see a `nan` at all: that is precisely how #210 reached the
+    partial-close arithmetic and wrote `nan` into the account balance. But this
+    is a single `or`, so unlike `unusable_stop`'s early-return ladder both
+    operands are evaluated and swapping them changes nothing. The property that
+    matters is that the finiteness test EXISTS, not that it comes first, and
+    saying "order is load-bearing" here would be a comment claiming a property
+    the code does not have.
+    """
+    if not math.isfinite(volume) or volume <= 0:
+        return f"volume_unusable:{volume}"
+    return None
+
+
 def lots_for_risk(
     equity: float,
     risk_pct: float,
