@@ -836,6 +836,19 @@ class Desk:
             stop=advice.stop,
             ticket=advice.ticket,
             staged=staged,
+            # WHY this turn held, when it held because we could not READ the
+            # reply rather than because the model chose to (straightedge#185).
+            # Without it these two turns are byte-identical in the journal:
+            # `action=hold staged=false` for a model that held, and the same for
+            # a reply that violated the schema and was forced to hold. The chat
+            # carries the reason in prose and `journal.jsonl` is the surface
+            # anyone reconstructing a demo week reads, which is #37 and #38.
+            #
+            # Empty when nothing degraded, and empty is written rather than
+            # omitted: a field that appears only on failure cannot be told from
+            # a desk too old to emit it, which is the partition
+            # `survivor_ticket` and `history_error` exist for.
+            degraded=advice.degraded,
         )
         # Unconditional, and deliberately not a branch. The alternative was to
         # skip it when the reply is not really advice ("no AI key", a provider

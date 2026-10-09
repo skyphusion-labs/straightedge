@@ -46,6 +46,13 @@ _JSON_TAIL = re.compile(r"\{[^{}]*\}\s*$", re.DOTALL)
 @dataclass
 class Advice:
     text: str
+    #: Why the schema gate degraded this turn, empty when it did not.
+    #:
+    #: Set by `Advisor.ask` from its own measurement, never parsed out of
+    #: the reply, so no model can write it (straightedge#185). The desk
+    #: journals it on the `advice_turn` row, which is what makes a model
+    #: HOLD distinguishable from a reply we could not read.
+    degraded: str = ""
     action: str = "hold"
     symbol: str | None = None
     sl: float | None = None
@@ -145,8 +152,25 @@ def _is_num(v: Any) -> bool:
     return isinstance(v, (int, float)) and not isinstance(v, bool)
 
 
-def _schema_violations(obj: dict[str, Any]) -> list[str]:
-    """How `obj` breaks ADVICE_FORMAT, as reasons an operator can read.
+#: Every way a reply can break the contract, as a CLASS rather than a sentence.
+#:
+#: A fixed vocabulary, which is what makes the journal's record of it bounded by
+#: construction (straightedge#216). Each is paired with a field name drawn from
+#: `ADVICE_PROPERTIES` or with the empty string when the offending field is one
+#: the MODEL named and we therefore must not repeat.
+V_UNKNOWN = "unknown_field"
+V_MISSING = "missing"
+V_NOT_IN_ENUM = "not_in_enum"
+V_NOT_A_STRING = "not_a_string"
+V_WRONG_TYPE = "wrong_type"
+V_BRACE = "brace"
+V_NOT_ASCII = "not_ascii"
+V_NOT_A_NUMBER = "not_a_number"
+V_NOT_AN_INTEGER = "not_an_integer"
+
+
+def _schema_violations(obj: dict[str, Any]) -> list[tuple[str, str]]:
+    """How `obj` breaks ADVICE_FORMAT, as (field, class) pairs.
 
     Checked on OUR side as well as the API's, because the constraint is applied
     by a server we do not run and may not reach: `claude_url` can point at a
@@ -154,21 +178,34 @@ def _schema_violations(obj: dict[str, Any]) -> list[str]:
     leave us believing we had a schema gate while having none. A reply that
     violates the schema is therefore evidence the constraint did not apply, and
     that is exactly when it must not be trusted.
+
+    STRUCTURED, not prose, and that is straightedge#216. This used to return
+    sentences with the model's own content interpolated into them, which was
+    right for the chat and wrong for the journal: a 6000 character `action`
+    produced a 6053 character reason and a 6293 byte journal row against the
+    512 byte bound the suite pins, so a model could author unbounded text in
+    our record. One producer, two renderings: `violation_prose` keeps the
+    operator sentence that #181 added and may echo a value, because the chat
+    already shows the model's own prose anyway, and `violation_classes` is
+    bounded by this vocabulary and is what reaches `journal.jsonl`.
+
+    The pair's field is `""` exactly when the offending name is the MODEL's,
+    which is the one case where naming the field would reintroduce the leak.
     """
     props = ADVICE_PROPERTIES
-    out: list[str] = []
-    for key in sorted(set(obj) - set(props)):
-        out.append(f"unknown field {key}")
+    out: list[tuple[str, str]] = []
+    for _key in sorted(set(obj) - set(props)):
+        out.append(("", V_UNKNOWN))
     for key in sorted(set(props) - set(obj)):
-        out.append(f"missing field {key}")
+        out.append((key, V_MISSING))
     action = obj.get("action")
     if "action" in obj and action not in ADVICE_ACTIONS:
-        out.append(f"action {action!r} is outside {list(ADVICE_ACTIONS)}")
+        out.append(("action", V_NOT_IN_ENUM))
     for key in ("text", "summary"):
         if key in obj and not isinstance(obj[key], str):
-            out.append(f"{key} is not a string")
+            out.append((key, V_NOT_A_STRING))
     if "symbol" in obj and obj["symbol"] is not None and not isinstance(obj["symbol"], str):
-        out.append("symbol is neither a string nor null")
+        out.append(("symbol", V_WRONG_TYPE))
     # A BRACE IN `symbol` IS A VIOLATION, not something to clean up. The property
     # is typed ["string","null"], so a braced symbol is schema-VALID and would
     # otherwise pass with nothing forced and nothing said. It has to be caught
@@ -177,7 +214,7 @@ def _schema_violations(obj: dict[str, Any]) -> list[str]:
     # string converts a NAMED REFUSAL into a staged order on an instrument the
     # model never named.
     if isinstance(obj.get("symbol"), str) and ("{" in obj["symbol"] or "}" in obj["symbol"]):
-        out.append(f"symbol {obj['symbol']!r} contains a brace")
+        out.append(("symbol", V_BRACE))
     # A NON-ASCII `symbol` IS A VIOLATION, for the same reason and with the same
     # answer (straightedge#197). It is schema-VALID by type, exactly like the
     # brace above, and `"EURU\u017fD".upper()` is `"EURUSD"`: the transform
@@ -188,16 +225,72 @@ def _schema_violations(obj: dict[str, Any]) -> list[str]:
     # name outside the instrument vocabulary it was given is also evidence the
     # constraint did not apply, which is this function's whole subject.
     if isinstance(obj.get("symbol"), str) and not may_transform_symbol(obj["symbol"]):
-        out.append(f"symbol {obj['symbol']!r} is not ASCII")
+        out.append(("symbol", V_NOT_ASCII))
     for key in ("sl", "tp", "limit", "stop"):
         if key in obj and obj[key] is not None and not _is_num(obj[key]):
-            out.append(f"{key} is neither a number nor null")
+            out.append((key, V_NOT_A_NUMBER))
     if "ticket" in obj and obj["ticket"] is not None and not isinstance(obj["ticket"], int):
-        out.append("ticket is neither an integer nor null")
+        out.append(("ticket", V_NOT_AN_INTEGER))
     return out
 
 
-def structured_to_parseable(raw: str) -> str:
+def violation_classes(bad: list[tuple[str, str]]) -> list[str]:
+    """The journal's rendering: bounded by the schema, never by the reply.
+
+    `field:class`, with the model's own names collapsed into one counted token,
+    so the longest possible output is a function of `ADVICE_PROPERTIES` and the
+    fixed vocabulary above and NOT of anything a model sends. That is the
+    property straightedge#216 needed: truncating an interpolated string would
+    also work and would leave a judgement about "small enough" in the code,
+    where this leaves none.
+    """
+    unknown = sum(1 for field, klass in bad if klass == V_UNKNOWN)
+    out = [
+        f"{field}:{klass}" if field else klass
+        for field, klass in bad
+        if klass != V_UNKNOWN
+    ]
+    if unknown:
+        out.insert(0, V_UNKNOWN if unknown == 1 else f"{V_UNKNOWN} x{unknown}")
+    return out
+
+
+def violation_prose(obj: dict[str, Any], bad: list[tuple[str, str]]) -> list[str]:
+    """The operator's rendering, which MAY echo the reply's own content.
+
+    #181 put the offending value in the chat deliberately and its suite pins
+    that, and the exposure straightedge#216 found is not here: the chat already
+    shows the model's own prose, because `Advice.text` IS that prose. What must
+    not carry unbounded model text is the durable record, and that is
+    `violation_classes`.
+    """
+    unknown = sorted(set(obj) - set(ADVICE_PROPERTIES))
+    out: list[str] = []
+    for field, klass in bad:
+        if klass == V_UNKNOWN:
+            out.append(f"unknown field {unknown.pop(0)}" if unknown else "unknown field")
+        elif klass == V_MISSING:
+            out.append(f"missing field {field}")
+        elif klass == V_NOT_IN_ENUM:
+            out.append(f"action {obj.get('action')!r} is outside {list(ADVICE_ACTIONS)}")
+        elif klass == V_NOT_A_STRING:
+            out.append(f"{field} is not a string")
+        elif klass == V_WRONG_TYPE:
+            out.append("symbol is neither a string nor null")
+        elif klass == V_BRACE:
+            out.append(f"symbol {obj.get('symbol')!r} contains a brace")
+        elif klass == V_NOT_ASCII:
+            out.append(f"symbol {obj.get('symbol')!r} is not ASCII")
+        elif klass == V_NOT_A_NUMBER:
+            out.append(f"{field} is neither a number nor null")
+        else:
+            out.append(f"{field} is neither an integer nor null")
+    return out
+
+
+def structured_to_parseable(
+    raw: str, *, violations: list[str] | None = None
+) -> str:
     """Re-shape a schema-constrained reply into prose + trailing JSON object.
 
     `parse_advice` STAYS THE ONE GATE that produces an `Advice`. Structured
@@ -228,6 +321,17 @@ def structured_to_parseable(raw: str) -> str:
     if not isinstance(obj, dict) or "action" not in obj:
         return raw
     bad = _schema_violations(obj)
+    prose_reasons = violation_prose(obj, bad)
+    if violations is not None:
+        # OUT OF BAND, and that is the whole point (straightedge#185). The
+        # reason has to reach the journal, and both ways it could travel
+        # INSIDE the reply are defects: parsing it back out of the prose is
+        # string-matching our own sentence, and adding a key to the trailing
+        # JSON would be a field `parse_advice` cannot tell WE wrote, because
+        # the `grok` and `computer` paths have no schema and a model could
+        # put that key in its own tail. A list the caller owns cannot be
+        # written by a model.
+        violations.extend(violation_classes(bad))
     prose = obj.get("text")
     prose = prose if isinstance(prose, str) else ""
     tail: dict[str, Any] = {k: obj.get(k) for k in _TAIL_KEYS}
@@ -235,7 +339,7 @@ def structured_to_parseable(raw: str) -> str:
         tail["action"] = "hold"
         note = (
             "degraded: the reply did not match the advice schema ("
-            + "; ".join(bad)
+            + "; ".join(prose_reasons)
             + "); action forced to hold"
         )
         prose = f"{prose}\n\n{note}" if prose else note
@@ -348,6 +452,11 @@ class Advisor:
         self.transport = transport or UrlLibTransport()
         self.persist_path = Path(persist_path) if persist_path else None
         self._memory: list[dict[str, str]] = []
+        #: What the schema gate found on the LAST turn, owned by this object
+        #: so no model can write it. `ask` clears it before every provider
+        #: call; declared here so a caller reaching a provider method
+        #: directly cannot hit an unset attribute (straightedge#185).
+        self._last_violations: list[str] = []
         self.load()
 
     def ask(
@@ -365,6 +474,11 @@ class Advisor:
                 )
             )
         user = f"{context}\n\nUser: {question}"
+        # CLEARED on every turn, before the provider is called. A reason
+        # that outlived its own turn would attach to the next clean one,
+        # which is the stale-marker shape straightedge#119 was: the only
+        # writer sets it from scratch each time rather than updating it.
+        self._last_violations = []
         if self.cfg.provider == "computer":
             raw = self._computer(question, context, session, history or [])
         elif self.cfg.provider == "claude":
@@ -372,6 +486,11 @@ class Advisor:
         else:
             raw = self._grok(user)
         advice = parse_advice(raw)
+        # The schema gate's reason, attached to the Advice the desk
+        # journals (straightedge#185). Carried on the object rather than
+        # left in the prose, because `journal.jsonl` is the surface anyone
+        # reconstructing a demo week reads and the prose never reaches it.
+        advice.degraded = "; ".join(self._last_violations)
         self._remember("user", question)
         self._remember("assistant", advice.text or raw)
         return advice
@@ -528,4 +647,4 @@ class Advisor:
             if stop == "refusal":
                 raise RuntimeError("claude refused")
             raise RuntimeError(f"claude empty (stop_reason={stop or 'unknown'})")
-        return structured_to_parseable(text)
+        return structured_to_parseable(text, violations=self._last_violations)
