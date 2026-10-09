@@ -77,6 +77,57 @@ Auto EMA trading is off until `/auto on`.
 | Unmeasured is not refused | An advice action that could not be turned into an order at all writes `advice_stage_failed` with `measured=false`, never `reject`. COULD NOT MEASURE stays distinct from REFUSED. |
 | Auto arming | `/auto on` and `/auto off` write `auto_on` and `auto_off`, the audit trail `/live` and `/approve` already had. |
 
+### Refusal reasons, in full
+
+`refused: <reason>` reaches the operator verbatim, so the reason word is part of
+the contract and not an implementation detail. **This table is the ENUMERATION;
+the rows above carry the mechanism in depth.** It is kept complete by
+`tests/test_contract_refusal_vocabulary.py`, which scans the source for every
+word the desk can emit and fails when one is not documented here, so a reason
+added to the code without a line here reds a PR rather than arriving silently
+(#220).
+
+A `:` suffix means the word is a PREFIX and a measured payload follows it, which
+is what makes the refusal actionable rather than merely named.
+
+| reason | what was measured | what the operator does |
+| --- | --- | --- |
+| `already_in_symbol` | a commitment in that symbol already exists | close or replace it first |
+| `currency_exposure` | the order would push net exposure in one currency past `max_currency_exposure` | reduce elsewhere in that currency, or raise the cap deliberately |
+| `daily_loss` | the UTC day's loss budget is spent | nothing today; this also HALTS and flattens |
+| `deviation_below_spread:` | the effective slippage tolerance is smaller than the current spread, with the measurement and the config key to change in the payload | raise `symbol_deviation_points` for that symbol, or wait for the spread |
+| `exposure_unmeasured` | currency exposure could not be computed at all | look at the venue; this is COULD NOT MEASURE, not a cap |
+| `halt_file` | the HALT file exists on disk | remove it when you mean to resume (`docs/RUNBOOK.md`) |
+| `halted` | the circuit is latched halted and names no narrower reason | read the journal for the halt that latched it |
+| `live_not_accepted` | mode is live and the account is real, but the risk phrase was never given | `/live on I-ACCEPT-RISK`, or start with `--i-accept-risk` |
+| `margin_buffer` | free margin as a fraction of equity is below `min_free_margin_pct` | reduce exposure, or add margin |
+| `max_advice_turns_per_day` | the UTC day's advice turn budget is spent | nothing today |
+| `max_drawdown` | the peak-to-trough drawdown cap is hit | nothing today; this also HALTS and flattens |
+| `max_positions` | open commitments carrying our magic are at `max_positions` | close one, or raise the cap deliberately |
+| `max_trades_per_day` | the UTC day's trade budget is spent | nothing today |
+| `no_signal` | the strategy produced FLAT or no side | not an error; nothing to send |
+| `orders_unmeasured` | `broker.orders()` could not be READ, so commitment is unmeasured | look at the venue or the Expert; reading a failed read as "no orders" would fail OPEN |
+| `outside_session` | an AUTO order fell outside the configured session window | wait for the session, or send it manually, which is not session-gated |
+| `rr_below_min` | reward-to-risk on the signal is below `min_rr` | widen the target, tighten the stop, or skip |
+| `size_exceeds_risk` | the sized order's worst case exceeds the per-trade cap | reduce size, or widen nothing and skip |
+| `size_zero` | sizing returned zero lots | the stop distance is too wide for the risk budget at min lot; skip it |
+| `sl_not_measured:` | the VENUE reported a stop that cannot be a price (`nan`, `inf`), with the value in the payload | look at the venue; this is not your omission |
+| `sl_required` | no stop was set | set one |
+| `spec_not_measured:` | the venue never streamed the named sizing fields, which are in the payload | get the symbol into Market Watch; sizing refuses rather than defaulting |
+| `spread_too_wide` | spread exceeds `max_spread_atr_frac` of ATR | wait for the spread to come in |
+| `state_unreadable` | the durable risk state could not be READ | fix the path or permissions; the budgets cannot be trusted without it |
+| `state_unwritable` | the durable risk state could not be WRITTEN | fix the path or permissions; a restart would hand out spent budget again |
+| `stops_level` | the stop is closer than the broker's own minimum distance | widen the stop past `stops_level` |
+| `trade_not_allowed` | the account or the Expert has trading disabled | enable it at the terminal |
+| `volume_unusable:` | a close or scale-out volume is not a finite number above zero, with the value in the payload | retype the volume |
+
+One refusal is PROSE rather than a word, deliberately: `refused: unresolved send
+<client_id>` names a specific in-flight send and cannot be a vocabulary entry.
+The scanner above returns it separately and the test pins it, so a NEW prose
+refusal is looked at by a person instead of quietly joining a list of things
+nothing checks.
+
+
 ## Forbidden claims
 
 | Claim | Fact |

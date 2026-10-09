@@ -36,6 +36,7 @@ the set of things not measured.
 from __future__ import annotations
 
 import ast
+import re
 from dataclasses import dataclass
 
 #: The keyword argument every `RiskDecision` carries its reason in.
@@ -220,6 +221,110 @@ def scan_reasons(source: str, *, class_name: str = "RiskManager") -> ReasonScan:
         forwarded=tuple(sorted(collector.forwarded)),
         unresolved=tuple(sorted(collector.unresolved)),
     )
+
+#: Functions that are the AUTHORITY for one refusal word, returning the reason
+#: a value earns or `None`. `sizing.unusable_stop` and `sizing.unusable_volume`
+#: are consulted by `engine.py` and rendered to the operator as
+#: `refused: <reason>`, so their words are part of the operator vocabulary even
+#: though no `RiskDecision` ever carries them.
+REASON_AUTHORITIES = ("unusable_stop", "unusable_volume")
+
+#: A reason WORD is a name this project defines: lower snake_case, optionally
+#: ending in `:` when a payload is appended at runtime. Anything else after
+#: `refused: ` is operator prose.
+REASON_WORD = re.compile(r"^[a-z][a-z0-9_]*:?$")
+
+
+def scan_reason_authorities(
+    source: str, *, function_names: tuple[str, ...] = REASON_AUTHORITIES
+) -> ReasonScan:
+    """Every word the named module-level functions can return.
+
+    Needed because both scanners above are keyed on `RiskDecision`, and a
+    refusal word reaching the operator does not have to come through one.
+    `unusable_stop` returns `sl_required` and `sl_not_measured:<value>`;
+    `unusable_volume` returns `volume_unusable:<value>`. Reading `risk.py` and
+    `engine.py` alone therefore UNDERCOUNTS the vocabulary, which is the same
+    shape as the drift `scan_decision_reasons` exists for: the population
+    moved, not the scanner.
+
+    Reuses `_Collector`, so an f-string, a concatenation and a module constant
+    all resolve, and a return it cannot read lands in `unresolved` rather than
+    being skipped. `return None` names no reason and is skipped deliberately.
+    """
+    tree = ast.parse(source)
+    collector = _Collector(_module_string_constants(tree))
+    seen: set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if node.name not in function_names:
+            continue
+        seen.add(node.name)
+        for ret in ast.walk(node):
+            if isinstance(ret, ast.Return) and ret.value is not None:
+                if isinstance(ret.value, ast.Constant) and ret.value.value is None:
+                    continue
+                collector.visit(ret.value)
+    # A NAME THAT IS NOT THERE IS NOT A CLEAN READ. Without this, renaming
+    # `unusable_volume` would shrink the denominator silently and every caller
+    # would still pass, which is this module's own documented failure mode.
+    for wanted in function_names:
+        if wanted not in seen:
+            collector.unresolved.add(f"function not found: {wanted}")
+    return ReasonScan(
+        names=frozenset(collector.names),
+        prefixes=frozenset(collector.prefixes),
+        forwarded=tuple(sorted(collector.forwarded)),
+        unresolved=tuple(sorted(collector.unresolved)),
+    )
+
+
+def scan_refusal_literals(source: str) -> ReasonScan:
+    """Reason words written directly after `refused: ` in a reply string.
+
+    `desk.py` answers `refused: halted` and `refused: max_advice_turns_per_day`
+    as plain literals, with no decision object involved, so these are invisible
+    to every scanner above. An interpolated site (`f"refused: {reason}"`) names
+    nothing here and is correctly skipped: the word is named wherever that
+    expression was set, and the scanners above read it there.
+
+    NOT EVERY REFUSAL REPLY IS A REASON WORD. `desk.py` also answers
+    `refused: unresolved send <client_id>`, which is operator PROSE: it has a
+    space in it, it is not a name this project defines, and a contract cannot
+    enumerate it as vocabulary. Prose lands in `forwarded`, so the caller pins
+    the exact set and a NEW prose refusal has to be looked at by a person.
+    Dropping it silently would be the defect this module was written against;
+    counting it would corrupt the denominator with text that can never be
+    documented as a word.
+    """
+    tree = ast.parse(source)
+    collector = _Collector(_module_string_constants(tree))
+
+    def take(text: str) -> None:
+        if not text.startswith("refused: ") or text == "refused: ":
+            return
+        tail = text[len("refused: ") :]
+        if REASON_WORD.match(tail):
+            collector._record(tail, prefix=True)
+        else:
+            collector.forwarded.add("prose: " + text.rstrip())
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            take(node.value)
+        elif isinstance(node, ast.JoinedStr):
+            head = node.values[0] if node.values else None
+            if isinstance(head, ast.Constant) and isinstance(head.value, str):
+                take(head.value)
+
+    return ReasonScan(
+        names=frozenset(collector.names),
+        prefixes=frozenset(collector.prefixes),
+        forwarded=tuple(sorted(collector.forwarded)),
+        unresolved=tuple(sorted(collector.unresolved)),
+    )
+
 
 DECISION_CLASS = "RiskDecision"
 
