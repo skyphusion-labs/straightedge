@@ -1223,6 +1223,39 @@ check never ran and the order was NOT sent. `not_measured` with `retcode=-1` is
 an IPC or bridge fault, not a trading decision; check the terminal link.
 Grep `reject` if it never trades.
 `outside_session` and `no_regime` are the usual reasons.
+`venue_clock_unmeasured` means the venue could not state its UTC offset, so
+the auto leg cannot know WHEN it is and refuses every signal. The record
+carries `unmeasured` and `detail`, and `unmeasured` names which of three
+things happened:
+- `server_time`: no stamp on the reply. On MT4 that is an Expert too old to
+  send `time=TimeCurrent()`; recompile and reattach
+  `mt4/Experts/Mt4RiskBot.mq4`.
+- `offset_sec`: a stamp arrived and could not be read as an offset. `detail`
+  says whether it was off the grid, outside the civil timezone band, or read
+  across too wide a round trip.
+- `freshness`: the caller could not bound how old the stamp is. On the auto
+  leg that means the desk's own poll interval was too wide; see
+  `engine.poll_seconds`.
+
+Run `doctor --connect`. It prints what the stamp IMPLIES and says plainly that
+freshness is NOT established, because `doctor` has no previous poll to bound
+the stamp with, and it exits ZERO on that: a closed market is the normal
+weekend state and is not a fault. Compare the implied offset against the
+server clock in the terminal. `doctor` exits non-zero only when the clock
+cannot be read at all, and, from config alone, when `engine.poll_seconds` is
+too slow for any sample to be bounded.
+
+`venue_clock_bar_disagrees` is the other clock refusal and it means the
+opposite: the offset WAS measured, and the venue's own forming bar contradicts
+it. The record carries `offset_sec`, `bar_time` and `implied_server_now`. A
+server cannot be forming a bar that has not opened on its own clock, so this is
+a stale tick stamp (the market closed, or the terminal lost its feed while the
+series kept its last bar) and the offset is wrong by that staleness. Check the
+terminal's own clock and its connection status; the desk resumes by itself once
+ticks flow again.
+
+Manual `/buy` and `/sell` still work while any of this holds, because they
+time themselves off the bot's clock and never off a bar.
 `reconnect` is a dropped venue link, then a fresh connect.
 It is written on MT4 and on MT5.
 On MT4 it is a mailbox round trip that got no reply.

@@ -354,3 +354,34 @@ MAILBOX_SEND_OPS = frozenset(
         "close_by",
     }
 )
+
+
+# --- venue clock measurement (straightedge#172) -----------------------------
+
+#: Real broker server offsets from UTC sit on a QUARTER HOUR grid, so a sample
+#: is read as the grid point it is nearest to.
+#:
+#: This grid is what turns a bounded uncertainty into a measurement: two grid
+#: points are 900s apart, so a sample whose total uncertainty `u` satisfies
+#: `2u < 900` can be consistent with exactly ONE of them, and a sample with a
+#: wider uncertainty is consistent with several and is therefore not a
+#: measurement of anything.
+#:
+#: That rule replaced a chosen tolerance constant (the straightedge#182
+#: review). A fixed 180s was a number nobody derived, in a repo whose
+#: `watchdog.py` states in as many words that a threshold is derived and never
+#: chosen. The uncertainty now comes from the CALLER, which is the only party
+#: that can measure it, and this grid is the only constant left.
+VENUE_CLOCK_GRID_SEC = 900
+#: The band a REAL venue offset can sit in: the civil timezone range, UTC-12
+#: to UTC+14. A snapped sample outside it is not a timezone, it is a frozen or
+#: wildly stale venue clock.
+#:
+#: It is NOT a freshness check and must never be read as one. Measured through
+#: the real adapter during the straightedge#182 review, with `TimeCurrent()`
+#: frozen at Friday's close on a genuinely UTC+3 server: 2h stale read
+#: UTC+01:00, 5h read UTC-02:00, 11h read UTC-08:00, and nothing was rejected
+#: until past 15h. The band catches an absurd clock. Only a BOUNDED sample
+#: makes a measurement.
+VENUE_CLOCK_MIN_OFFSET_SEC = -12 * 3600
+VENUE_CLOCK_MAX_OFFSET_SEC = 14 * 3600

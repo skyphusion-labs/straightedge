@@ -11,6 +11,7 @@ from straightedge.models import (
     Position,
     SymbolSpec,
     Tick,
+    VenueClock,
     WorkingOrder,
 )
 
@@ -28,6 +29,9 @@ class Broker(Protocol):
     def symbol(self, name: str) -> SymbolSpec: ...
     def tick(self, name: str) -> Tick: ...
     def rates(self, name: str, timeframe: str, count: int) -> list[Bar]: ...
+    def venue_clock(
+        self, name: str, *, max_staleness_sec: float | None
+    ) -> VenueClock: ...
     def positions(self, magic: int | None = None) -> list[Position]: ...
     def orders(self, magic: int | None = None) -> list[PendingOrder]: ...
     def select_symbol(self, name: str) -> bool: ...
@@ -62,3 +66,42 @@ class Broker(Protocol):
         deviation: int = 20,
     ) -> OrderResult: ...
     def close_by(self, ticket: int, other: int, symbol: str = "") -> OrderResult: ...
+
+
+#: What `venue_clock_of` reports when the venue has no such method at all.
+VENUE_CLOCK_ABSENT = "venue_clock"
+
+
+def venue_clock_of(
+    broker: object, name: str, *, max_staleness_sec: float | None
+) -> VenueClock:
+    """The venue's clock, with the caller's own bound on the sample's staleness.
+
+    `max_staleness_sec` is REQUIRED and has no default, and `None` is a
+    deliberate value rather than an omission: it means this caller cannot
+    measure how old the venue's stamp is. A venue that SAMPLES a server then
+    answers with an implication that refuses every conversion
+    (`VenueClock.implied`), and a venue that stamps its own bars still answers
+    with a measurement (`VenueClock.declared`), because it has no staleness to
+    bound. The straightedge#182 review is why the argument exists at all: a
+    bound that lives in a docstring gets inherited by the next caller, and one
+    of the three callers here genuinely has no bound to give.
+
+    Read through `getattr` rather than called directly, for the same reason
+    `startup_connect` and `history_probe` are (see `Engine.start` and
+    `Mt4Broker.history_probe`): a venue that predates the method still has to
+    get an answer, and the only safe answer is NOT MEASURED. Reading an absent
+    method as "this venue stamps UTC" is the straightedge#172 defect itself,
+    just relocated into the adapter layer.
+
+    The Protocol above declares the method, so a real adapter that forgets it
+    is a typecheck failure as well; this is the runtime half of the same rule.
+    """
+    ask = getattr(broker, "venue_clock", None)
+    if not callable(ask):
+        return VenueClock.not_measured(
+            VENUE_CLOCK_ABSENT,
+            source=type(broker).__name__,
+            detail="this venue cannot state its UTC offset",
+        )
+    return ask(name, max_staleness_sec=max_staleness_sec)
