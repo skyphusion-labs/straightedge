@@ -279,6 +279,26 @@ class Desk:
                 return "unknown command. /help"
             return fn()
         except (ValueError, RuntimeError) as exc:
+            # COULD NOT MEASURE, not REFUSED: no rule said no, the command
+            # could not be completed at all. So it gets its own event name,
+            # exactly as `advice_stage_failed` does one branch over, and a
+            # reason count can never absorb it.
+            #
+            # Journal-only. The chat already has this sentence as the return
+            # value below, and `_emit` would turn one failure into two
+            # messages, which is the precedent PR #40 set for refusals.
+            #
+            # redact_text again on the way in: `journal.write` redacts by
+            # field, but a provider error arrives as free prose that can echo
+            # the key it was sent, and an audit trail holding a credential is
+            # worse than no audit trail (#232).
+            self._journal_only(
+                "command_failed",
+                measured=False,
+                command=cmd.name or "ask",
+                source="telegram",
+                error=redact_text(str(exc))[:200],
+            )
             return redact_text(str(exc))
 
     def _quote(self, args: str) -> str:
@@ -749,12 +769,39 @@ class Desk:
             except (ValueError, RuntimeError, OSError):
                 pass
         self.engine.risk.record_advice_turn()
-        advice = self.advisor.ask(
-            question,
-            self.engine.advice_context(),
-            session=session,
-            history=self.engine.advice_history(),
-        )
+        try:
+            advice = self.advisor.ask(
+                question,
+                self.engine.advice_context(),
+                session=session,
+                history=self.engine.advice_history(),
+            )
+        except (ValueError, RuntimeError) as exc:
+            # `record_advice_turn()` fired on the line above, before the call,
+            # and that ordering is deliberate: the provider bills a turn
+            # whether or not it ends in an order, so a cap that counted only
+            # completed turns would cost what it saves.
+            #
+            # The consequence this records is that a turn which then FAILS has
+            # ALREADY cost the operator a slot. Without it their daily budget
+            # drops with nothing in the journal to point at, which is the
+            # defect #232 was filed for, found by a live run rather than by
+            # this suite: every fake transport here returns a payload, and a
+            # payload cannot raise an HTTP 502.
+            #
+            # The turn stays SPENT on purpose. We cannot know from here
+            # whether the provider billed before failing, and refunding on
+            # error makes the cap an unbounded retry against a paid endpoint.
+            # So the fix makes the spend visible, it does not undo it.
+            self._journal_only(
+                "advice_turn_failed",
+                measured=False,
+                turn_spent=True,
+                provider=getattr(self.advisor.cfg, "provider", ""),
+                session=session,
+                error=redact_text(str(exc))[:200],
+            )
+            raise
         lines = [advice.text]
         if advice.summary:
             lines.append(advice.summary)
