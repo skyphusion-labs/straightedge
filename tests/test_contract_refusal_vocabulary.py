@@ -266,7 +266,14 @@ def test_non_word_refusal_sites_are_pinned_rather_than_ignored() -> None:
             s
             for scan in _scans().values()
             for s in scan.forwarded
-            if s.startswith(("prose: ", "interpolated: "))
+            # `composed: ` BELONGS HERE AND WAS MISSING, which made the
+            # previous fix close the example rather than the hole for the
+            # fourth time on this PR. The scanner surfaced a concatenated
+            # site and this filter dropped it, so injecting
+            # `"refused: " + x.comment` into desk.py left the pin GREEN while
+            # a test one level down reported the scanner had seen it.
+            # Measured both ways before and after.
+            if s.startswith(("prose: ", "interpolated: ", "composed: "))
         )
     )
     # Compared against a SORTED pin rather than the literal order above, so a
@@ -376,14 +383,22 @@ SEEN_SPELLINGS = (
 UNSEEN_SPELLING = 'return "ref" + "used: " + x.comment'
 
 
+#: A module with no refusal site in it, so a probe measures the ADDED line and
+#: nothing else. Deliberately NOT `desk.py`: reading the real module made each
+#: probe a delta against whatever else was in the tree, so injecting one site
+#: changed the baseline for every other case and these tests redded on a change
+#: they were not about. A gate that reds on an unrelated edit is one the next
+#: person disables.
+_PROBE_STUB = "def unrelated(x) -> str:\n    return str(x)\n"
+
+
 def _probe(line: str):
-    """`scan_refusal_literals` over desk.py plus one added refusal site."""
+    """`scan_refusal_literals` over a clean stub plus one added refusal site."""
     from refusal_scan import scan_refusal_literals
 
-    base = (SRC / "desk.py").read_text(encoding="utf-8")
-    before = scan_refusal_literals(base)
+    before = scan_refusal_literals(_PROBE_STUB)
     after = scan_refusal_literals(
-        base + "\n\ndef _probe_site(x) -> str:\n    " + line + "\n"
+        _PROBE_STUB + "\n\ndef _probe_site(x) -> str:\n    " + line + "\n"
     )
     return (
         sorted(set(after.forwarded) - set(before.forwarded)),
