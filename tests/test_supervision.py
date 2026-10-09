@@ -20,6 +20,7 @@ because a gate that fails everything is as useless as one that fails nothing.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -143,9 +144,56 @@ def _repeat_every(iso: str, *, enabled: str = "true") -> str:
     </TimeTrigger>"""
 
 
-def _audit_one(xml: str, cfg: BotConfig, spec: supervision.TaskSpec | None = None) -> list[supervision.Finding]:
+#: Used as an identity sentinel, never as data, so `_audit_one` can tell "no
+#: liveness half was supplied" from "a liveness half of None was supplied".
+_INFO_DEFAULT = supervision.TaskInfo(name="__sentinel__")
+
+
+def _healthy_info(name: str = "straightedge-desk", **over: object) -> supervision.TaskInfo:
+    """The healthy liveness reading, as MEASURED on the live box.
+
+    2026-10-09 17:46 UTC: `State=Running`, `NextRunTime` five minutes out,
+    `Missed=0`, and `LastTaskResult=0x800710E0` because `IgnoreNew` refused a
+    duplicate launch while an instance was running.
+
+    THAT NON-ZERO RESULT IS IN THE DEFAULT ON PURPOSE. Every declaration test
+    below runs against it, so if the benign-refusal reading is ever got wrong,
+    the whole file reds rather than one test. An audit that flagged non-zero
+    here would report the live desk broken every five minutes while it worked
+    perfectly, and the sibling `mt4-terminal-supervisor` reports 0 for the
+    opposite reason: its action is a short probe that exits cleanly, so it is
+    never the already-running case.
+    """
+    fields: dict[str, object] = {
+        "state": "Running",
+        "multiple_instances": "IgnoreNew",
+        "last_task_result": supervision.REFUSED_DUPLICATE_LAUNCH,
+        "number_of_missed_runs": 0,
+        "next_run_time_utc": "2026-10-09T17:50:50+00:00",
+        "last_run_time_utc": "2026-10-09T17:45:45+00:00",
+        "measured_utc": "2026-10-09T17:46:00+00:00",
+    }
+    fields.update(over)
+    return supervision.TaskInfo(name=name, present=True, **fields)  # type: ignore[arg-type]
+
+
+def _audit_one(
+    xml: str,
+    cfg: BotConfig,
+    spec: supervision.TaskSpec | None = None,
+    info: supervision.TaskInfo | None = _INFO_DEFAULT,
+) -> list[supervision.Finding]:
+    """Audit one hand-built dump, with a HEALTHY liveness half by default.
+
+    The default matters. These fixtures are real-looking dumps rather than
+    templates, so without a liveness half every one of them would red on
+    `liveness_unmeasured`, and the declaration findings each test exists to
+    show would be buried under it. Supplying the measured-healthy half isolates
+    the half under test; the liveness tests pass their own.
+    """
     chosen = spec or supervision.DESK_TASK
     view = supervision.parse_task_xml(chosen.name, xml)
+    view.info = _healthy_info(chosen.name) if info is _INFO_DEFAULT else info
     ceiling, measurable = supervision.interval_ceiling(cfg)
     return supervision.audit_task(
         chosen, view, max_interval_s=ceiling, measurable=measurable
@@ -732,3 +780,696 @@ def test_a_bomless_utf16_dump_is_read(tmp_path: Path) -> None:
     view = supervision.load_views(dest)["straightedge-desk"]
     assert view.present and not view.unreadable
     assert view.repeat_intervals_s == [DECLARED_INTERVAL_S]
+
+
+# --- #151: the declaration is not the behaviour ----------------------------------------
+
+#: The shape the live box ACTUALLY carried on 2026-09-26, which is not the
+#: shape `LOGON_ONLY` reproduces. The repetition is right there, `PT5M`, which
+#: is why a human reading this XML concluded the desk was supervised. It is
+#: hosted on the `LogonTrigger`, and it fired zero times in twelve days.
+#:
+#: `LOGON_ONLY` above has no `Repetition` at all, so it is the easy case any
+#: trigger check catches. Keeping both is the point: the easy one proves
+#: `no_repeating_trigger` works, this one proves the audit can see the defect
+#: that actually happened.
+LOGON_CARRYING_THE_REPETITION = """    <LogonTrigger>
+      <Repetition>
+        <Interval>PT5M</Interval>
+        <StopAtDurationEnd>true</StopAtDurationEnd>
+      </Repetition>
+      <Enabled>true</Enabled>
+      <UserId>EXAMPLE\\operator</UserId>
+    </LogonTrigger>"""
+
+
+def test_the_shape_that_was_actually_on_the_live_box_fails(tmp_path: Path) -> None:
+    """The incident, reproduced properly this time.
+
+    Measured against the audit as merged in #146: `repeat_intervals_s`
+    [300.0], ceiling 428s, ZERO findings, exit 0. Every field it checked was
+    correct, because `parse_task_xml` appends any `Repetition/Interval` it
+    finds with no regard for the trigger's type, so `PT5M` on a `LogonTrigger`
+    counted exactly like a cadence. That desk had not restarted in twelve days.
+
+    This is the regression test for that, and it needs no liveness sidecar: the
+    trigger TYPE is in the declaration, so this half is catchable statically
+    and protects the shipped template too.
+    """
+    findings = _audit_one(
+        _task_xml(triggers=LOGON_CARRYING_THE_REPETITION), _cfg(tmp_path)
+    )
+    codes = _codes(findings, supervision.FAIL)
+    print(f"supervision: the real live-box shape -> {sorted(codes)}")
+    assert "repetition_not_on_a_clock" in codes
+    assert "no_repeating_trigger" not in codes, (
+        "the repetition IS declared; reporting it as absent is the misleading "
+        "message #151 was filed about"
+    )
+    assert supervision.exit_code(findings) == 1
+    text = supervision.report(findings, max_interval_s=float(MT4_STALE))
+    assert "TimeTrigger" in text, "the finding must name what would fix it"
+    assert "twelve days" in text
+
+
+def test_the_interval_alone_cannot_tell_the_two_shapes_apart(tmp_path: Path) -> None:
+    """Why the trigger type has to be kept, stated as an assertion.
+
+    The broken shape and the working shape are IDENTICAL in the one field the
+    merged audit used. If a future change drops `Repetition.trigger` and goes
+    back to storing bare intervals, this test is what notices.
+    """
+    broken = supervision.parse_task_xml(
+        "straightedge-desk", _task_xml(triggers=LOGON_CARRYING_THE_REPETITION)
+    )
+    working = supervision.parse_task_xml(
+        "straightedge-desk", _task_xml(triggers=LOGON_AND_REPEAT)
+    )
+    assert broken.repeat_intervals_s == working.repeat_intervals_s == [300.0]
+    assert [rep.trigger for rep in broken.repetitions] == ["LogonTrigger"]
+    assert "TimeTrigger" in [rep.trigger for rep in working.repetitions]
+
+
+def test_a_clock_hosted_repetition_is_allowed(tmp_path: Path) -> None:
+    """Positive control for the check above.
+
+    Without this, a rule that refused EVERY repetition would pass the test
+    above and the suite would be measuring nothing.
+    """
+    findings = _audit_one(_task_xml(triggers=LOGON_AND_REPEAT), _cfg(tmp_path))
+    assert "repetition_not_on_a_clock" not in _codes(findings)
+    assert supervision.exit_code(findings) == 0
+
+
+def test_a_task_with_no_repetition_still_reports_the_absence(tmp_path: Path) -> None:
+    """The two codes must not collapse into each other.
+
+    `no_repeating_trigger` is "nothing repeats"; `repetition_not_on_a_clock` is
+    "something repeats and it cannot be a cadence". A reader acts differently
+    on each, so a dump with no repetition must not get the new code.
+    """
+    findings = _audit_one(_task_xml(triggers=LOGON_ONLY), _cfg(tmp_path))
+    codes = _codes(findings, supervision.FAIL)
+    assert "no_repeating_trigger" in codes
+    assert "repetition_not_on_a_clock" not in codes
+
+
+# --- #151: the liveness half ----------------------------------------------------------
+
+
+def _info_json(**over: object) -> str:
+    """A sidecar in the exact shape `Export-Tasks.ps1` writes."""
+    body: dict[str, object] = {
+        "task_name": "straightedge-desk",
+        "measured_utc": "2026-10-09T17:46:00.0000000Z",
+        "state": "Running",
+        "multiple_instances": "IgnoreNew",
+        "last_task_result": 2147946720,
+        "number_of_missed_runs": 0,
+        "next_run_time_utc": "2026-10-09T17:50:50.0000000Z",
+        "last_run_time_utc": "2026-10-09T17:45:45.0000000Z",
+    }
+    body.update(over)
+    return json.dumps(body)
+
+
+def test_the_sidecar_the_exporter_writes_is_the_sidecar_the_audit_reads() -> None:
+    """The round trip, by key name and by type.
+
+    Two files have to agree on this schema and only one of them is Python, so
+    the names are asserted rather than trusted. The measured live values are
+    used so a reader can see what a healthy box looks like.
+    """
+    info = supervision.parse_task_info("straightedge-desk", _info_json())
+    assert info.present and not info.unreadable
+    assert info.state == "Running"
+    assert info.multiple_instances == "IgnoreNew"
+    assert info.last_task_result == supervision.REFUSED_DUPLICATE_LAUNCH
+    assert info.number_of_missed_runs == 0
+    assert info.next_run_time_utc.startswith("2026-10-09T17:50:50")
+    assert info.last_run_time_utc.startswith("2026-10-09T17:45:45")
+    assert info.measured_utc.startswith("2026-10-09T17:46:00")
+
+
+def test_a_real_dump_with_no_sidecar_is_unmeasured_and_not_healthy(
+    tmp_path: Path,
+) -> None:
+    """The #151 blind spot, as a failure.
+
+    An audit that read only the declaration passed the live box with exit 0.
+    Saying so is the minimum; the sidecar is how it stops being true.
+    """
+    findings = _audit_one(
+        _task_xml(triggers=LOGON_AND_REPEAT), _cfg(tmp_path), info=None
+    )
+    codes = _codes(findings, supervision.FAIL)
+    assert codes == {"liveness_unmeasured"}, sorted(codes)
+    assert supervision.exit_code(findings) == 1
+    text = supervision.report(findings, max_interval_s=float(MT4_STALE))
+    assert "Export-Tasks.ps1" in text, "a failure must name how to measure it"
+
+
+def test_a_shipped_template_does_not_need_a_sidecar(tmp_path: Path) -> None:
+    """A template has no NextRunTime because it is registered with nothing.
+
+    That is a different question, not an unmeasured invariant, and the artifact
+    says which question it is: the declaration carries REPLACE_ME. Without this
+    distinction the declaration audit CI runs would red forever on a liveness
+    reading that cannot exist.
+    """
+    views = supervision.load_views(DECLARED)
+    assert all(v.is_template for v in views.values()), (
+        "the shipped declaration stopped carrying its placeholder, so the "
+        "liveness half can no longer tell a template from a live dump"
+    )
+    ceiling, measurable = supervision.interval_ceiling(_cfg(tmp_path))
+    findings = supervision.audit(views, max_interval_s=ceiling, measurable=measurable)
+    assert _codes(findings, supervision.FAIL) == set()
+    note = supervision.liveness_note(views)
+    assert "NOT APPLICABLE" in note
+    assert supervision.TEMPLATE_PLACEHOLDER in note
+
+
+def test_the_template_exemption_cannot_hide_a_live_dump(tmp_path: Path) -> None:
+    """The control of that exemption, which is the dangerous one.
+
+    If `is_template` were true for a real dump, a live box would skip the
+    liveness half silently and this change would be worse than useless. A
+    stale export directory from before this change has real paths and no
+    sidecar, and it must FAIL rather than be mistaken for a declaration.
+    """
+    view = supervision.parse_task_xml(
+        "straightedge-desk", _task_xml(triggers=LOGON_AND_REPEAT)
+    )
+    assert not view.is_template, "a dump with real paths must not read as a template"
+    assert supervision.TEMPLATE_PLACEHOLDER not in _task_xml(triggers=LOGON_AND_REPEAT)
+
+
+def test_an_unparseable_sidecar_is_not_the_same_as_an_absent_one(
+    tmp_path: Path,
+) -> None:
+    """Same rule `task_unreadable` follows, one layer down.
+
+    Both are failures and they are DIFFERENT failures: one says re-dump, the
+    other says the dump you have is corrupt. Collapsing them would let a
+    truncated sidecar read as a missing exporter.
+    """
+    broken = supervision.parse_task_info("straightedge-desk", "{not json")
+    assert broken.unreadable and not broken.present
+    findings = _audit_one(
+        _task_xml(triggers=LOGON_AND_REPEAT), _cfg(tmp_path), info=broken
+    )
+    assert _codes(findings, supervision.FAIL) == {"liveness_unreadable"}
+    other = _audit_one(_task_xml(triggers=LOGON_AND_REPEAT), _cfg(tmp_path), info=None)
+    assert _codes(other, supervision.FAIL) == {"liveness_unmeasured"}
+
+
+def test_a_json_array_is_not_a_sidecar() -> None:
+    """Valid JSON that is not an object is unreadable, not empty."""
+    info = supervision.parse_task_info("straightedge-desk", "[1, 2, 3]")
+    assert info.unreadable and not info.present
+    assert "object" in info.parse_error
+
+
+def test_a_declared_repetition_with_no_next_run_time_fails(tmp_path: Path) -> None:
+    """The general case the declaration CANNOT settle.
+
+    A future StartBoundary, an expired EndBoundary or an elapsed Duration all
+    leave a perfect XML and an empty NextRunTime. This is the reading that
+    separates a configured supervisor from a running one.
+    """
+    findings = _audit_one(
+        _task_xml(triggers=LOGON_AND_REPEAT),
+        _cfg(tmp_path),
+        info=_healthy_info(next_run_time_utc=""),
+    )
+    codes = _codes(findings, supervision.FAIL)
+    assert "repetition_never_fires" in codes
+    assert supervision.exit_code(findings) == 1
+
+
+def test_a_populated_next_run_time_does_not_fail(tmp_path: Path) -> None:
+    """Positive control. A rule that reds on every task proves nothing."""
+    findings = _audit_one(_task_xml(triggers=LOGON_AND_REPEAT), _cfg(tmp_path))
+    assert "repetition_never_fires" not in _codes(findings)
+    assert supervision.exit_code(findings) == 0
+
+
+def test_a_fire_once_at_logon_task_is_not_judged_on_next_run_time(
+    tmp_path: Path,
+) -> None:
+    """#151's open question, settled by the conditionality.
+
+    A task whose only trigger fires once at logon has an empty NextRunTime and
+    is CORRECT. The check is conditional on a repetition being DECLARED, so
+    such a task is never judged by it. Without that conditionality this gate
+    would red on arrangements that are fine, which is how a gate gets ignored.
+    """
+    findings = _audit_one(
+        _task_xml(triggers=LOGON_ONLY),
+        _cfg(tmp_path),
+        info=_healthy_info(next_run_time_utc=""),
+    )
+    codes = _codes(findings, supervision.FAIL)
+    assert "repetition_never_fires" not in codes
+    assert "no_repeating_trigger" in codes, (
+        "a desk task that never repeats is still a failure, for its own reason"
+    )
+
+
+def test_a_disabled_task_is_not_also_reported_as_never_firing(tmp_path: Path) -> None:
+    """One cause, one finding.
+
+    A disabled task has an empty NextRunTime BECAUSE it is disabled. Reporting
+    both makes an operator chase two problems that are one problem.
+    """
+    findings = _audit_one(
+        _task_xml(triggers=LOGON_AND_REPEAT, enabled="false"),
+        _cfg(tmp_path),
+        info=_healthy_info(next_run_time_utc=""),
+    )
+    codes = _codes(findings, supervision.FAIL)
+    assert "task_disabled" in codes
+    assert "repetition_never_fires" not in codes
+
+
+def test_the_live_state_overrules_the_declaration(tmp_path: Path) -> None:
+    """`Settings/Enabled` true and `State=Disabled` is the whole subject.
+
+    Two readings of the same fact, and only one of them decides whether
+    anything fires. The declaration cannot show this at all.
+    """
+    findings = _audit_one(
+        _task_xml(triggers=LOGON_AND_REPEAT),
+        _cfg(tmp_path),
+        info=_healthy_info(state="Disabled", next_run_time_utc=""),
+    )
+    codes = _codes(findings, supervision.FAIL)
+    assert "live_state_disabled" in codes
+    assert "task_disabled" not in codes, "the XML says enabled; only the live state does not"
+    assert "repetition_never_fires" not in codes, "disabled explains the empty NextRunTime"
+
+
+# --- #151: the tuple, because no single field is safe ---------------------------------
+
+
+def test_the_benign_already_running_refusal_is_not_a_failure(tmp_path: Path) -> None:
+    """The discriminator, measured on the live box.
+
+    `LastTaskResult=0x800710E0` with `State=Running` and a populated
+    `NextRunTime` is the HEALTHY steady state of a supervision task: the
+    trigger fired, found the desk alive, and `IgnoreNew` refused the duplicate.
+    An audit that flagged non-zero here would report the live desk broken every
+    five minutes, forever, while it worked perfectly.
+    """
+    findings = _audit_one(_task_xml(triggers=LOGON_AND_REPEAT), _cfg(tmp_path))
+    assert findings == [], [f.line() for f in findings]
+    assert supervision.exit_code(findings) == 0
+
+
+def test_a_result_that_is_not_the_benign_refusal_fails(tmp_path: Path) -> None:
+    """The other half, or the field is simply being ignored.
+
+    Without this, "do not flag non-zero" would be indistinguishable from "do
+    not read LastTaskResult", and a task erroring every cycle would be silent.
+    """
+    findings = _audit_one(
+        _task_xml(triggers=LOGON_AND_REPEAT),
+        _cfg(tmp_path),
+        info=_healthy_info(last_task_result=0x80070002),
+    )
+    codes = _codes(findings, supervision.FAIL)
+    assert "last_run_failed" in codes
+    text = supervision.report(findings, max_interval_s=float(MT4_STALE))
+    assert "0x80070002" in text, "the operator needs the code to look it up"
+    assert supervision.exit_code(findings) == 1
+
+
+def test_a_clean_zero_result_is_also_fine(tmp_path: Path) -> None:
+    """`mt4-terminal-supervisor` reports 0, for the opposite reason.
+
+    Its action is a short probe that exits cleanly, so it is never the
+    already-running case. Same family of task, opposite healthy value, and
+    both must pass.
+    """
+    findings = _audit_one(
+        _task_xml(triggers=LOGON_AND_REPEAT),
+        _cfg(tmp_path),
+        info=_healthy_info(last_task_result=0, state="Ready"),
+    )
+    assert findings == [], [f.line() for f in findings]
+
+
+def test_a_refused_launch_with_nothing_running_warns_and_does_not_fail(
+    tmp_path: Path,
+) -> None:
+    """The combination that contradicts itself.
+
+    A refused duplicate means an instance WAS running; if nothing is running
+    now, what it declined to replace has since exited. WARN and not FAIL
+    because it is also a legitimate race between the refusal and the export.
+    """
+    findings = _audit_one(
+        _task_xml(triggers=LOGON_AND_REPEAT),
+        _cfg(tmp_path),
+        info=_healthy_info(state="Ready"),
+    )
+    assert "refused_launch_while_nothing_runs" in _codes(findings, supervision.WARN)
+    assert _codes(findings, supervision.FAIL) == set()
+    assert supervision.exit_code(findings) == 0
+
+
+def test_a_null_last_task_result_is_not_a_zero(tmp_path: Path) -> None:
+    """`None` is "this audit does not know", `0` is "the last launch worked".
+
+    The same rule `parse_duration_seconds` already follows. Collapsing them
+    would let an exporter that wrote nothing read as a clean run.
+    """
+    info = supervision.parse_task_info(
+        "straightedge-desk", _info_json(last_task_result=None)
+    )
+    assert info.last_task_result is None
+    zero = supervision.parse_task_info(
+        "straightedge-desk", _info_json(last_task_result=0)
+    )
+    assert zero.last_task_result == 0
+    findings = _audit_one(
+        _task_xml(triggers=LOGON_AND_REPEAT), _cfg(tmp_path), info=info
+    )
+    assert "last_run_failed" not in _codes(findings)
+
+
+def test_climbing_missed_runs_warn(tmp_path: Path) -> None:
+    """A populated NextRunTime with a climbing missed count is a third state."""
+    findings = _audit_one(
+        _task_xml(triggers=LOGON_AND_REPEAT),
+        _cfg(tmp_path),
+        info=_healthy_info(number_of_missed_runs=7),
+    )
+    assert "missed_runs" in _codes(findings, supervision.WARN)
+    assert _codes(findings, supervision.FAIL) == set()
+
+
+def test_one_missed_run_is_tolerated(tmp_path: Path) -> None:
+    """Control for the threshold. A warning that is always on says nothing."""
+    for missed in (0, 1):
+        findings = _audit_one(
+            _task_xml(triggers=LOGON_AND_REPEAT),
+            _cfg(tmp_path),
+            info=_healthy_info(number_of_missed_runs=missed),
+        )
+        assert "missed_runs" not in _codes(findings), missed
+
+
+def test_a_last_run_far_older_than_the_cadence_warns(tmp_path: Path) -> None:
+    """The twelve-day state, caught independently of the declaration.
+
+    Deliberately measured against the EXPORT's own clock and not this host's:
+    the audit can run on another machine days later, and comparing a box's
+    timestamp to the auditing host's clock is #172's defect with a different
+    clock in it.
+    """
+    findings = _audit_one(
+        _task_xml(triggers=LOGON_AND_REPEAT),
+        _cfg(tmp_path),
+        info=_healthy_info(last_run_time_utc="2026-09-26T01:56:56+00:00"),
+    )
+    assert "last_run_stale" in _codes(findings, supervision.WARN)
+    text = supervision.report(findings, max_interval_s=float(MT4_STALE))
+    assert "300s" in text
+
+
+def test_a_last_run_inside_the_cadence_does_not_warn(tmp_path: Path) -> None:
+    """Control. The measured-healthy default is 15s before the export."""
+    findings = _audit_one(_task_xml(triggers=LOGON_AND_REPEAT), _cfg(tmp_path))
+    assert "last_run_stale" not in _codes(findings)
+
+
+def test_a_next_run_time_before_the_measurement_warns(tmp_path: Path) -> None:
+    """Populated but not advancing is a third state, distinct from empty."""
+    findings = _audit_one(
+        _task_xml(triggers=LOGON_AND_REPEAT),
+        _cfg(tmp_path),
+        info=_healthy_info(next_run_time_utc="2026-10-09T17:00:00+00:00"),
+    )
+    assert "next_run_in_the_past" in _codes(findings, supervision.WARN)
+    assert "repetition_never_fires" not in _codes(findings)
+
+
+def test_a_timestamp_with_no_offset_is_refused_rather_than_assumed_utc() -> None:
+    """#172, one file over, and not repeated here.
+
+    A naive timestamp is NOT relabelled UTC. The exporter resolves the offset
+    on the box where the offset is known, and an audit that filled it in would
+    be inventing a measurement. Refusing it means the time-based WARNs abstain
+    rather than firing on a guess.
+    """
+    assert supervision._parse_utc("2026-10-09T17:46:00") is None
+    assert supervision._parse_utc("") is None
+    assert supervision._parse_utc("not a time") is None
+    aware = supervision._parse_utc("2026-10-09T13:46:00-04:00")
+    assert aware is not None
+    assert aware.isoformat() == "2026-10-09T17:46:00+00:00"
+    zulu = supervision._parse_utc("2026-10-09T17:46:00.0000000Z")
+    assert zulu is not None and zulu.hour == 17
+
+
+def test_a_naive_export_does_not_fire_the_time_warnings(tmp_path: Path) -> None:
+    """The consequence of that refusal, asserted rather than assumed.
+
+    With an unusable clock the time-based readings abstain and the structural
+    ones still run, which is the right split: `NextRunTime` being POPULATED is
+    readable without any arithmetic.
+    """
+    findings = _audit_one(
+        _task_xml(triggers=LOGON_AND_REPEAT),
+        _cfg(tmp_path),
+        info=_healthy_info(
+            measured_utc="2026-10-09T17:46:00",
+            last_run_time_utc="2026-09-26T01:56:56",
+            next_run_time_utc="2026-10-09T17:50:50",
+        ),
+    )
+    codes = _codes(findings)
+    assert "last_run_stale" not in codes
+    assert "next_run_in_the_past" not in codes
+    assert "repetition_never_fires" not in codes
+
+
+def test_the_liveness_note_states_what_was_measured(tmp_path: Path) -> None:
+    """A header line, because "no liveness finding" has two causes.
+
+    Templates not applicable, or a box measured and healthy. A reader cannot
+    tell those apart from silence, and silence about not having measured is
+    this module's entire subject.
+    """
+    view = supervision.parse_task_xml(
+        "straightedge-desk", _task_xml(triggers=LOGON_AND_REPEAT)
+    )
+    view.info = _healthy_info()
+    note = supervision.liveness_note({"straightedge-desk": view})
+    assert "measured for 1 of 1" in note
+    view.info = None
+    assert "measured for 0 of 1" in supervision.liveness_note({"straightedge-desk": view})
+
+
+def test_load_views_picks_up_the_sidecar_beside_the_dump(tmp_path: Path) -> None:
+    """The wiring, end to end, off the filesystem.
+
+    Everything above drives `audit_task` directly, so without this the loader
+    could simply never attach a sidecar and every liveness test would still
+    pass against hand-attached data.
+    """
+    (tmp_path / "straightedge-desk.xml").write_text(
+        _task_xml(triggers=LOGON_AND_REPEAT), encoding="utf-8"
+    )
+    (tmp_path / "straightedge-desk.info.json").write_text(
+        _info_json(), encoding="utf-8"
+    )
+    views = supervision.load_views(tmp_path)
+    info = views["straightedge-desk"].info
+    assert info is not None and info.present
+    assert info.last_task_result == supervision.REFUSED_DUPLICATE_LAUNCH
+
+    (tmp_path / "straightedge-desk.info.json").unlink()
+    again = supervision.load_views(tmp_path)
+    assert again["straightedge-desk"].info is None, (
+        "an absent sidecar must stay absent, not become an empty measurement"
+    )
+
+
+def test_a_utf16_sidecar_is_read_like_the_xml_is(tmp_path: Path) -> None:
+    """PowerShell writes both files and the BOM question is the same one."""
+    (tmp_path / "straightedge-desk.xml").write_text(
+        _task_xml(triggers=LOGON_AND_REPEAT), encoding="utf-8"
+    )
+    (tmp_path / "straightedge-desk.info.json").write_bytes(
+        _info_json().encode("utf-16")
+    )
+    views = supervision.load_views(tmp_path)
+    info = views["straightedge-desk"].info
+    assert info is not None and info.present and not info.unreadable
+    assert info.state == "Running"
+
+
+# --- the SCHED_S_* family, which CI caught and the fixtures had not -----------------
+
+
+def test_a_task_that_has_never_run_is_not_a_failed_launch(tmp_path: Path) -> None:
+    """MEASURED ON A REAL RUNNER, which is how this was found.
+
+    `supervision-xml` registers both declarations and audits the dump. A task
+    registered thirty seconds earlier reports `LastTaskResult = 267011`
+    (`0x00041303 SCHED_S_TASK_HAS_NOT_RUN`), and the first version of this
+    check called that `last_run_failed` and red the job on a task with nothing
+    wrong with it.
+
+    That is the "a gate that reds on a healthy box is a gate that gets ignored"
+    failure, and no offline fixture was going to produce the value: only a real
+    Task Scheduler had it.
+    """
+    findings = _audit_one(
+        _task_xml(triggers=LOGON_AND_REPEAT),
+        _cfg(tmp_path),
+        info=_healthy_info(
+            last_task_result=supervision.SCHED_S_TASK_HAS_NOT_RUN,
+            state="Ready",
+            last_run_time_utc="",
+        ),
+    )
+    assert _codes(findings, supervision.FAIL) == set(), [f.line() for f in findings]
+    assert "never_run" in _codes(findings, supervision.WARN)
+    assert supervision.exit_code(findings) == 0
+    text = supervision.report(findings, max_interval_s=float(MT4_STALE))
+    assert "never run" in text, "a fresh install must be told what it is looking at"
+
+
+def test_the_scheduler_saying_no_valid_triggers_is_a_failure(tmp_path: Path) -> None:
+    """The one informational code that IS a failure.
+
+    `0x00041307 SCHED_S_TASK_NO_VALID_TRIGGERS` is #151's defect reported by
+    Task Scheduler itself, which is the strongest evidence this audit can get.
+    It must not be swept up by the rule that forgives the rest of the family.
+    """
+    findings = _audit_one(
+        _task_xml(triggers=LOGON_AND_REPEAT),
+        _cfg(tmp_path),
+        info=_healthy_info(
+            last_task_result=supervision.SCHED_S_TASK_NO_VALID_TRIGGERS,
+            state="Ready",
+        ),
+    )
+    assert "no_valid_triggers" in _codes(findings, supervision.FAIL)
+    assert supervision.exit_code(findings) == 1
+
+
+def test_an_unrecognised_informational_result_is_named_not_dropped(
+    tmp_path: Path,
+) -> None:
+    """A code this audit has no reading for is a thing to look up.
+
+    Silence would be the family's whole hazard repeated: the severity bit says
+    it is not an error, which is not the same as saying it is uninteresting.
+    """
+    findings = _audit_one(
+        _task_xml(triggers=LOGON_AND_REPEAT),
+        _cfg(tmp_path),
+        info=_healthy_info(last_task_result=0x00041304, state="Ready"),
+    )
+    assert "informational_result" in _codes(findings, supervision.WARN)
+    assert _codes(findings, supervision.FAIL) == set()
+    text = supervision.report(findings, max_interval_s=float(MT4_STALE))
+    assert "0x00041304" in text
+
+
+def test_an_error_severity_result_still_fails(tmp_path: Path) -> None:
+    """The control on the rule above, or it is just ignoring the field.
+
+    Without this, "forgive the informational family" and "never read
+    LastTaskResult" are indistinguishable, and a task erroring every cycle
+    would be silent. 0x80070002 is ERROR_FILE_NOT_FOUND, which is what a task
+    pointed at a moved interpreter reports.
+    """
+    findings = _audit_one(
+        _task_xml(triggers=LOGON_AND_REPEAT),
+        _cfg(tmp_path),
+        info=_healthy_info(last_task_result=0x80070002, state="Ready"),
+    )
+    assert "last_run_failed" in _codes(findings, supervision.FAIL)
+    assert supervision.exit_code(findings) == 1
+
+
+def test_the_severity_bit_is_what_separates_them() -> None:
+    """The rule itself, stated once so it cannot drift into an allow-list.
+
+    An allow-list would encode which members of the family this author happened
+    to have seen, and the next unseen one would read as a failed launch.
+    """
+    assert not supervision._is_error_hresult(0)
+    assert not supervision._is_error_hresult(supervision.SCHED_S_TASK_HAS_NOT_RUN)
+    assert not supervision._is_error_hresult(supervision.SCHED_S_TASK_NO_VALID_TRIGGERS)
+    assert not supervision._is_error_hresult(0x00041300)
+    assert supervision._is_error_hresult(supervision.REFUSED_DUPLICATE_LAUNCH)
+    assert supervision._is_error_hresult(0x80070002)
+
+
+#: CAPTURED VERBATIM from `Export-Tasks.ps1` running on a GitHub-hosted
+#: `windows-latest` runner, 2026-10-09T18:15:13Z, against a `straightedge-desk`
+#: task registered by `Install-Supervision.ps1` about thirty seconds earlier.
+#:
+#: Not hand-built. Everything else in this file is a fixture this author wrote,
+#: and a fixture encodes its author's assumptions: the hand-built healthy
+#: sidecar had `last_task_result` 0x800710E0 and a populated `last_run_time`,
+#: because that is what the LIVE DESK reports, and a freshly installed task
+#: reports neither. Only the real runner produced this shape, and the first
+#: version of the liveness check red on it.
+RUNNER_SIDECAR = """{
+  "task_name": "straightedge-desk",
+  "measured_utc": "2026-10-09T18:15:13.7863469Z",
+  "state": "Ready",
+  "multiple_instances": "IgnoreNew",
+  "last_task_result": 267011,
+  "number_of_missed_runs": 0,
+  "next_run_time_utc": "2026-10-09T18:20:00.0000000Z",
+  "last_run_time_utc": null
+}"""
+
+
+def test_the_sidecar_a_real_runner_produced_audits_clean(tmp_path: Path) -> None:
+    """The exact bytes a real Task Scheduler produced, end to end.
+
+    This is the regression test for the defect `supervision-xml` caught: the
+    audit red on a correctly installed task because 267011 is
+    `SCHED_S_TASK_HAS_NOT_RUN` and the check read every non-zero result as an
+    error. A fixture proves the decision path; this proves the reading, and it
+    is the only test in this file whose input was not written by hand.
+    """
+    info = supervision.parse_task_info("straightedge-desk", RUNNER_SIDECAR)
+    assert info.present and not info.unreadable
+    assert info.last_task_result == supervision.SCHED_S_TASK_HAS_NOT_RUN
+    assert info.last_run_time_utc == "", (
+        "the exporter maps Task Scheduler's never-ran sentinel to null, so a "
+        "1899 timestamp cannot become a 1.1 million hour staleness finding"
+    )
+
+    findings = _audit_one(
+        _task_xml(triggers=LOGON_AND_REPEAT), _cfg(tmp_path), info=info
+    )
+    assert _codes(findings, supervision.FAIL) == set(), [f.line() for f in findings]
+    assert _codes(findings, supervision.WARN) == {"never_run"}
+    assert supervision.exit_code(findings) == 0
+
+
+def test_the_captured_sidecar_still_lets_the_real_defect_red(tmp_path: Path) -> None:
+    """The control on the test above, which is the one that matters.
+
+    Making a fresh install pass must not have made the #151 shape pass with it.
+    Same freshly-installed liveness reading, pre-fix triggers, and the static
+    half must still fail.
+    """
+    info = supervision.parse_task_info("straightedge-desk", RUNNER_SIDECAR)
+    findings = _audit_one(
+        _task_xml(triggers=LOGON_CARRYING_THE_REPETITION), _cfg(tmp_path), info=info
+    )
+    assert "repetition_not_on_a_clock" in _codes(findings, supervision.FAIL)
+    assert supervision.exit_code(findings) == 1

@@ -6,6 +6,69 @@ See README.md and docs/CONTRACT.md.
 
 ## 1.6.0
 
+### The supervision audit asks Task Scheduler what the task will DO (issue #151)
+
+The audit shipped in #146 read the task DECLARATION and never asked what would
+happen next. Re-measured while taking #151, and the blind spot was worse than
+the issue said: against the exact shape the live box carried on 2026-09-26, a
+`Repetition PT5M` hung on the desk task's `LogonTrigger` with every other field
+correct, the audit returned **zero findings and exit 0** while that desk had not
+restarted in twelve days. Not a nearly-right reason; the wrong answer. The
+suite's own "the incident, reproduced" fixture carried no repetition at all,
+which is the easy case any trigger check catches, so nothing ever ran the shape
+that happened.
+
+The live defect is fixed on the box (a `TimeTrigger` was added beside the
+`LogonTrigger`, 2026-10-09, `NextRunTime` now five minutes out). This closes the
+instrument so the next one is caught by a control instead of by an outage.
+
+- **Two instruments that fail independently.** `CLOCK_TRIGGERS` judges the
+  trigger TYPE under a repetition from the XML alone, so the shape that actually
+  happened is caught with no export and the shipped templates are covered too.
+  `NextRunTime`, from a new `<task>.info.json` sidecar, catches what a
+  declaration cannot settle: a future `StartBoundary`, an expired `EndBoundary`,
+  an elapsed `Duration`, a task the live system has disabled behind an XML that
+  says enabled.
+- **`Export-Tasks.ps1` writes the sidecar** from `Get-ScheduledTaskInfo`, still
+  read-only. Times are explicit UTC resolved ON THE BOX, and `_parse_utc`
+  REFUSES a naive timestamp rather than assuming one: relabelling a local time
+  as UTC is #172's defect with a different clock in it.
+- **A real dump with no sidecar is `liveness_unmeasured`, a FAIL**, by the same
+  rule `task_unreadable` follows. A shipped template is exempt because it is
+  registered with nothing; the artifact declares which it is via `REPLACE_ME`
+  rather than an operator remembering a flag, since a forgotten flag would turn
+  a live audit into a declaration audit silently.
+- **No single live field is safe, so the audit judges a tuple.**
+  `LastTaskResult = 0x800710E0` is the HEALTHY steady state of the desk's task:
+  the trigger fires, finds the desk alive, and `IgnoreNew` refuses the
+  duplicate. Flagging non-zero would report the desk broken every five minutes
+  forever; ignoring the field would miss a task erroring every cycle. The
+  measured-healthy reading is the DEFAULT fixture for every declaration test, so
+  getting that reading wrong reds the whole file rather than one test.
+- **The control has a control.** `supervision-xml` now registers the pre-fix
+  shape against real Task Scheduler on `windows-latest`, dumps it, and requires
+  the audit to red AND to name `repetition_not_on_a_clock`. It prints the
+  sidecar first, so if Task Scheduler ever reports that shape differently, that
+  is visible rather than hidden behind a bare red.
+- **The control caught a defect in the audit on its first run, which is the
+  point of having it.** `supervision-xml` red on the freshly registered tasks:
+  `LastTaskResult` is `267011` (`0x00041303 SCHED_S_TASK_HAS_NOT_RUN`) on a task
+  that has never run, and the check read every non-zero result as a failed
+  launch. That would have red on every first install, which is the "a gate that
+  reds on a healthy box is a gate that gets ignored" failure. Fixed by judging
+  the HRESULT severity BIT rather than an allow-list of codes to forgive, since
+  an allow-list encodes which members of the family the author happened to see.
+  `0x00041307 SCHED_S_TASK_NO_VALID_TRIGGERS` stays a FAIL, being the scheduler's
+  own verdict that a task cannot fire. The runner's sidecar is now pinned
+  VERBATIM as a fixture: it is the only input in that test file not written by
+  hand, and the hand-written healthy one could not have produced this shape
+  because it carries what the LIVE DESK reports, not what a fresh install does.
+- #151's own body asserted that `StopAtDurationEnd` with an empty `Duration` was
+  the mechanism. That was an inference about XML semantics and nothing measured
+  it; the documented schema says an absent `Duration` repeats indefinitely. What
+  WAS measured three times is the trigger TYPE, so the trigger type is what this
+  judges, and the window is reported as measured without a reading imposed on it.
+
 ### A git deploy procedure, and a desk that can say what it is running (issue #147)
 
 Conrad's requirement: "I wanted the deployment method of this bot on the box to
