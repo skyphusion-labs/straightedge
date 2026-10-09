@@ -113,6 +113,59 @@ class Journal:
                 out.append(redact(rec))
         return out
 
+    #: The events that mark a SESSION, and therefore a day the desk was alive.
+    SESSION_EVENTS = ("start", "stop")
+
+    def last_session_day_before(self, day: str) -> str:
+        """The most recent day the desk was ALIVE, strictly before `day`.
+
+        Durable evidence for `Engine._owed_recap_day`, and the thing no
+        in-memory or snapshot value can be: the equity snapshot's `day_key`
+        ROLLS, and memory dies with the process (straightedge#129, and the
+        review of #198 that measured the window that leaves).
+
+        IT READS THE ROW'S OWN `day` FIELD, not `ts`, and the difference is
+        load-bearing. `ts` is stamped by `write()` from the wall clock, while
+        every gate in this desk runs on the engine's injected clock; #182 is
+        the whole lesson about conflating two clocks. The `start` and `stop`
+        rows therefore carry the engine's own `day`, and that is what this
+        reads. `ts` is the fallback for rows written before that field
+        existed, which keeps an upgraded install from losing one boundary on
+        its first boot, and is correct there because the live desk's engine
+        clock IS the wall clock.
+
+        Scoped to SESSION_EVENTS on purpose: a `recap` row also carries `day`,
+        and counting it as evidence would make the announcement its own
+        justification.
+
+        It reads the rotated file too, because a 10MB rotation between two
+        boots would otherwise hide yesterday and the day would be silently
+        missed. The recap marker is read from the current file only, so after a
+        rotation the surviving failure is one DUPLICATE message, never a miss.
+        """
+        if not day:
+            return ""
+        wanted = set(self.SESSION_EVENTS)
+        best = ""
+        for path in (self.path, self.path.with_name(self.path.name + ".1")):
+            if not path.exists():
+                continue
+            with path.open("r", encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if not isinstance(rec, dict) or rec.get("event") not in wanted:
+                        continue
+                    stamp = str(rec.get("day") or rec.get("ts") or "")[:10]
+                    if len(stamp) == 10 and best < stamp < day:
+                        best = stamp
+        return best
+
     def last_event(self, *names: str) -> dict[str, Any] | None:
         """Last record whose event is one of names. Full scan; start is rare."""
         if not names or not self.path.exists():
