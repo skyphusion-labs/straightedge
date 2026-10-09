@@ -4,7 +4,234 @@ NOTE: Operator docs from 1.0.0 use 8th-grade Simplified Technical English.
 Do not treat older changelog wording as the operator contract.
 See README.md and docs/CONTRACT.md.
 
+## 1.7.0
+
+### One clock: a broker bar stamp is not UTC, and the offset is measured (issue #172)
+
+Found while pulling the #37 demo evidence off the live box, 2026-10-09, and
+measured there rather than theorised. `C:\bot-state\journal.jsonl` carried three
+auto refusals that could not be right:
+
+```
+2026-10-09T14:00:04Z reject source=auto stage=signal symbol=XAUUSD reason=outside_session
+2026-10-09T15:00:03Z reject source=auto stage=signal symbol=XAUUSD reason=outside_session
+2026-10-09T16:00:02Z reject source=auto stage=signal symbol=XAUUSD reason=outside_session
+```
+
+The live window is `start_utc = "07:00"` / `end_utc = "17:00"` and the box clock
+is UTC. 14:00 and 15:00 are squarely inside it. `in_session` was not the bug;
+the timestamp handed to it was.
+
+`engine.py` built the auto leg's instant as
+`datetime.fromtimestamp(bars[-1].time, tz=timezone.utc)`, and an MT4 bar time is
+BROKER SERVER time. `tz=timezone.utc` does not convert it, it RELABELS it. The
+desk is on a UTC+3 server, so every gate below that line ran three hours off.
+
+- **The session window silently moved by the broker offset.** 07:00-17:00 UTC
+  became 04:00-14:00 UTC, and nothing printed either number, so the operator
+  read the config and believed it. The #37 evidence week was collected through
+  a window nobody chose.
+- **One daily-loss budget had two day boundaries.** The auto path rolled
+  `day_key` on the BROKER day; the desk and the recap roll on the real UTC day.
+  Which boundary applied depended on whether a human or the regime fired.
+- **A `daily_loss` halt could release up to the broker offset EARLY.** The halt
+  clears on the day-key change and the broker day crosses midnight first, so a
+  gate whose whole job is to stop trading for the rest of the day handed the
+  budget back while it was still that day in the units the config is written in.
+  This is the sharp one.
+- **`weekday()` came from the same relabelled value**, so the Saturday/Sunday
+  block and the Friday cutoff landed on the wrong wall-clock instants. Near the
+  weekend edges that is a DAY-sized error: on a UTC+10 server, 22:00 UTC Sunday
+  stamps the bar Monday 08:00, which is a weekday inside the window, so the
+  weekend block did not fire during the illiquid Sunday open.
+
+**The offset is MEASURED off the venue and is never configured.** It is a
+per-server property that moves with the SERVER's DST, so a number in
+`config.toml` is a guess that outlives the first DST change after somebody wrote
+it: that is #68 (an instrument-blind constant that silently mis-sized gold) with
+a clock in place of a tick value, and the rule from #68 applies unchanged. A new
+`VenueClock` carries `SymbolSpec`'s exact partition, applied to a clock:
+`offset_sec` is `None` and `unmeasured` names the field when the measurement
+failed, `to_utc` RAISES rather than returning a plausible instant, and the type
+cannot be constructed half-measured at all. There is no "assume UTC" fallback,
+because zero is a perfectly ordinary offset and a defaulted zero cannot be told
+from a measured one.
+
+**No Expert change and no reattach.** `TickReply` has carried
+`time=TimeCurrent()` since the first version of the ICD, so
+`Mt4Broker.venue_clock` measures the offset from a reply the Expert already
+sends, pairing it with the desk's own clock read either side of the round trip.
+The fix reaches the live desk as a Python upgrade. An Expert that does not send
+`time` reads as NOT MEASURED and refuses, never as UTC.
+
+**The staleness bound is an ARGUMENT with no default, and that is the whole
+safety property.** `TimeCurrent()` is the time of the LAST TICK, not of now, so
+a sample reads `offset - staleness` and the two cannot be separated without a
+bound on the second. The bound is therefore supplied by the caller and REQUIRED:
+`Engine.step_symbol` measures it as the elapsed time since its own previous poll
+of that symbol, which is sound because a bar advanced between those two polls,
+so a tick arrived inside that interval, so the stamp cannot be older than it.
+`replay_symbol` and `doctor` own no such gate, pass `None`, and are therefore
+structurally unable to obtain a measurement from a venue that samples a server.
+
+It is not derived from a config value, and that is deliberate: this repo's own
+tick budget for a live MT4 config is 270s of bounded part with an explicitly
+unbounded tail, and `watchdog.py` publishes `tick_gap_max_s` precisely because
+that budget can be exceeded. A number the codebase already instruments because
+it can be false is not a bound.
+
+A sample is read as the nearest quarter-hour grid point only when twice its
+uncertainty (the bound plus the measured round trip) stays under one grid step,
+because otherwise more than one offset fits it. A chosen 180s tolerance in the
+first version of this change is gone: it was a number nobody derived, in a repo
+whose `watchdog.py` says in as many words that a threshold is derived and never
+chosen.
+
+**The one case the grid cannot see is closed by a second reading.** A stamp
+stale by an exact multiple of 900s lands on a grid point and looks perfect, and
+the civil timezone band does not see it either (11h is 44 whole grid steps).
+`VenueClock.measure` says so, and the limit of the type is pinned by a test. The
+ENGINE then catches it with a reading the type does not have:
+`Engine._bar_instant` compares the measured offset against the venue's own
+forming bar and refuses with `venue_clock_bar_disagrees`, because a server
+cannot be forming a bar its own clock says has not opened yet. The review's
+whole frozen-Friday sweep (2h, 5h, 11h, 15h) is driven through the engine and
+refuses there; both readings come from the same server clock, so our clock
+cancels out and a correct offset cannot be refused by it. A positive control
+pins that: it caught a fixture of this change's own, which had seeded a bar an
+hour ahead of the venue's clock and was therefore observing its own refusal
+rather than the defect's.
+
+**`day_key` is the UTC day, decided and written down** (`docs/CONTRACT.md`, "One
+clock"). It was accidentally both before, which is the actual defect. The
+operator's config is written in UTC, the desk and recap already rolled on it,
+and a broker day would key the money budget to something that moves without
+anyone editing anything.
+
+**MT5 was checked rather than assumed.** `copy_rates_from_pos` and
+`symbol_info_tick` return the trade server's clock with no API that states the
+offset, the adapter passed both through unconverted, and the engine seam is
+shared, so the MT5 path carried the identical defect and is fixed identically.
+Verified by reading the adapter and by a unit test against a fake binding; NOT
+verified against a live MT5 terminal, which this repo has never claimed for the
+MT5 path.
+
+**Breaking for a third-party venue adapter.** `Broker` gains
+`venue_clock(name, *, max_staleness_sec)`. An adapter that does not implement it
+reads as NOT MEASURED, which refuses rather than trading on a guessed clock, so
+an out-of-tree adapter keeps working for every manual command and stops the auto
+leg until it answers. Paper, MT4 and MT5 in this repo implement it.
+
+**What an operator sees, and what `doctor` deliberately does NOT claim.**
+`doctor` has no previous poll and no bar advance, so it cannot bound staleness
+and never prints a measurement for a venue that samples a server. It prints the
+two facts separately:
+
+```
+venue clock: stamp implies UTC+03:00, freshness NOT established (...)
+```
+
+and exits ZERO on that, because it is the normal state of a closed market and
+an operator who sees a red `doctor` every weekend learns to ignore `doctor`. It
+exits non-zero only when the clock cannot be READ at all (no stamp, or a venue
+that cannot answer), and, from config alone with no terminal involved, when
+`engine.poll_seconds` is too slow for any sample to be bounded.
+
+The first version of this gate printed `server UTC+03:00 measured` and was
+wrong about it: the straightedge#182 review froze `TimeCurrent()` at Friday's
+close on a genuinely UTC+3 server and the gate reported `UTC+01:00 measured` at
+2h stale, `UTC-02:00` at 5h and `UTC-08:00` at 11h, each with exit 0, to a
+human deciding whether to start a live loop. The civil band rejected nothing
+until past 15h. That whole sweep is now a test.
+
+The auto refusal is journaled as `reject` with
+`reason=venue_clock_unmeasured` plus the `unmeasured` field and a `detail`;
+`docs/RUNBOOK.md` says what to do about it. Manual `/buy` and `/sell` are
+unaffected throughout: they time themselves off the bot's clock and never off a
+bar.
+
+**The test had to go red first, and 1222 green tests could not see this.** Every
+existing fixture seeds bars whose timestamps ARE UTC, so the suite agreed with
+the defect. `tests/test_bar_clock_is_not_utc.py` supplies the one input none of
+them had, a venue whose clock is not UTC, and asserts the session window, the
+day boundary, the halt release and the weekend block against the real UTC
+instant. All four fail on `main` and pass here.
+
+### Fix-forward, in the same change
+
+- **`broker/base.py` is no longer excluded from coverage.** It was omitted as
+  pure type declarations; it now holds `venue_clock_of`, the rule that turns a
+  venue with no clock into a refusal, and a safety rule in an omitted file is a
+  rule whose coverage cannot be measured.
+- **The venue fakes in `test_cli.py`, `test_login_not_leaked.py` and
+  `test_history_preflight.py` now state a clock.** Without it the doctor gate
+  went red for two reasons at once in the history test, which would have made
+  its red unattributable.
+
 ## 1.6.0
+
+### The supervision audit asks Task Scheduler what the task will DO (issue #151)
+
+The audit shipped in #146 read the task DECLARATION and never asked what would
+happen next. Re-measured while taking #151, and the blind spot was worse than
+the issue said: against the exact shape the live box carried on 2026-09-26, a
+`Repetition PT5M` hung on the desk task's `LogonTrigger` with every other field
+correct, the audit returned **zero findings and exit 0** while that desk had not
+restarted in twelve days. Not a nearly-right reason; the wrong answer. The
+suite's own "the incident, reproduced" fixture carried no repetition at all,
+which is the easy case any trigger check catches, so nothing ever ran the shape
+that happened.
+
+The live defect is fixed on the box (a `TimeTrigger` was added beside the
+`LogonTrigger`, 2026-10-09, `NextRunTime` now five minutes out). This closes the
+instrument so the next one is caught by a control instead of by an outage.
+
+- **Two instruments that fail independently.** `CLOCK_TRIGGERS` judges the
+  trigger TYPE under a repetition from the XML alone, so the shape that actually
+  happened is caught with no export and the shipped templates are covered too.
+  `NextRunTime`, from a new `<task>.info.json` sidecar, catches what a
+  declaration cannot settle: a future `StartBoundary`, an expired `EndBoundary`,
+  an elapsed `Duration`, a task the live system has disabled behind an XML that
+  says enabled.
+- **`Export-Tasks.ps1` writes the sidecar** from `Get-ScheduledTaskInfo`, still
+  read-only. Times are explicit UTC resolved ON THE BOX, and `_parse_utc`
+  REFUSES a naive timestamp rather than assuming one: relabelling a local time
+  as UTC is #172's defect with a different clock in it.
+- **A real dump with no sidecar is `liveness_unmeasured`, a FAIL**, by the same
+  rule `task_unreadable` follows. A shipped template is exempt because it is
+  registered with nothing; the artifact declares which it is via `REPLACE_ME`
+  rather than an operator remembering a flag, since a forgotten flag would turn
+  a live audit into a declaration audit silently.
+- **No single live field is safe, so the audit judges a tuple.**
+  `LastTaskResult = 0x800710E0` is the HEALTHY steady state of the desk's task:
+  the trigger fires, finds the desk alive, and `IgnoreNew` refuses the
+  duplicate. Flagging non-zero would report the desk broken every five minutes
+  forever; ignoring the field would miss a task erroring every cycle. The
+  measured-healthy reading is the DEFAULT fixture for every declaration test, so
+  getting that reading wrong reds the whole file rather than one test.
+- **The control has a control.** `supervision-xml` now registers the pre-fix
+  shape against real Task Scheduler on `windows-latest`, dumps it, and requires
+  the audit to red AND to name `repetition_not_on_a_clock`. It prints the
+  sidecar first, so if Task Scheduler ever reports that shape differently, that
+  is visible rather than hidden behind a bare red.
+- **The control caught a defect in the audit on its first run, which is the
+  point of having it.** `supervision-xml` red on the freshly registered tasks:
+  `LastTaskResult` is `267011` (`0x00041303 SCHED_S_TASK_HAS_NOT_RUN`) on a task
+  that has never run, and the check read every non-zero result as a failed
+  launch. That would have red on every first install, which is the "a gate that
+  reds on a healthy box is a gate that gets ignored" failure. Fixed by judging
+  the HRESULT severity BIT rather than an allow-list of codes to forgive, since
+  an allow-list encodes which members of the family the author happened to see.
+  `0x00041307 SCHED_S_TASK_NO_VALID_TRIGGERS` stays a FAIL, being the scheduler's
+  own verdict that a task cannot fire. The runner's sidecar is now pinned
+  VERBATIM as a fixture: it is the only input in that test file not written by
+  hand, and the hand-written healthy one could not have produced this shape
+  because it carries what the LIVE DESK reports, not what a fresh install does.
+- #151's own body asserted that `StopAtDurationEnd` with an empty `Duration` was
+  the mechanism. That was an inference about XML semantics and nothing measured
+  it; the documented schema says an absent `Duration` repeats indefinitely. What
+  WAS measured three times is the trigger TYPE, so the trigger type is what this
+  judges, and the window is reported as measured without a reading imposed on it.
 
 ### A git deploy procedure, and a desk that can say what it is running (issue #147)
 

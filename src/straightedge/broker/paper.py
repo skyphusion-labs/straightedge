@@ -47,6 +47,7 @@ from straightedge.models import (
     Side,
     SymbolSpec,
     Tick,
+    VenueClock,
     WorkingOrder,
 )
 from straightedge.sizing import ticks_between
@@ -128,6 +129,7 @@ class PaperBroker:
         specs: dict[str, SymbolSpec] | None = None,
         bars: dict[str, list[Bar]] | None = None,
         trade_allowed: bool = True,
+        utc_offset_sec: int = 0,
     ) -> None:
         self._balance = float(balance)
         self._leverage = leverage
@@ -140,6 +142,16 @@ class PaperBroker:
         self._trade_allowed = trade_allowed
         self._connected = False
         self._clock = 0
+        #: The UTC offset this SIMULATED venue stamps its bars with.
+        #:
+        #: Zero is a MEASUREMENT here and not a default, which is the whole
+        #: reason paper may answer at all: the paper venue has no server of
+        #: its own, its bars are stamped by whoever seeded them, and both
+        #: `synthetic.generate_bars` and `run_backtest` stamp in UTC. A test
+        #: that needs a venue three hours ahead sets this, which is how the
+        #: straightedge#172 regression drives the real conversion path
+        #: instead of a mock of it.
+        self.utc_offset_sec = int(utc_offset_sec)
 
     def seed_bars(self, symbol: str, bars: list[Bar]) -> None:
         self._bars[symbol.upper()] = list(bars)
@@ -173,6 +185,24 @@ class PaperBroker:
         half = (spec.spread * spec.point) / 2.0
         t = bar.time if bar else self._clock
         return Tick(time=t, bid=mid - half, ask=mid + half, last=mid)
+
+    def venue_clock(
+        self, name: str, *, max_staleness_sec: float | None = None
+    ) -> VenueClock:
+        """What this simulated venue stamps its bars with.
+
+        DECLARED, not sampled, so the staleness bound is accepted and
+        ignored: there is no server here whose last tick could be old. The
+        bars carry whatever the simulator or `run_backtest` stamped them
+        with, which is this offset by construction. See `utc_offset_sec`.
+        """
+        del name, max_staleness_sec
+        # `measured_at` is left at zero, which the field documents as "answered
+        # from its own construction rather than from a reading". It matters:
+        # `Engine._bar_instant` cross-checks a SAMPLED offset against the
+        # venue's own forming bar, and a declared clock has no sample to check,
+        # so it must not present a bar time as the instant a sample was paired.
+        return VenueClock.declared(self.utc_offset_sec, source="paper")
 
     def rates(self, name: str, timeframe: str | int, count: int) -> list[Bar]:
         del timeframe

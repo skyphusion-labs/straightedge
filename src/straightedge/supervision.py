@@ -48,12 +48,69 @@ cannot be observed has not been satisfied, and reporting it as satisfied is the
 exact failure this module was written about. The remedy is to point the task at
 the interpreter directly so the arguments are in the definition where an auditor
 can read them.
+
+The declaration is not the behaviour
+------------------------------------
+Everything above reads a task DEFINITION. #151 measured what that misses, and
+it is not a corner case: the live desk's definition carried
+`Repetition PT5M` on its `LogonTrigger`, every other field was correct, the
+interval was inside the derived ceiling, and this audit returned ZERO FINDINGS
+AND EXIT 0 while that desk had not restarted in twelve days. A human reading
+the XML saw `PT5M` and concluded the desk was supervised; so did the audit.
+
+So there are now two instruments, and they fail independently:
+
+* STATIC, from the declaration alone. `CLOCK_TRIGGERS`: a repetition hung only
+  on an event trigger repeats inside that event, and a logon is the one event
+  that is not available when the desk dies unattended. This is the shape that
+  actually happened, it needs no export, and it therefore also protects the
+  templates this repo ships.
+* LIVE, from a `<task>.info.json` sidecar that `Export-Tasks.ps1` writes from
+  `Get-ScheduledTaskInfo`. `NextRunTime` is the only reading that separates a
+  configured supervisor from a running one, and it is the one that catches the
+  shapes a declaration cannot settle: a `StartBoundary` in the future, an
+  expired `EndBoundary`, an elapsed `Duration`, a task the live system has
+  disabled behind an XML that says enabled.
+
+No single live field is safe, which is why `_check_liveness` judges a TUPLE.
+`LastTaskResult = 0x800710E0` is the HEALTHY steady state of the desk's task:
+the trigger fires every five minutes, finds the desk alive, and `IgnoreNew`
+refuses the duplicate. Flagging non-zero would report the live desk broken
+every five minutes forever; ignoring the field would miss a task erroring every
+cycle. See `REFUSED_DUPLICATE_LAUNCH`.
+
+That field carries TWO vocabularies and only one of them is about failure. Task
+Scheduler reports its own status through it using the `SCHED_S_*` family, whose
+HRESULT severity bit is CLEAR: a task that has never run reports `0x00041303`,
+not an error. The first version of this check read every non-zero result as a
+failed launch, and `supervision-xml` red on a task that had been installed
+thirty seconds earlier. `_is_error_hresult` judges the severity BIT rather than
+an allow-list of codes to forgive, because an allow-list would encode which
+members of the family this author had happened to see and the next unseen one
+would read as a failure. The one informational code that IS a failure is
+`0x00041307 SCHED_S_TASK_NO_VALID_TRIGGERS`, which is #151's defect reported by
+the scheduler itself.
+
+A dump of a real task with no sidecar is `liveness_unmeasured`, a FAIL, by the
+same rule `task_unreadable` follows. A shipped TEMPLATE is exempt, because it
+is registered with nothing and has no `NextRunTime` to have: the artifact says
+which it is via `TEMPLATE_PLACEHOLDER`, rather than an operator having to
+remember a flag, because a forgotten flag would turn a live audit into a
+declaration audit silently and silent is this module's whole subject.
+
+Times in the sidecar are explicit UTC with the offset resolved ON THE BOX,
+where the box's offset is known. A bare local timestamp relabelled as UTC by
+the reader is straightedge#172's defect with a different clock in it, so
+`_parse_utc` REFUSES a naive timestamp rather than assuming one, and the
+time-based readings abstain when it does.
 """
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from xml.etree import ElementTree
@@ -73,6 +130,69 @@ REQUIRED_INSTANCES_POLICY = "IgnoreNew"
 #: PT72H, which ends a healthy desk three days in, during a session, for no
 #: reason an operator would ever connect to a task setting.
 INDEFINITE_LIMITS = frozenset({"PT0S", "PT0M", "PT0H"})
+
+#: `LastTaskResult` when Task Scheduler refused to start a second instance
+#: because one was already running and `MultipleInstancesPolicy` is `IgnoreNew`.
+#: 0x800710E0 is HRESULT_FROM_WIN32(ERROR_SERVICE_ALREADY_RUNNING).
+#:
+#: THIS IS THE HEALTHY STEADY STATE FOR A SUPERVISION TASK, and it is why
+#: `LastTaskResult` is unusable on its own. The desk's task fires every five
+#: minutes and its whole job is "start the desk if it is not running", so on a
+#: healthy box it finds the desk alive and is refused, every time, forever. An
+#: audit that flagged non-zero here would report the live desk broken every
+#: five minutes while it worked perfectly. A ZERO would mean it had just
+#: launched a fresh instance, which is the exception and not the rule.
+#:
+#: The sibling `mt4-terminal-supervisor` reports 0 for the opposite reason: its
+#: action is a short probe that exits cleanly, so it is never the
+#: already-running case. Same family of task, opposite healthy value. Measured
+#: on the live box 2026-10-09 17:46 UTC, both desk tasks reporting this code
+#: while `NextRunTime` was five minutes out and `Missed=0`.
+#:
+#: So nothing here judges one field. The reading is the TUPLE: live state, last
+#: result, next run time, instances policy.
+REFUSED_DUPLICATE_LAUNCH = 0x800710E0
+
+#: `SCHED_S_TASK_HAS_NOT_RUN`. A task that has never run once reports this, and
+#: it is NOT a failed launch. Measured on a GitHub-hosted `windows-latest`
+#: runner: a task registered thirty seconds earlier reports it, and the first
+#: version of the liveness check called it `last_run_failed` and red the job.
+SCHED_S_TASK_HAS_NOT_RUN = 0x00041303
+
+#: `SCHED_S_TASK_NO_VALID_TRIGGERS`. Task Scheduler's own verdict that the task
+#: cannot fire, which is #151's defect reported by the scheduler itself. Also an
+#: informational code, and the one informational code that is a FAIL.
+SCHED_S_TASK_NO_VALID_TRIGGERS = 0x00041307
+
+
+def _is_error_hresult(result: int) -> bool:
+    """Is this `LastTaskResult` an ERROR, as opposed to a status.
+
+    Task Scheduler reports its own state through the same field it reports
+    failures through, using the `SCHED_S_*` family whose HRESULT severity bit is
+    CLEAR. `0x00041303` (has not run) and `0x00041307` (no valid triggers) are
+    members; `0x800710E0` (duplicate launch refused) and `0x80070002` (file not
+    found) are errors.
+
+    Judged on the severity BIT rather than on a list of codes to forgive. An
+    allow-list would encode which members of the family this author happened to
+    have seen, and the next unseen one would read as a failed launch; the
+    severity bit is the documented property that separates the whole family.
+    """
+    return bool(result & 0x80000000)
+
+
+#: Missed repetition windows tolerated before the audit says so. One is a
+#: reboot or a busy moment. A climbing count is the scheduler failing to start
+#: something it still intends to start, which no declaration can show.
+MISSED_RUNS_WARN_AT = 1
+
+#: `LastRunTime` older than this many declared intervals is reported. Three
+#: windows is late enough that one slow start or a reboot does not trip it, and
+#: early enough to catch "it ran once a fortnight ago" independently of the
+#: declaration. That is exactly the state the live desk was in for twelve days
+#: while its XML read perfectly.
+STALE_LAST_RUN_INTERVALS = 3.0
 
 #: fc34. A scheduled task re-runs its arguments on every restart, so this flag
 #: in a task definition arms real money again on every crash with nobody there.
@@ -139,6 +259,103 @@ class Finding:
         return f"{self.severity} {self.task}: {self.code} -- {self.detail}"
 
 
+#: Trigger types that recur on a CLOCK, so a repetition hung on one is a cadence
+#: that survives having nobody logged in.
+#:
+#: The rule this encodes is measured, not inferred from the schema. Three
+#: readings agree: the broken desk carried its `PT5M` on a `LogonTrigger` alone
+#: and fired zero times in twelve days; the working sibling
+#: `mt4-terminal-supervisor` carried its repetition on a `TimeTrigger` and fired
+#: every two minutes throughout; and the remedy applied on 2026-10-09 was to add
+#: a `TimeTrigger` beside the existing `LogonTrigger`, after which `NextRunTime`
+#: populated five minutes out.
+#:
+#: Deliberately NOT a claim about `StopAtDurationEnd` with an empty `Duration`.
+#: #151's body asserted that as the mechanism and that was an inference about
+#: XML semantics which nothing here measured; the documented schema says an
+#: absent `Duration` repeats indefinitely. What was measured is the trigger
+#: TYPE, so the trigger type is what this judges.
+CLOCK_TRIGGERS = frozenset({"TimeTrigger", "CalendarTrigger"})
+
+#: A task definition carrying this is a TEMPLATE shipped in this repo, not a
+#: dump of a live task. `deploy/windows/*.xml` hold it where an installer
+#: substitutes real values, and `test_the_declaration_still_carries_its_
+#: placeholders` pins that it stays there.
+#:
+#: It is the discriminator for whether the liveness half APPLIES. A template has
+#: no `NextRunTime` because it is not registered with anything, which is not a
+#: defect; a dump with real paths and no liveness sidecar is a measurement that
+#: was not taken, which is. Keying on this rather than on a flag the operator
+#: must remember is deliberate: a forgotten flag would turn a live audit into a
+#: declaration audit silently, and silent is the whole subject of this module.
+TEMPLATE_PLACEHOLDER = "REPLACE_ME"
+
+
+@dataclass(frozen=True)
+class Repetition:
+    """One enabled trigger's repetition, with the trigger TYPE kept.
+
+    The type is the load-bearing part and dropping it is what hid the live
+    defect for twelve days. `PT5M` on a `TimeTrigger` is a cadence; the same
+    `PT5M` on a `LogonTrigger` is a repetition inside an event that has already
+    happened. Both read identically if all you keep is the interval, which is
+    all this module used to keep.
+    """
+
+    #: Local XML tag, e.g. `TimeTrigger` or `LogonTrigger`.
+    trigger: str
+    interval_s: float
+    #: Raw ISO text, `""` when the element is absent. Reported as measured, with
+    #: no reading imposed on it: see `CLOCK_TRIGGERS` on why the mechanism this
+    #: module judges is the trigger type and not this field.
+    duration: str = ""
+    stop_at_duration_end: bool = False
+
+
+@dataclass
+class TaskInfo:
+    """What Task Scheduler says the task will actually DO next.
+
+    `schtasks /query /xml` does not carry any of this; `Get-ScheduledTaskInfo`
+    does, and `deploy/windows/Export-Tasks.ps1` writes it to a
+    `<task>.info.json` sidecar beside the XML it already dumps.
+
+    This whole type exists because of #151: the audit read the declaration and
+    never asked what would happen next. Measured on the merged audit, against
+    the exact shape the live box carried, a `LogonTrigger` holding
+    `Repetition PT5M`: ZERO findings, exit 0, while that desk had not restarted
+    in twelve days.
+    """
+
+    name: str
+    #: A sidecar was found. False means UNMEASURED, which is a failure and never
+    #: a pass, by the same rule `task_unreadable` already follows.
+    present: bool = False
+    #: A sidecar existed and would not parse. Distinct from absent for the same
+    #: reason `TaskView.unreadable` is.
+    unreadable: bool = False
+    parse_error: str = ""
+    #: `Ready`, `Running`, `Disabled`, as Task Scheduler reports it LIVE. A
+    #: different fact from `Settings/Enabled` in the XML, and a task whose
+    #: declaration says enabled while its live state says disabled is precisely
+    #: the declaration-versus-reality gap this module is about.
+    state: str = ""
+    #: Carried from `Get-ScheduledTask` so the benign-refusal reading can be
+    #: made without re-reading the XML half.
+    multiple_instances: str = ""
+    last_task_result: int | None = None
+    number_of_missed_runs: int | None = None
+    #: UTC, ISO 8601, as written by the exporter. Empty means Task Scheduler has
+    #: no next run for this task, which is the whole point of the sidecar.
+    next_run_time_utc: str = ""
+    last_run_time_utc: str = ""
+    #: When the exporter took the measurement, UTC. Staleness is computed
+    #: against THIS and never against the audit host's clock: the audit can run
+    #: on another machine days later, and comparing a box's timestamp to this
+    #: host's clock is #172's mistake with a different clock in it.
+    measured_utc: str = ""
+
+
 @dataclass
 class TaskView:
     """The handful of fields that decide whether a task is supervision.
@@ -162,14 +379,33 @@ class TaskView:
     logon_type: str = ""
     instances_policy: str = ""
     execution_time_limit: str = ""
-    #: Seconds, for each enabled trigger that repeats. Empty means nothing in
-    #: this task ever fires twice.
-    repeat_intervals_s: list[float] = field(default_factory=list)
+    #: One entry per enabled trigger that repeats, carrying the trigger TYPE
+    #: alongside the window. `repeat_intervals_s` is DERIVED from this rather
+    #: than stored beside it: two copies of the same list is how a declaration
+    #: and a reality drift apart, which is the defect this module is about.
+    repetitions: list[Repetition] = field(default_factory=list)
     has_logon_trigger: bool = False
+    #: This dump is a TEMPLATE from this repo, not a live task. See
+    #: `TEMPLATE_PLACEHOLDER`: it decides whether the liveness half applies at
+    #: all, because a template has no NextRunTime and that is not a defect.
+    is_template: bool = False
+    #: What Task Scheduler says it will do next, from the sidecar. `None` means
+    #: no sidecar was read: UNMEASURED, never healthy.
+    info: TaskInfo | None = None
     battery_flags: tuple[bool, bool] = (False, False)
     #: Why the dump would not parse, quoted into the report. A reader needs the
     #: parser's own words to tell a truncated file from a wrong one.
     parse_error: str = ""
+
+    @property
+    def repeat_intervals_s(self) -> list[float]:
+        """Seconds per repeating enabled trigger. Derived, never stored.
+
+        Kept as a property so the trigger TYPE cannot be dropped on the way in
+        while this list still reads full, which is what made a `LogonTrigger`
+        carrying `PT5M` indistinguishable from a working cadence.
+        """
+        return [rep.interval_s for rep in self.repetitions]
 
 
 _DURATION_RE = re.compile(
@@ -251,7 +487,9 @@ def parse_task_xml(name: str, xml_text: str) -> TaskView:
         root = ElementTree.fromstring(xml_text.lstrip("﻿"))
     except ElementTree.ParseError as exc:
         return TaskView(name=name, present=False, unreadable=True, parse_error=str(exc))
-    view = TaskView(name=name, present=True)
+    view = TaskView(
+        name=name, present=True, is_template=TEMPLATE_PLACEHOLDER in xml_text
+    )
     settings = _find(root, "Settings")
     if settings is not None:
         view.enabled = _bool_text(settings, "Enabled")
@@ -285,8 +523,89 @@ def parse_task_xml(name: str, xml_text: str) -> TaskView:
                 continue
             interval = parse_duration_seconds(_text(repetition, "Interval"))
             if interval is not None and interval > 0:
-                view.repeat_intervals_s.append(interval)
+                view.repetitions.append(
+                    Repetition(
+                        trigger=kind,
+                        interval_s=interval,
+                        duration=_text(repetition, "Duration"),
+                        stop_at_duration_end=bool(
+                            _bool_text(repetition, "StopAtDurationEnd")
+                        ),
+                    )
+                )
     return view
+
+
+def _opt_int(raw: Any) -> int | None:
+    """An integer, or None when the exporter wrote null or nonsense.
+
+    None and 0 must not collapse: `LastTaskResult` 0 means the last launch
+    succeeded, and None means this audit does not know what it was.
+    """
+    if raw is None or isinstance(raw, bool):
+        return None
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def _opt_text(raw: Any) -> str:
+    return "" if raw is None else str(raw).strip()
+
+
+def parse_task_info(name: str, json_text: str) -> TaskInfo:
+    """One `<task>.info.json` sidecar into a `TaskInfo`.
+
+    A sidecar that will not parse is `unreadable`, never absent and never
+    healthy, for the same reason `parse_task_xml` reports a bad dump that way:
+    an audit that cannot read its own instrument has not taken a measurement.
+    """
+    try:
+        raw = json.loads(json_text)
+    except json.JSONDecodeError as exc:
+        return TaskInfo(name=name, present=False, unreadable=True, parse_error=str(exc))
+    if not isinstance(raw, dict):
+        return TaskInfo(
+            name=name,
+            present=False,
+            unreadable=True,
+            parse_error=f"expected a JSON object, got {type(raw).__name__}",
+        )
+    return TaskInfo(
+        name=name,
+        present=True,
+        state=_opt_text(raw.get("state")),
+        multiple_instances=_opt_text(raw.get("multiple_instances")),
+        last_task_result=_opt_int(raw.get("last_task_result")),
+        number_of_missed_runs=_opt_int(raw.get("number_of_missed_runs")),
+        next_run_time_utc=_opt_text(raw.get("next_run_time_utc")),
+        last_run_time_utc=_opt_text(raw.get("last_run_time_utc")),
+        measured_utc=_opt_text(raw.get("measured_utc")),
+    )
+
+
+def _parse_utc(text: str) -> datetime | None:
+    """An ISO 8601 instant the exporter wrote, as an aware UTC datetime.
+
+    Returns None rather than guessing. A value with no offset is REFUSED rather
+    than assumed to be UTC: relabelling a local timestamp as UTC is #172's
+    defect, and the exporter is the thing that knows the box's offset, so it
+    writes the offset in. An audit that filled it in here would be inventing a
+    measurement.
+    """
+    raw = (text or "").strip()
+    if not raw:
+        return None
+    if raw.endswith(("z", "Z")):
+        raw = raw[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return parsed.astimezone(timezone.utc)
 
 
 def _check_trigger(
@@ -309,6 +628,33 @@ def _check_trigger(
                     "logs in, which is the one event that is not available "
                     "when the desk dies unattended. This task "
                     f"{spec.purpose}."
+                ),
+            )
+        )
+        return out
+    if not any(rep.trigger in CLOCK_TRIGGERS for rep in view.repetitions):
+        # The #151 defect, caught in the DECLARATION. This is the half that
+        # needs no sidecar, so it protects the shipped template too, and it is
+        # why the audit no longer depends on a liveness export to see the one
+        # shape that actually happened.
+        out.append(
+            Finding(
+                task=view.name,
+                severity=FAIL,
+                code="repetition_not_on_a_clock",
+                detail=(
+                    f"declares a repetition ({_describe_repetitions(view)}) and "
+                    "not one of those triggers recurs on a clock "
+                    f"({', '.join(sorted(CLOCK_TRIGGERS))}). A repetition hung "
+                    "only on an event trigger repeats INSIDE that event, and a "
+                    "logon is the one event that is not available when the desk "
+                    "dies unattended, so a human reads PT5M and the task never "
+                    "fires. Measured: this exact shape ran zero times in twelve "
+                    "days while every other field was correct, the working "
+                    "sibling mt4-terminal-supervisor carries its repetition on "
+                    "a TimeTrigger, and adding a TimeTrigger beside the "
+                    "LogonTrigger is what populated NextRunTime. This task "
+                    f"{spec.purpose}"
                 ),
             )
         )
@@ -541,6 +887,274 @@ def _check_settings(spec: TaskSpec, view: TaskView) -> list[Finding]:
     return out
 
 
+def _describe_repetitions(view: TaskView) -> str:
+    """Every repetition as measured, with no reading imposed on it."""
+    parts = []
+    for rep in view.repetitions:
+        window = rep.duration.strip() or "(no Duration)"
+        parts.append(
+            f"{rep.trigger} every {rep.interval_s:.0f}s, Duration {window}, "
+            f"StopAtDurationEnd {str(rep.stop_at_duration_end).lower()}"
+        )
+    return "; ".join(parts) or "(none)"
+
+
+def _check_liveness(spec: TaskSpec, view: TaskView) -> list[Finding]:
+    """What Task Scheduler intends to DO, as opposed to what the XML declares.
+
+    `repetition_not_on_a_clock` already catches the one shape that happened,
+    from the declaration alone. This half is for the shapes a declaration
+    CANNOT settle: a `StartBoundary` in the future, an expired `EndBoundary`, an
+    elapsed `Duration`, a task the live system has disabled behind an XML that
+    says enabled, a launch that errors every cycle. `NextRunTime` is empty in
+    the first three and the XML is perfect in all five.
+
+    Skipped entirely for a template, which has no NextRunTime because it is
+    registered with nothing. That is not an unmeasured invariant; it is a
+    different question, and `TEMPLATE_PLACEHOLDER` is how the artifact says
+    which question it is answering.
+    """
+    if view.is_template:
+        return []
+    out: list[Finding] = []
+    info = view.info
+    if info is not None and info.unreadable:
+        return [
+            Finding(
+                task=view.name,
+                severity=FAIL,
+                code="liveness_unreadable",
+                detail=(
+                    "a liveness sidecar for this task was written and will not "
+                    f"parse ({info.parse_error}). The declaration was read; "
+                    "what Task Scheduler will DO next was NOT measured, so it "
+                    "is reported as a failure rather than as either answer. "
+                    "Re-dump with deploy/windows/Export-Tasks.ps1"
+                ),
+            )
+        ]
+    if info is None or not info.present:
+        return [
+            Finding(
+                task=view.name,
+                severity=FAIL,
+                code="liveness_unmeasured",
+                detail=(
+                    "this is a dump of a real task and there is no "
+                    f"{view.name}.info.json beside it, so the audit read the "
+                    "DECLARATION and never asked Task Scheduler what the task "
+                    "will do next. An unmeasured invariant has not been met "
+                    "(#151). Re-dump with a current "
+                    "deploy/windows/Export-Tasks.ps1, which writes the sidecar "
+                    "beside each XML. If you meant to audit the shipped "
+                    f"templates, they carry {TEMPLATE_PLACEHOLDER} and this "
+                    "check stands aside for them"
+                ),
+            )
+        ]
+    disabled_live = info.state.strip().lower() == "disabled"
+    if disabled_live:
+        out.append(
+            Finding(
+                task=view.name,
+                severity=FAIL,
+                code="live_state_disabled",
+                detail=(
+                    "Task Scheduler reports State=Disabled. That is a different "
+                    "fact from Settings/Enabled in the XML, and when the two "
+                    "disagree the live state is the one that decides whether "
+                    f"anything fires. This task {spec.purpose}"
+                ),
+            )
+        )
+    # Conditional on a repetition being DECLARED, which settles #151's open
+    # question: a task whose only trigger fires once at logon declares no
+    # repetition and is never judged here, and a task with no repetition at all
+    # is already `no_repeating_trigger`. Skipped when the task is disabled by
+    # either reading, because then the empty NextRunTime is explained and
+    # naming one cause twice makes a report harder to act on.
+    if (
+        view.repetitions
+        and not info.next_run_time_utc
+        and not disabled_live
+        and view.enabled is not False
+    ):
+        slowest = max(view.repeat_intervals_s)
+        out.append(
+            Finding(
+                task=view.name,
+                severity=FAIL,
+                code="repetition_never_fires",
+                detail=(
+                    f"declares a repetition ({_describe_repetitions(view)}) and "
+                    "Task Scheduler reports NO NextRunTime, so it does not "
+                    "intend to start this task again. The repetition is real "
+                    "and it is not a cadence. A declaration cannot settle this: "
+                    f"{slowest:.0f}s is declared, the trigger window is what "
+                    "decides, and only the scheduler knows whether it is open. "
+                    f"This task {spec.purpose}"
+                ),
+            )
+        )
+    measured_at = _parse_utc(info.measured_utc)
+    next_run = _parse_utc(info.next_run_time_utc)
+    if measured_at is not None and next_run is not None and next_run < measured_at:
+        out.append(
+            Finding(
+                task=view.name,
+                severity=WARN,
+                code="next_run_in_the_past",
+                detail=(
+                    f"NextRunTime {info.next_run_time_utc} is BEFORE the moment "
+                    f"the export measured it ({info.measured_utc}), so the "
+                    "scheduler is not advancing the window. Populated but stale "
+                    "is a third state, distinct from empty and from healthy"
+                ),
+            )
+        )
+    result = info.last_task_result
+    if result is not None and result != 0:
+        if not _is_error_hresult(result):
+            # An INFORMATIONAL result, not an error. Task Scheduler reports its
+            # own status through this field using the SCHED_S_* family, whose
+            # HRESULT severity bit is CLEAR, and those are not failed launches.
+            #
+            # Measured, and it is why this branch exists: a freshly registered
+            # task reports 0x00041303 SCHED_S_TASK_HAS_NOT_RUN, and the first
+            # version of this check called that `last_run_failed`. It red the
+            # supervision-xml job on a task that had been installed thirty
+            # seconds earlier and had nothing wrong with it, which is exactly
+            # the "a gate that reds on a healthy box is a gate that gets
+            # ignored" failure `interval_unjudged` exists to avoid.
+            #
+            # Judged on the SEVERITY BIT rather than on a list of codes to
+            # forgive. An allow-list would be a guess about which members of a
+            # family I had happened to see; the severity bit is the documented
+            # property that distinguishes the whole family.
+            if result == SCHED_S_TASK_NO_VALID_TRIGGERS:
+                out.append(
+                    Finding(
+                        task=view.name,
+                        severity=FAIL,
+                        code="no_valid_triggers",
+                        detail=(
+                            "LastTaskResult is 0x00041307 "
+                            "SCHED_S_TASK_NO_VALID_TRIGGERS, which is Task "
+                            "Scheduler's OWN verdict that this task cannot "
+                            "fire. It is an informational code, not an error "
+                            "code, and it is the strongest evidence this audit "
+                            f"can get. This task {spec.purpose}"
+                        ),
+                    )
+                )
+            elif result == SCHED_S_TASK_HAS_NOT_RUN:
+                out.append(
+                    Finding(
+                        task=view.name,
+                        severity=WARN,
+                        code="never_run",
+                        detail=(
+                            "LastTaskResult is 0x00041303 "
+                            "SCHED_S_TASK_HAS_NOT_RUN: this task has never run "
+                            "once. Expected on a box where supervision was just "
+                            "installed, and the finding itself on a box where it "
+                            "was not. `last_run_stale` cannot see this state "
+                            "because there is no LastRunTime to be stale, so it "
+                            "is reported here rather than being silent"
+                        ),
+                    )
+                )
+            else:
+                out.append(
+                    Finding(
+                        task=view.name,
+                        severity=WARN,
+                        code="informational_result",
+                        detail=(
+                            f"LastTaskResult is {result} "
+                            f"(0x{result & 0xFFFFFFFF:08X}), an informational "
+                            "SCHED_S_* status rather than an error. Named rather "
+                            "than passed over in silence: this audit has no "
+                            "reading for this particular code, and an "
+                            "unrecognised status is a thing to look up, not a "
+                            "thing to drop"
+                        ),
+                    )
+                )
+        elif result == REFUSED_DUPLICATE_LAUNCH:
+            # The healthy steady state for a supervision task, so this is a
+            # finding ONLY in the combination that contradicts it: a refused
+            # duplicate launch means an instance WAS running, and if nothing is
+            # running now then what it declined to replace has since died.
+            if info.state.strip().lower() != "running":
+                out.append(
+                    Finding(
+                        task=view.name,
+                        severity=WARN,
+                        code="refused_launch_while_nothing_runs",
+                        detail=(
+                            "LastTaskResult is 0x800710E0, the benign refusal "
+                            "of a duplicate launch, which means an instance was "
+                            f"already running. But State is {info.state!r}, not "
+                            "'Running'. On a healthy supervision task those two "
+                            "go together; apart, they say the instance it "
+                            "declined to replace has since exited. Can also be "
+                            "a momentary race between the refusal and the export"
+                        ),
+                    )
+                )
+        else:
+            out.append(
+                Finding(
+                    task=view.name,
+                    severity=FAIL,
+                    code="last_run_failed",
+                    detail=(
+                        f"LastTaskResult is {result} "
+                        f"(0x{result & 0xFFFFFFFF:08X}), an ERROR-severity "
+                        "HRESULT and not the benign already-running refusal "
+                        "0x800710E0, so the last launch of this task errored. A "
+                        "declaration cannot show this: the task fires, fails, "
+                        "and the XML stays perfect"
+                    ),
+                )
+            )
+    missed = info.number_of_missed_runs
+    if missed is not None and missed > MISSED_RUNS_WARN_AT:
+        out.append(
+            Finding(
+                task=view.name,
+                severity=WARN,
+                code="missed_runs",
+                detail=(
+                    f"NumberOfMissedRuns is {missed}. A populated NextRunTime "
+                    "with a climbing missed count is a third state again: the "
+                    "scheduler intends to fire and is not managing to"
+                ),
+            )
+        )
+    last_run = _parse_utc(info.last_run_time_utc)
+    if view.repetitions and measured_at is not None and last_run is not None:
+        slowest = max(view.repeat_intervals_s)
+        age_s = (measured_at - last_run).total_seconds()
+        if age_s > slowest * STALE_LAST_RUN_INTERVALS:
+            out.append(
+                Finding(
+                    task=view.name,
+                    severity=WARN,
+                    code="last_run_stale",
+                    detail=(
+                        f"LastRunTime is {age_s / 3600:.1f}h before the export, "
+                        f"against a declared repetition of {slowest:.0f}s. "
+                        "Whatever the declaration says the cadence is, this task "
+                        "has not been running at it. The live desk sat in this "
+                        "state for twelve days"
+                    ),
+                )
+            )
+    return out
+
+
 def audit_task(
     spec: TaskSpec,
     view: TaskView,
@@ -581,6 +1195,7 @@ def audit_task(
         _check_trigger(spec, view, max_interval_s, measurable=measurable)
         + _check_action(spec, view)
         + _check_settings(spec, view)
+        + _check_liveness(spec, view)
     )
 
 
@@ -624,6 +1239,21 @@ def read_dump(path: Path) -> str:
     return raw.decode("utf-8-sig", errors="replace")
 
 
+def _load_info(directory: Path, name: str) -> TaskInfo | None:
+    """The `<name>.info.json` sidecar beside a dump, or None if absent.
+
+    None rather than an empty `TaskInfo` on purpose: absent and
+    present-but-empty are different measurements, and `_check_liveness`
+    reports the first as UNMEASURED. Audited through the same `read_dump`
+    as the XML because PowerShell writes both and the BOM question is the
+    same one.
+    """
+    candidate = directory / f"{name}.info.json"
+    if not candidate.is_file():
+        return None
+    return parse_task_info(name, read_dump(candidate))
+
+
 def load_views(source: str | Path, *, specs: tuple[TaskSpec, ...] = DECLARED_TASKS) -> dict[str, TaskView]:
     """Read one `<name>.xml` per declared task from a directory, or one file.
 
@@ -638,12 +1268,41 @@ def load_views(source: str | Path, *, specs: tuple[TaskSpec, ...] = DECLARED_TAS
             candidate = path / f"{spec.name}.xml"
             if not candidate.is_file():
                 continue
-            views[spec.name] = parse_task_xml(spec.name, read_dump(candidate))
+            view = parse_task_xml(spec.name, read_dump(candidate))
+            view.info = _load_info(path, spec.name)
+            views[spec.name] = view
         return views
     text = read_dump(path)
     name = path.stem
-    views[name] = parse_task_xml(name, text)
+    view = parse_task_xml(name, text)
+    view.info = _load_info(path.parent, name)
+    views[name] = view
     return views
+
+
+def liveness_note(views: dict[str, TaskView]) -> str:
+    """One line on whether what-happens-next was measured, and for what.
+
+    Stated in the header rather than left to the ABSENCE of a finding, because
+    "no liveness finding" has two causes: these are templates and the question
+    does not apply, or the box was measured and is fine. A reader cannot tell
+    those apart from silence, and an instrument that is silent about not having
+    measured is the subject of this entire module.
+    """
+    live = [v for v in views.values() if v.present and not v.is_template]
+    if not live:
+        return (
+            "liveness: NOT APPLICABLE, every definition read is a shipped "
+            f"template carrying {TEMPLATE_PLACEHOLDER}, so Task Scheduler holds "
+            "no NextRunTime for any of them. This run judges the DECLARATION "
+            "only; point --tasks at Export-Tasks.ps1 output to judge a box"
+        )
+    measured = [v for v in live if v.info is not None and v.info.present]
+    return (
+        f"liveness: measured for {len(measured)} of {len(live)} live task(s) "
+        "from Get-ScheduledTaskInfo sidecars. NextRunTime is the one reading "
+        "that separates a configured supervisor from a running one (#151)"
+    )
 
 
 def report(
@@ -652,6 +1311,7 @@ def report(
     max_interval_s: float,
     measurable: bool = True,
     specs: tuple[TaskSpec, ...] = DECLARED_TASKS,
+    liveness: str = "",
 ) -> str:
     """The whole operator-facing output, failures first."""
     ceiling = (
@@ -667,6 +1327,8 @@ def report(
         "supervision audit: the scheduled tasks that keep the desk alive",
         ceiling,
     ]
+    if liveness:
+        lines.append(liveness)
     fails = [f for f in findings if f.severity == FAIL]
     warns = [f for f in findings if f.severity == WARN]
     for finding in fails + warns:
