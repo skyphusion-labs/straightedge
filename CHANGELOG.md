@@ -4,7 +4,7 @@ NOTE: Operator docs from 1.0.0 use 8th-grade Simplified Technical English.
 Do not treat older changelog wording as the operator contract.
 See README.md and docs/CONTRACT.md.
 
-## 1.7.1
+## 1.7.2
 
 ### The day that ended while the desk was down is no longer silent (issue #129)
 
