@@ -1837,9 +1837,26 @@ class Engine:
         # after it: the operator gets the same named refusal `/close` gives, and
         # the desk is not asked to survive an exception class it never
         # classified. Placed here, immediately before the arithmetic, rather
-        # than at the top of the function, so that no currently reachable
-        # refusal changes precedence; the only behaviour that moves is the
-        # non-finite case, which had none worth keeping.
+        # than at the top of the function, so the position lookup and the
+        # circuit check above keep their precedence.
+        #
+        # WHAT THIS CHANGES AND WHAT IT DOES NOT (#222, correcting the comment
+        # that shipped with #210). The version that shipped claimed no
+        # reachable refusal changed, and that overclaims. The true and narrower
+        # statement: no refusal changes its OUTCOME, since nothing is sent in
+        # either version for any value, but TWO reachable values change their
+        # reason WORD, from a magnitude message to the named one:
+        #
+        #   /tp T PX 0      volume below min lot  ->  refused: volume_unusable:0.0
+        #   /tp T PX -0.5   volume below min lot  ->  refused: volume_unusable:-0.5
+        #
+        # The controls are part of the claim, because the next reader's first
+        # question is whether it is confined to those two: `0.001` still replies
+        # `volume below min lot`, `5` still `volume exceeds position`, `0.05`
+        # still succeeds, and `docs/CONTRACT.md` documents the new word on the
+        # `/tp` row. The non-finite cases are the only ones with no prior reply
+        # worth keeping, `nan` having leaked the interpreter's own words and
+        # `inf` having escaped the handler entirely.
         bad = unusable_volume(volume)
         if bad is not None:
             return f"refused: {bad}"
