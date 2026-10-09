@@ -48,6 +48,7 @@ from straightedge.broker.mt4_live import (
     PHASE_READ,
     PHASE_SHIM_MAILBOX,
     PHASE_SHIM_UNAVAILABLE,
+    WITHDRAWAL_WORDS,
     TRANSPORT_NET,
     BridgeTimeout,
     FileBridge,
@@ -280,7 +281,13 @@ class HttpBridge:
         return data
 
     def _from_status(self, exc: urllib.error.HTTPError, op: str = "") -> Exception:
-        detail = _short(exc)
+        # ONE read. `exc.read()` drains the stream, so the detail text and the
+        # withdrawal word have to come out of the same pass; reading twice would
+        # hand the second caller an empty body and a missing key reads as the
+        # unsafe `claimed`, which would look like a working fallback instead of
+        # a bug.
+        body = _read_body(exc)
+        detail = _clip(body) or _reason(exc)
         if exc.code in RETRYABLE_STATUSES:
             # The shim answered, and what it said is "the Expert has not replied
             # yet" or "the mailbox is not writable yet". Both are the cold-boot
@@ -301,21 +308,55 @@ class HttpBridge:
                 transport=TRANSPORT_NET,
                 phase=phase,
                 # A 504 IS the shim reporting a mailbox timeout, and the
-                # shim's own FileBridge has already withdrawn the request
-                # on that path. It does not say WHICH outcome it got,
-                # though, so this end must not claim the safe one.
-                withdrawal="claimed",
+                # shim's own FileBridge has already withdrawn the request on
+                # that path. As of #135 it SAYS which outcome it got, so this
+                # end reads the measurement instead of assuming the worst.
+                #
+                # Only on 504. On a 503 the mailbox was never usable and
+                # nothing was written, so there is no withdrawal to report and
+                # reporting one would invent a measurement.
+                withdrawal=(
+                    _withdrawal(body)
+                    if exc.code == STATUS_MAILBOX_TIMEOUT
+                    else "claimed"
+                ),
             )
         return RuntimeError(f"mt4 net bridge: HTTP {exc.code} from {self.url} ({detail})")
 
 
-def _short(exc: urllib.error.HTTPError) -> str:
-    """The shim's own one-line reason, clipped. Never the request body."""
+def _read_body(exc: urllib.error.HTTPError) -> str:
+    """The shim's refusal body, once. Never the request body."""
     try:
-        text = exc.read().decode("ascii", "replace")
+        return exc.read().decode("ascii", "replace")
     except (OSError, ValueError):  # pragma: no cover - body already consumed
-        return exc.reason if isinstance(exc.reason, str) else "no reason given"
-    return " ".join(text.split())[:200] or "no reason given"
+        return ""
+
+
+def _clip(text: str) -> str:
+    """One line, bounded. The shim is trusted to be terse, not assumed to be."""
+    return " ".join(text.split())[:200]
+
+
+def _reason(exc: urllib.error.HTTPError) -> str:
+    return exc.reason if isinstance(exc.reason, str) else "no reason given"
+
+
+def _withdrawal(body: str) -> str:
+    """What the far end did with the request, as the far end reports it (#135).
+
+    The shim's `FileBridge` measured this: the `.req` file either came back off
+    the shared name or it did not. Before #135 the fact reached the shim's local
+    log and stopped there, so every provably-withdrawn send off-box was read as
+    ambiguous money and reconciled by hand.
+
+    ABSENT OR UNRECOGNISED FALLS BACK TO `claimed`, ALWAYS, and that direction
+    is the whole safety property. An old shim sends no key; a confused one sends
+    a word this desk does not know. Neither is a measurement, and `claimed` is
+    what "I do not know" has to render as, because `withdrawn` is the only word
+    that lets the desk stop worrying about an order it cannot see.
+    """
+    word = str(decode(body).get("withdrawal", "") or "")
+    return word if word in WITHDRAWAL_WORDS else "claimed"
 
 
 # ---------------------------------------------------------------------------
@@ -429,7 +470,15 @@ class _ShimHandler(http.server.BaseHTTPRequestHandler):
         try:
             reply = self._shim.bridge.exchange(body, req_id)
         except BridgeTimeout as exc:
-            self._refuse(STATUS_MAILBOX_TIMEOUT, "mailbox_timeout", detail=str(exc))
+            # The withdrawal travels on the WIRE, not only into our own log: the
+            # desk is the end that has to decide whether an order can still
+            # fire, and this process is the only one that knows (#135).
+            self._refuse(
+                STATUS_MAILBOX_TIMEOUT,
+                "mailbox_timeout",
+                detail=str(exc),
+                withdrawal=exc.withdrawal,
+            )
             return
         except OSError as exc:
             self._refuse(
@@ -453,13 +502,27 @@ class _ShimHandler(http.server.BaseHTTPRequestHandler):
             f"mt4-shim: id={req_id} 200 in {(time.monotonic() - started) * 1000:.0f}ms"
         )
 
-    def _refuse(self, status: int, reason: str, *, detail: str = "") -> None:
+    def _refuse(
+        self, status: int, reason: str, *, detail: str = "", withdrawal: str = ""
+    ) -> None:
         """A refusal in the mailbox's own vocabulary, so the desk can read it.
 
         `ok=0` plus a named `error` is what every Expert refusal looks like, so a
         shim refusal needs no second format to parse.
+
+        `withdrawal` is ONE MORE LINE in that same `key=value` body, never a
+        second format (#135). An old desk clips the extra key out of the message
+        text and ignores it, and a new desk against an old shim sees no key and
+        falls back to `claimed`, so the two halves deploy in either order. That
+        matters because the shim runs on the customer's host.
+
+        A word outside `WITHDRAWAL_WORDS` is not written at all, so this end
+        cannot teach the desk a vocabulary the desk does not have.
         """
-        body = f"ok=0\nerror={reason}\n".encode("ascii")
+        lines = [f"ok=0\nerror={reason}\n"]
+        if withdrawal in WITHDRAWAL_WORDS:
+            lines.append(f"withdrawal={withdrawal}\n")
+        body = "".join(lines).encode("ascii")
         self.send_response(status)
         self.send_header("Content-Type", WIRE_CONTENT_TYPE)
         self.send_header("Content-Length", str(len(body)))

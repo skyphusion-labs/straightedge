@@ -39,10 +39,12 @@ printed on every one of them.
 from __future__ import annotations
 
 import argparse
+import io
 import socket
 import socketserver
 import threading
 import time
+import urllib.error
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator, cast
@@ -53,14 +55,19 @@ from mt4_transcripts import GOLDEN, TranscriptExpert, ea_ok, t_ping
 from straightedge.broker import broker_for
 from straightedge.broker import mt4_net
 from straightedge.broker.mt4_live import (
+    PHASE_SHIM_MAILBOX,
+    PHASE_SHIM_UNAVAILABLE,
     REQ_NAME,
     BridgeTimeout,
     FileBridge,
     Mt4Broker,
+    decode,
     encode,
 )
 from straightedge.broker.mt4_net import (
     CALL_PATH,
+    STATUS_MAILBOX_TIMEOUT,
+    STATUS_MAILBOX_UNAVAILABLE,
     MAX_REPLY_BYTES,
     MAX_REQUEST_BYTES,
     MIN_TOKEN_CHARS,
@@ -1087,3 +1094,160 @@ class TestTheShimCommand:
         rc = cli.main(["--config", str(path), "mt4-shim", "--port", "0"])
         assert rc == 0
         assert len(served) == 1, f"servers served: {len(served)}"
+
+
+class TestTheShimReportsWhatItWithdrew:
+    """The shim measures the file leg's withdrawal; the desk must learn it (#135).
+
+    On a mailbox timeout behind the shim, the shim's own `FileBridge._withdraw`
+    returns `withdrawn`, `claimed` or `locked`, and that is a MEASUREMENT: the
+    `.req` file either came back off the shared name or it did not. Before this,
+    `_refuse` put it in the shim's local log only and sent the desk
+    `ok=0 error=mailbox_timeout`, so `HttpBridge._from_status` hardcoded the
+    pessimistic `claimed`.
+
+    `withdrawal` is read on the SEND path. `withdrawn` means the request is
+    provably gone and the order cannot fire; `claimed` is the ambiguous-money
+    case that writes `journal.inflight.json` and refuses to transmit that order
+    again. So every provably-withdrawn send off-box became an operator
+    reconciliation by hand, for an outcome the shim had one process away.
+    """
+
+    def test_the_shim_measures_a_withdrawal_the_desk_cannot_see(
+        self, tmp_path: Path
+    ) -> None:
+        """The gap itself, measured on BOTH sides of the wire at once.
+
+        This is the reproduction for #135 and it is written so it can only pass
+        when the fact actually crosses: it asserts the shim ACHIEVED `withdrawn`
+        from the shim's own log before it asserts what the desk received. If the
+        shim ever stopped withdrawing, the first assertion fails and this test
+        reports that instead of silently passing on a changed premise.
+        """
+        log: list[str] = []
+        with shim(tmp_path, log=log) as (url, _):
+            with pytest.raises(BridgeTimeout) as caught:
+                net_broker(url).connect()
+
+        # The shim's side: it took the request back off the shared name. No
+        # Expert ever ran, so `unlink` succeeded and `_withdraw` said so.
+        shim_lines = [line for line in log if "mailbox_timeout" in line]
+        print(f"shim refusal lines: {len(shim_lines)} {shim_lines}")
+        assert shim_lines, f"the shim logged no mailbox_timeout refusal: {log}"
+        assert any("request=withdrawn" in line for line in shim_lines), (
+            "the shim did not withdraw the request, so this test's premise is "
+            f"gone and #135 is about a fact that no longer exists: {shim_lines}"
+        )
+
+        # The desk's side: the same event, as the desk is entitled to read it.
+        print(f"desk withdrawal={caught.value.withdrawal!r}")
+        assert caught.value.withdrawal == "withdrawn", (
+            "the shim proved the request is gone and the desk still reads it as "
+            f"{caught.value.withdrawal!r}, so a provably-withdrawn send is "
+            "treated as ambiguous money"
+        )
+        # The partition must not move: a 504 is still a retryable BridgeTimeout.
+        assert "504" in str(caught.value)
+        assert caught.value.phase == PHASE_SHIM_MAILBOX
+
+    def test_an_absent_withdrawal_key_falls_back_to_claimed(self) -> None:
+        """Absent must never read as `withdrawn` (#135).
+
+        An OLD shim against a NEW desk sends no `withdrawal=` key. The fallback
+        is `claimed`, always, so a dropped key fails toward the unsafe reading.
+        A bug that loses the key must cost an operator a reconciliation, never a
+        clean bill of health on money that may have moved.
+        """
+        body = b"ok=0\nerror=mailbox_timeout\n"
+        exc = urllib.error.HTTPError(
+            "http://shim.invalid/x",
+            STATUS_MAILBOX_TIMEOUT,
+            "Gateway Timeout",
+            {},  # type: ignore[arg-type]
+            io.BytesIO(body),
+        )
+        bridge = HttpBridge("http://shim.invalid/x", GOOD_TOKEN, timeout_sec=1.0)
+        built = bridge._from_status(exc, "market")
+        assert isinstance(built, BridgeTimeout)
+        print(f"absent key -> withdrawal={built.withdrawal!r}")
+        assert built.withdrawal == "claimed"
+
+    def test_an_unknown_withdrawal_word_falls_back_to_claimed(self) -> None:
+        """A word this desk does not know is not a measurement (#135).
+
+        The vocabulary is closed: `withdrawn`, `claimed`, `locked`. A shim that
+        sends anything else is a peer this desk cannot interpret, and guessing
+        would be inventing a measurement. Same fallback, same direction.
+        """
+        body = b"ok=0\nerror=mailbox_timeout\nwithdrawal=probably_fine\n"
+        exc = urllib.error.HTTPError(
+            "http://shim.invalid/x",
+            STATUS_MAILBOX_TIMEOUT,
+            "Gateway Timeout",
+            {},  # type: ignore[arg-type]
+            io.BytesIO(body),
+        )
+        bridge = HttpBridge("http://shim.invalid/x", GOOD_TOKEN, timeout_sec=1.0)
+        built = bridge._from_status(exc, "market")
+        assert isinstance(built, BridgeTimeout)
+        print(f"unknown word -> withdrawal={built.withdrawal!r}")
+        assert built.withdrawal == "claimed"
+
+    def test_a_503_reports_no_withdrawal_because_there_was_none(
+        self, tmp_path: Path
+    ) -> None:
+        """#135 must NOT widen to 503, and this pins that it did not.
+
+        On a 503 the mailbox was never usable and nothing was written, so there
+        is no withdrawal to report. Reporting one would invent a measurement.
+        The desk keeps `claimed` here, and the phase stays the unavailable one.
+
+        THE BODY CARRIES `withdrawal=withdrawn` ON PURPOSE, and the first
+        version of this test did not. Without it the case could not fail:
+        a 503 body with no key falls back to `claimed` anyway, so "the desk
+        ignores the key on a 503" and "the desk reads the key on every status"
+        produce the same answer and the control is decoration. Measured: with
+        the key absent, deleting the 504 condition in `_from_status` left the
+        whole suite green. A correct shim never sends this, because `_refuse`
+        is only given a withdrawal on the timeout path; the point is that a
+        future or confused one cannot teach this desk a fact that did not
+        happen.
+        """
+        body = b"ok=0\nerror=mailbox_unavailable\nwithdrawal=withdrawn\n"
+        exc = urllib.error.HTTPError(
+            "http://shim.invalid/x",
+            STATUS_MAILBOX_UNAVAILABLE,
+            "Service Unavailable",
+            {},  # type: ignore[arg-type]
+            io.BytesIO(body),
+        )
+        bridge = HttpBridge("http://shim.invalid/x", GOOD_TOKEN, timeout_sec=1.0)
+        built = bridge._from_status(exc, "market")
+        assert isinstance(built, BridgeTimeout)
+        print(f"503 -> withdrawal={built.withdrawal!r} phase={built.phase!r}")
+        assert built.withdrawal == "claimed"
+        assert built.phase == PHASE_SHIM_UNAVAILABLE
+
+    def test_the_shim_still_sends_one_key_value_body_and_no_second_format(
+        self, tmp_path: Path
+    ) -> None:
+        """One more line, not JSON (#135).
+
+        `docs/MT4.md` specifies the `key=value` body and `decode` parses it. The
+        refusal body must stay in that vocabulary, so an OLD desk against a NEW
+        shim text-clips the extra key through `_short` and ignores it rather
+        than failing to parse. Measured on the raw bytes, hand-built request, so
+        the shim's own writing is what is under test.
+        """
+        with shim(tmp_path) as (_url, where):
+            status, text = raw(
+                where,
+                request_text("POST", CALL_PATH, token=GOOD_TOKEN, body=encode("tick", {"symbol": "EURUSD"}, 4242)),
+            )
+        print(f"shim refusal body status={status} body={text!r}")
+        assert status == STATUS_MAILBOX_TIMEOUT
+        assert not text.lstrip().startswith("{"), "the shim answered JSON"
+        parsed = decode(text)
+        assert parsed.get("ok") in {0, "0"}
+        assert parsed.get("error") == "mailbox_timeout"
+        assert parsed.get("withdrawal") == "withdrawn"

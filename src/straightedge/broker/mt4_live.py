@@ -124,6 +124,13 @@ PHASE_SHIM_MAILBOX = "shim-mailbox"
 #: MT4 may not have created Common Files yet.
 PHASE_SHIM_UNAVAILABLE = "shim-unavailable"
 
+#: The closed vocabulary of `BridgeTimeout.withdrawal`. ONE declaration, because
+#: the shim writes these words onto the wire (`mt4_net._refuse`) and the desk
+#: reads them back off it (`mt4_net._from_status`), so a word added on one side
+#: and not the other would be a silent reinterpretation of what happened to
+#: money. A word outside this set is not a measurement this desk can act on.
+WITHDRAWAL_WORDS = frozenset({"withdrawn", "claimed", "locked"})
+
 #: Every phase above, so a test can enumerate the partition instead of listing
 #: it again and drifting from it.
 BRIDGE_TIMEOUT_PHASES = (
