@@ -33,6 +33,7 @@ from straightedge.constants import (
     TRADE_RETCODE_TRADE_DISABLED,
 )
 from straightedge.history import HistoryProbe
+from straightedge.risk import parse_fx
 from straightedge.models import (
     Account,
     Bar,
@@ -867,6 +868,14 @@ class Mt4Broker:
             convention is kept because it is useful and usually right, and the
             field is recorded as unmeasured so no caller mistakes it for a
             measurement.
+
+            The convention comes from `parse_fx`, never from a 3-and-3 name
+            split. The split was the last copy of the #77 misreading in the
+            tree: it cut `DOGEUSD` into `DOG` / `EUS`, `AVAXUSD` into `AVA` /
+            `XUS` and `MATICUSD` into `MAT` / `ICU`, all codes the broker never
+            quoted (#98). `parse_fx` confirms both halves against the one
+            currency table, so a name it cannot confirm yields "" and the field
+            is carried by `unmeasured` alone rather than by an invention.
             """
             if key in d:
                 return str(d[key])
@@ -887,8 +896,11 @@ class Mt4Broker:
         stops_level = measure("stops_level", positive=False)
         freeze_level = measure("freeze_level", positive=False)
         spread = measure("spread", positive=False)
-        currency_base = derived("currency_base", n[:3] if len(n) >= 6 else "")
-        currency_profit = derived("currency_profit", n[3:6] if len(n) >= 6 else "")
+        # ONE derivation, shared with the currency-exposure limit, so the two
+        # cannot diverge again the way #77 found them diverged.
+        pair = parse_fx(n)
+        currency_base = derived("currency_base", pair[0] if pair else "")
+        currency_profit = derived("currency_profit", pair[1] if pair else "")
         currency_margin = derived("currency_margin", "")
 
         if "trade_mode" in d:
