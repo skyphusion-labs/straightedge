@@ -2317,6 +2317,20 @@ class Engine:
         read or cannot be written, where the roll never lands at all. Removing
         the marker makes every boot owe the same day again, which is
         straightedge#119's defect arriving by the other door.
+
+        AT MOST ONCE, AND IT ERRS TOWARD SILENCE RATHER THAN REPETITION.
+        `_emit` journals FIRST and notifies SECOND, and the journal row is also
+        what suppresses a retry, so a send that dies between the two loses the
+        ANNOUNCEMENT for good: the row survives for `/recap` and a journal
+        read, and no later boot tells the operator, including a boot a
+        supervisor brings up automatically. That asymmetry is deliberate.
+        Marking the day done only after a successful notify would retry, and a
+        desk whose Telegram stays broken would then send one message per boot,
+        which is straightedge#119 arriving by the other door and the thing this
+        marker exists to prevent. One lost announcement on a transport that is
+        already failing is the cheaper error than an unbounded flood on one
+        that keeps failing, so the design accepts the miss. Measured in review
+        of #198.
         """
         if owed is None:
             return

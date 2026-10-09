@@ -177,6 +177,26 @@ Six cases pin it, including both controls: a same-day restart announces nothing
 and a first-ever start announces nothing, so the new row cannot fire on an
 ordinary boot. A clock that moved BACKWARDS across a boundary is deliberately
 not reported as a missed recap; that is a different fault.
+**Two claims beside mechanisms now red when the mechanism goes, and one
+accepted window is named.** Review of #198 measured three gaps, none of them
+behavioural, all of them the shape `docs/TESTING.md` describes: a comment
+correct about intent with no reachable state in which its removal is visible.
+`last_session_day_before` reads the rotated `.1` journal and said why, and
+removing that read left the whole suite green; a rotation between two boots now
+has a case, and it is the direction that costs a MISSED day rather than the
+duplicate the marker's own rotation bound already accepts. `SESSION_EVENTS`
+excludes `recap` so an announcement cannot be evidence for itself, and adding
+`"recap"` to it also left the suite green; a case now pins it with the recap row
+naming a LATER day than the session rows, which is the only shape in which the
+scoping is observable. Measured: a journal whose `start` row has rotated away
+re-announces an already-recapped day with `"recap"` counted, and does not
+without it. Third, `_announce_unrecapped_day` now names the window it accepts
+on the notify path: `_emit` journals before it notifies and the row is also
+what suppresses a retry, so a send dying in between loses the ANNOUNCEMENT
+permanently. That is the deliberate side of the trade, because retrying on a
+persistently broken transport is one message per boot, which is #119 by the
+other door.
+
 ### A transform on a model-chosen symbol can no longer manufacture one (issue #197, p0-safety)
 
 `"EURUſD".upper()` is `"EURUSD"`. Unicode uppercasing maps U+017F LATIN SMALL

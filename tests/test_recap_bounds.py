@@ -29,6 +29,7 @@ import pytest
 from straightedge.broker.paper import PaperBroker
 from straightedge.config import BotConfig
 from straightedge.engine import Engine
+from straightedge.journal import Journal
 from straightedge.synthetic import generate_bars
 from straightedge.state import snapshot_path_for
 from straightedge.telegram import TelegramClient, TgCommand
@@ -437,7 +438,7 @@ def test_the_announcement_is_made_once_and_survives_a_crash_loop(tmp_path) -> No
     WHAT MAKES THIS PASS IS NOT THE JOURNAL MARKER, and saying so is the point.
     A review of #198 measured this case green with the marker removed: boot 1's
     `observe()` rolls the PERSISTED day_key, so boots 2 and 3 return None from
-    `_owed_day_before_roll` before the journal is ever read. The fixture sits at
+    `_owed_recap_day` before the journal is ever read. The fixture sits at
     a state the code itself produced, which is this repo's own named tell.
 
     It is kept because the OUTCOME is the contract (a crash loop sends one
@@ -561,11 +562,18 @@ def test_a_death_between_the_roll_and_the_row_does_not_lose_the_day(
     message ever named it. #129's own symptom in a narrower window, and the
     expected failure mode on a supervised desk rather than a rare one.
 
-    The owed day is derived from the JOURNAL now, which never rolls, so there
-    is no window to preserve and no ordering for a future edit to break. This
-    drives the same kill point the review used, and then asserts the part that
-    matters more: the NEXT boot reaches the same conclusion, which is what the
-    snapshot-derived version could not do at all.
+    The owed day is derived from the JOURNAL now, which never rolls, so the
+    DECISION has no window to preserve and no ordering for a future edit to
+    break. THAT IS TRUE OF THE SECOND ASSERTION AND NOT OF THE FIRST, and the
+    two are worth telling apart because they do different jobs. The first,
+    that the dying boot already wrote the row, pins the pre-roll POSITION
+    deliberately: it reds when the two statements are swapped, because the
+    baseline `day_start` exists only until the roll overwrites it. The second,
+    that the NEXT boot reaches the same conclusion, is the
+    ordering-independent half and is what the snapshot-derived version could
+    not do at all. Review of #198 found this docstring claiming the whole case
+    was ordering-independent while its first line was the only thing in the
+    suite pinning that ordering.
     """
     clock = [datetime(2024, 1, 3, 12, tzinfo=timezone.utc)]
     first = _engine(tmp_path, clock, cfg=_cfg(tmp_path))
@@ -747,3 +755,89 @@ def test_a_first_ever_start_with_an_unreadable_snapshot_announces_nothing(
     engine.start()
     assert _recaps(engine) == [], "a desk with no history invented a recap"
     engine.stop()
+
+
+def test_a_rotation_between_two_boots_does_not_hide_the_ended_day(
+    tmp_path,
+) -> None:
+    """The `.1` read, pinned. Removing it costs a MISSED day, not a duplicate.
+
+    `last_session_day_before` scans the rotated file as well as the current
+    one, and its docstring says why: a 10MB rotation between two boots leaves
+    today's fresh journal with no `start` or `stop` row before today, so
+    nothing would be owed and the day would go out silently. Review of #198
+    removed that read and the whole suite stayed green, which is the shape this
+    repo keeps naming in `docs/TESTING.md`: a claim beside a mechanism,
+    correct about intent, with no reachable state in which its removal is
+    visible.
+
+    The DIRECTION of harm is what earns it a case of its own. The recap MARKER
+    is read from the current file only, so a rotation there costs one DUPLICATE
+    message; this read is what stops a MISS, and a silently missed day is #129
+    itself. The two are not symmetrical and only the duplicate side was
+    covered.
+
+    The rotation is driven by a rename rather than by writing 10MB, which is
+    exactly what `Journal._rotate_if_needed` does to get there.
+    """
+    clock = [datetime(2024, 1, 3, 12, tzinfo=timezone.utc)]
+    first = _engine(tmp_path, clock, cfg=_cfg(tmp_path))
+    first.start()
+    first.step_all()
+    first.stop()
+
+    live = tmp_path / "j.jsonl"
+    assert "2024-01-03" in live.read_text(encoding="utf-8"), (
+        "the fixture never wrote the session rows this test rotates away"
+    )
+    live.rename(tmp_path / "j.jsonl.1")
+    # The only evidence this desk was ever alive now sits in `.1`. A scan of
+    # the current file alone has nothing to find, which is precisely the state
+    # a real rotation leaves between two boots.
+    assert not live.exists()
+
+    clock[0] = datetime(2024, 1, 4, 8, 0, tzinfo=timezone.utc)
+    second = _engine(tmp_path, clock, cfg=_cfg(tmp_path))
+    second.start()
+    rows = _recaps(second)
+    assert len(rows) == 1, (
+        "a journal rotation between two boots hid the day that ended and the "
+        f"recap was silently missed: {rows}"
+    )
+    assert rows[0]["day"] == "2024-01-03"
+    second.stop()
+
+
+def test_a_recap_row_is_not_evidence_that_the_desk_was_alive(tmp_path) -> None:
+    """`SESSION_EVENTS` scoping, pinned. An announcement cannot justify itself.
+
+    The scan is scoped to `start` and `stop` deliberately: a `recap` row also
+    carries `day`, so counting one as session evidence would let the
+    announcement stand in for the thing it announces. Review of #198 added
+    `"recap"` to `SESSION_EVENTS` and every case still passed, so the reasoning
+    was right and nothing held it.
+
+    THE RECAP ROW HERE NAMES A LATER DAY THAN THE SESSION ROWS, and that is the
+    only shape in which the scoping is observable. A recap row naming a day the
+    session rows already name cannot red anything, because it loses the
+    comparison either way; this one would WIN it and change the answer. That is
+    why the obvious version of this assertion is not the one written here.
+    """
+    journal = Journal(tmp_path / "j.jsonl")
+    journal.write("start", day="2024-01-02")
+    journal.write("stop", day="2024-01-02")
+    journal.write("recap", day="2024-01-03")
+
+    assert journal.last_session_day_before("2024-01-04") == "2024-01-02", (
+        "a recap row counted as evidence the desk was alive on the day it "
+        "announced, which makes the announcement its own justification"
+    )
+
+    # The positive control, in the same case so it cannot drift from it: the
+    # scan CAN return 2024-01-03, so the assertion above is an exclusion by
+    # SCOPE and not an inability to see the row at all.
+    journal.write("start", day="2024-01-03")
+    assert journal.last_session_day_before("2024-01-04") == "2024-01-03", (
+        "the scan cannot report this day at all, so the assertion above "
+        "proves nothing about scoping"
+    )
