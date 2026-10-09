@@ -87,6 +87,18 @@ kept complete in BOTH directions by
 word the desk can put after `refused: ` and fails when one has no row here, and
 also fails on a row naming a word the code can no longer emit (#220).
 
+**What that gate does and does not cover**, because a guarantee stated loosely
+is the thing this document keeps having to correct. It is closed over sites
+that name a word LITERALLY. A site whose word arrives by interpolation
+(`f"refused: {decision.reason}"`) is covered only because another scanner reads
+that word where it is set; a site whose payload is free text nobody defines
+(`f"refused: {result.comment}"`, filled by `OrderResult.not_sent`) has no word
+to document at all. Those sites are not counted and not ignored: the scanner
+returns each one and the test PINS the set, so a new one of either kind fails
+until a person decides which it is. The pin is the part that forces the look,
+and an earlier version of it covered only the prose kind, so a new free-text
+site changed nothing anywhere.
+
 **SCOPE, stated because the table cannot close over what it does not scan.**
 A refusal that does not take the `refused: <word>` shape is NOT in this table
 and is NOT gated by that test:
@@ -125,10 +137,10 @@ is what makes the refusal actionable rather than merely named.
 | `orders_unmeasured` | `broker.orders()` could not be READ, so commitment is unmeasured | look at the venue or the Expert; reading a failed read as "no orders" would fail OPEN |
 | `outside_session` | an AUTO order fell outside the configured session window | wait for the session, or send it manually, which is not session-gated |
 | `rr_below_min` | reward-to-risk on the signal is below `min_rr` | widen the target, tighten the stop, or skip |
-| `size_exceeds_risk` | the sized order's worst case exceeds the per-trade cap | reduce size, or widen nothing and skip |
+| `size_exceeds_risk` | the order's worst case exceeds **`min(per_trade, loss_room)`**, the LESSER of the per-trade cap and `loss_room`, which is the money the account may still lose before EITHER halt gate trips, daily loss or drawdown, computed from the persisted snapshot the sizer never sees (#157). Measured that way at both emission sites: `risk.py` on a new order, `engine.py` on a `/replace`. The reason carries NO payload, so it does not say which half bound | **depends on which half bound, and you have to work that out.** Per-trade cap: reduce size. `loss_room`: size is not the problem and halving it refuses again. If DAILY LOSS is the near one, stop and wait for the UTC roll; if DRAWDOWN is, the roll will not help, because peak-to-trough outlives the day. From `/replace` the refusal means specifically that the replacement ADDS risk, since #164 exempts a reduction from the cap entirely, so the action there is a replacement at or below what is already resting and never a smaller version of the increase |
 | `size_zero` | sizing returned zero lots | the stop distance is too wide for the risk budget at min lot; skip it |
 | `sl_not_measured:` | the VENUE reported a stop that cannot be a price (`nan`, `inf`), with the value in the payload | look at the venue; this is not your omission |
-| `sl_required` | no stop was set | set one |
+| `sl_required` | no USABLE stop: `unusable_stop` returns this for any `sl <= 0`, so it covers a stop that was never set (the venue encodes that as `0`) AND one set to a negative price, which is set but cannot be a price | set a stop at a real price. A negative value is not a missing stop and is worth re-reading as a sign or units mistake rather than an omission |
 | `spec_not_measured:` | the venue never streamed the named sizing fields, which are in the payload | get the symbol into Market Watch; sizing refuses rather than defaulting |
 | `spread_too_wide` | spread exceeds `max_spread_atr_frac` of ATR | wait for the spread to come in |
 | `state_unreadable` | the durable risk state could not be READ | fix the path or permissions; the budgets cannot be trusted without it |

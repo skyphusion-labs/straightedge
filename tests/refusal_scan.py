@@ -289,22 +289,38 @@ def scan_refusal_literals(source: str) -> ReasonScan:
     nothing here and is correctly skipped: the word is named wherever that
     expression was set, and the scanners above read it there.
 
-    NOT EVERY REFUSAL REPLY IS A REASON WORD. `desk.py` also answers
-    `refused: unresolved send <client_id>`, which is operator PROSE: it has a
-    space in it, it is not a name this project defines, and a contract cannot
-    enumerate it as vocabulary. Prose lands in `forwarded`, so the caller pins
-    the exact set and a NEW prose refusal has to be looked at by a person.
-    Dropping it silently would be the defect this module was written against;
-    counting it would corrupt the denominator with text that can never be
-    documented as a word.
+    NOT EVERY REFUSAL REPLY IS A REASON WORD, and `forwarded` carries two
+    kinds of non-word site so that neither is dropped:
+
+    * `prose: ...` for a literal with no word shape, such as
+      `refused: unresolved send <client_id>`, which names one in-flight send.
+    * `interpolated: ...` for an f-string whose head is exactly `refused: `,
+      so nothing literal follows it. Either the word is named elsewhere
+      (`f"refused: {decision.reason}"`) or the payload is free text nobody
+      defines (`f"refused: {result.comment}"`). The scanner cannot tell those
+      apart by dataflow and does not try; it returns the expression and the
+      caller pins the set.
+
+    Both are RETURNED rather than counted or ignored. Counting them would
+    corrupt the denominator with text that can never be documented as a word;
+    dropping them is the defect this module was written against, and an
+    earlier version of this function did exactly that to the interpolated
+    kind.
     """
     tree = ast.parse(source)
     collector = _Collector(_module_string_constants(tree))
 
     def take(text: str) -> None:
-        if not text.startswith("refused: ") or text == "refused: ":
+        if not text.startswith("refused: "):
             return
         tail = text[len("refused: ") :]
+        if not tail:
+            # A bare `"refused: "` literal is an f-string HEAD, which
+            # `ast.walk` also visits as a Constant in its own right. The
+            # JoinedStr branch below records that site as `interpolated:`, so
+            # recording it here as well would report one site twice under two
+            # different kinds. It names nothing on its own either way.
+            return
         if REASON_WORD.match(tail):
             collector._record(tail, prefix=True)
         else:
@@ -315,8 +331,30 @@ def scan_refusal_literals(source: str) -> ReasonScan:
             take(node.value)
         elif isinstance(node, ast.JoinedStr):
             head = node.values[0] if node.values else None
-            if isinstance(head, ast.Constant) and isinstance(head.value, str):
-                take(head.value)
+            if not (isinstance(head, ast.Constant) and isinstance(head.value, str)):
+                continue
+            if head.value == "refused: ":
+                # NOTHING LITERAL FOLLOWS `refused: `, so this site names no
+                # word HERE. An earlier version returned early on exactly this
+                # string and the site vanished: not a name, not a prefix, not
+                # forwarded. Demonstrated by injecting a NEW
+                # `f"refused: {x.comment}"` site and getting byte-identical
+                # scanner output, which made the hole sit precisely in the
+                # mechanism meant to force a person to look at a new refusal.
+                #
+                # Two kinds reach here and the scanner cannot tell them apart
+                # by dataflow, which is exactly why it must not try: either the
+                # word is named elsewhere and another scanner reads it there
+                # (`f"refused: {decision.reason}"`), or the payload is free
+                # text nobody defines (`f"refused: {result.comment}"`, whose
+                # value comes from `OrderResult.not_sent`). So the EXPRESSION
+                # is returned and the caller pins the set, the same contract
+                # `forwarded` already carries for `RiskDecision(reason=...)`.
+                # A new site of either kind then fails until a person says
+                # which it is.
+                collector.forwarded.add("interpolated: " + ast.unparse(node))
+                continue
+            take(head.value)
 
     return ReasonScan(
         names=frozenset(collector.names),

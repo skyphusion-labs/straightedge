@@ -39,10 +39,32 @@ CONTRACT = ROOT / "docs" / "CONTRACT.md"
 #: rendered after `refused: `, so it is not vocabulary.
 NOT_A_REFUSAL = frozenset({"ok"})
 
-#: The one refusal that is operator PROSE rather than a word, pinned exactly so
-#: a NEW prose refusal fails here and gets looked at by a person. It names a
-#: specific in-flight send, so it can never be a contract entry.
-PINNED_PROSE = ("prose: refused: unresolved send",)
+#: Every `refused: ` site that names NO word here, pinned exactly so a NEW one
+#: fails and gets looked at by a person. Two kinds, and the pin covers both
+#: because the gap that let one through was the kind that was not pinned:
+#:
+#: * `prose:` a literal with no word shape. `refused: unresolved send <id>`
+#:   names one in-flight send and can never be a contract entry.
+#: * `interpolated:` an f-string whose head is exactly `refused: `. Either the
+#:   word is named elsewhere and another scanner reads it there
+#:   (`{decision.reason}`, `{bad}`, `{trip.reason}`, `{reason}`, `{bad_stop}`,
+#:   `{exc.reason}`), or the payload is free text nobody defines
+#:   (`{result.comment}`, set by `OrderResult.not_sent`). No scanner can tell
+#:   those apart by dataflow, so the decision is a person's.
+#:
+#: MEASURED: before this pin existed, adding a new `f"refused: {x.comment}"`
+#: site produced byte-identical scanner output, so the hole sat exactly in the
+#: mechanism meant to force that look. A new site of either kind now reds here.
+PINNED_NON_WORD_SITES = (
+    "interpolated: f'refused: {bad}'",
+    "interpolated: f'refused: {bad_stop}'",
+    "interpolated: f'refused: {decision.reason}'",
+    "interpolated: f'refused: {exc.reason}'",
+    "interpolated: f'refused: {reason}'",
+    "interpolated: f'refused: {result.comment}'",
+    "interpolated: f'refused: {trip.reason}'",
+    "prose: refused: unresolved send",
+)
 
 
 def _scans() -> dict[str, object]:
@@ -223,26 +245,40 @@ def test_the_coverage_check_can_see_an_undocumented_reason() -> None:
     )
 
 
-def test_prose_refusals_are_pinned_rather_than_ignored() -> None:
-    """Not every reply after `refused: ` is a word, and the exceptions are named.
+def test_non_word_refusal_sites_are_pinned_rather_than_ignored() -> None:
+    """Not every reply after `refused: ` is a word, and every exception is named.
 
-    `desk.py` answers `refused: unresolved send <client_id>`, which is prose
-    about one in-flight send. It cannot be a vocabulary entry, so the scanner
-    returns it separately. Pinning the exact set is what keeps that from
-    becoming a silent ignore list: a new prose refusal fails here.
+    This is the half that was broken. The first version pinned only `prose: `
+    sites, and `scan_refusal_literals` returned early on an f-string head of
+    exactly `refused: `, so an INTERPOLATED site was not pinned and was not
+    returned at all. Adding a new `f"refused: {x.comment}"` therefore changed
+    nothing anywhere, which put the hole inside the one mechanism this module
+    exists for: forcing a person to look at a new refusal.
+
+    Both kinds are pinned now. A new site reds here whether its payload is a
+    word named elsewhere or free text nobody defines, and the message says
+    which decision is owed.
     """
-    prose = tuple(
+    sites = tuple(
         sorted(
-            p
+            s
             for scan in _scans().values()
-            for p in scan.forwarded
-            if p.startswith("prose: ")
+            for s in scan.forwarded
+            if s.startswith(("prose: ", "interpolated: "))
         )
     )
-    assert prose == PINNED_PROSE, (
-        f"the set of PROSE refusals changed: found {prose!r}, pinned "
-        f"{PINNED_PROSE!r}. A new one is either a reason word that should be "
-        "named and documented, or prose that belongs in this pin."
+    # Compared against a SORTED pin rather than the literal order above, so a
+    # future editor adding an entry where it reads naturally does not get a
+    # spurious failure. `{bad_stop}` sorts before `{bad}` because `_` < `}`,
+    # which is exactly the kind of ordering trap that teaches people to stop
+    # trusting a pin.
+    assert sites == tuple(sorted(PINNED_NON_WORD_SITES)), (
+        f"the set of non-word `refused: ` sites changed.\nfound  {sites!r}\n"
+        f"pinned {tuple(sorted(PINNED_NON_WORD_SITES))!r}\n"
+        "A new site is one of three things, and which one is a person's call: "
+        "a reason word that should be named and given a table row; a payload "
+        "whose word is named elsewhere and already scanned there; or free text "
+        "that can never be a vocabulary entry and belongs in this pin."
     )
 
 
