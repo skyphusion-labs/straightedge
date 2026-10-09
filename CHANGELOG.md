@@ -4,6 +4,91 @@ NOTE: Operator docs from 1.0.0 use 8th-grade Simplified Technical English.
 Do not treat older changelog wording as the operator contract.
 See README.md and docs/CONTRACT.md.
 
+## 1.7.0
+
+### The worst tick gap this box has seen now outlives the process (issue #153)
+
+`tick_gap_max_s` answered one question while the runbook asked it another, and
+a restart erased the answer. The figure is the largest gap between heartbeat
+writes that the live PROCESS has observed, and `over_budget` is derived from
+it. But what `over_budget` was installed to test is whether the derived
+staleness allowance is adequate for this BOOK, and a restart changes neither
+the allowance nor the book.
+
+Measured on the live desk, not theorised. Before the 2026-10-08 deploy:
+
+```
+stale_after_s=428   tick_budget_s=214   tick_gap_max_s=608.5   over_budget=1
+```
+
+After the restart that deploy required:
+
+```
+stale_after_s=428   tick_budget_s=214   tick_gap_max_s=7.7     over_budget=0
+```
+
+Both figures are correct for their process. The 608.5 then existed nowhere a
+live surface could reach, while #143 was citing it as evidence that the
+deployed desk's single 5000ms budget could not clear #84's derived 7060ms worst
+case. The reset is also in the dangerous direction: a desk restarted after a
+bad episode publishes its cleanest possible history, so `over_budget=0` on a
+fresh restart is the reassuring half of a two-part answer.
+
+**Two questions, two pairs of fields, and the heartbeat now carries both.**
+
+- `tick_gap_max_s` and `over_budget` are unchanged and stay PER PROCESS. A desk
+  whose book has shrunk must be able to report a clean budget again; an
+  indicator that can never go green is one an operator learns to ignore, which
+  is the module's refusal to widen the threshold read from the other end.
+- `tick_gap_ever_s` and `over_budget_ever` are new and are carried across
+  restarts. `watch` says so in plain words when the box has breached and the
+  live process has not, because a durable figure published to nobody is not an
+  improvement.
+
+**The store is the heartbeat itself, and the other two were rejected on the
+record.** The risk snapshot is money-path state that fails closed, so a
+diagnostic there widens what a corrupt snapshot can halt. The JOURNAL is where
+the breach RECORD goes but cannot be the store for the maximum: rotation is a
+single generation and `tail` reads only the live file, so a maximum recovered
+by scanning the journal is a LOWER BOUND once a rotation has happened, and a
+lower bound published as a maximum is the defect being fixed. The heartbeat is
+not risk state, is not rotated, is already 0600 and atomically replaced, and is
+already the file the figure is published in, so no new sidecar was added.
+
+**What it cannot see, stated rather than implied.** The figure is a maximum over
+the heartbeats that SURVIVED. Deleting `journal.heartbeat` resets the box
+history and that is the only way to lose it. A desk upgrading from 1.6.x starts
+the chain at its own observations: the previous process's `tick_gap_max_s` is
+deliberately NOT adopted, because that is the other question's number and
+adopting it would reintroduce the conflation. `watch` reports a missing
+`over_budget_ever` as unknown and never as clean.
+
+**Every breach is also journaled**, as `tick_gap_breach` with `gap_s`,
+`budget_s`, `symbols` and `run_id`, once per process per breach. The heartbeat
+holds the worst gap; only the journal can answer how OFTEN this box breaches.
+The stdout warning stays, and on the deployed box it goes to a file nobody
+reads, which is why it was never the durable record. `symbols` and not the
+position count the issue floated: a position count means a venue round trip
+inside the heartbeat writer, which would add latency to the very path the
+record exists to explain, and an instrument must not perturb its own
+measurement.
+
+**Red first.** `tests/test_tick_gap_survives_restart.py` drives two real desk
+processes over a monkeypatched monotonic clock and lets `_write_heartbeat`
+measure the 608.5 itself; nothing assigns the figure. Six mutations were run
+and each produced a named failure: no restore, a restore that overwrites the
+live measurement instead of taking a maximum, a restore that adopts the
+previous process's figure, the watcher note removed, a missing field read as
+clean, and the breach printed but not journaled.
+
+### Fix-forward, in the same change
+
+- **The heartbeat field list was incomplete in both docs.** `docs/CONTRACT.md`
+  did not name `deployed=`, and `docs/RUNBOOK.md` named neither `run_id=`,
+  `started_at=` nor `deployed=`, all three shipped in 1.6.0. Both lists are now
+  complete. A format contract that omits fields the renderer emits is a
+  contract a reader cannot reproduce the file from.
+
 ## 1.6.0
 
 ### A git deploy procedure, and a desk that can say what it is running (issue #147)

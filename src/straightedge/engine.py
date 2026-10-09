@@ -6,6 +6,7 @@ import math
 import os
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 from straightedge.broker.base import Broker
@@ -183,6 +184,13 @@ class Engine:
         self._hb_last_mono: float | None = None
         self._hb_gap_max_s = 0.0
         self._hb_over_warned = False
+        #: The worst gap THIS BOX has ever published, carried across restarts.
+        #: A DIFFERENT question from `_hb_gap_max_s` one line up, which is why
+        #: it is a second field rather than a change to the first;
+        #: `_restore_gap_ever` states which question each one answers, where a
+        #: reader meets them.
+        self._hb_gap_ever_s = 0.0
+        self._hb_ever_restored = False
         #: This process's identity, published in the heartbeat so that a
         #: supervised restart is observable from OUTSIDE the process. Assigned
         #: in __init__ and never reassigned: a desk that re-read its own config
@@ -2137,16 +2145,44 @@ class Engine:
         """
         dest = watchdog.heartbeat_path_for(self.journal.path)
         tmp = dest.with_name(dest.name + ".tmp")
+        # BEFORE anything is written. This method REPLACES `dest`, so the only
+        # moment the previous process's figure is still readable is here.
+        self._restore_gap_ever(dest)
         ts = now or self.now_fn()
         mono = time.monotonic()
         if self._hb_last_mono is not None:
             self._hb_gap_max_s = max(self._hb_gap_max_s, mono - self._hb_last_mono)
         self._hb_last_mono = mono
         budget = watchdog.tick_budget_seconds(self.cfg)
+        # Monotonic, by construction: this desk's own observations are part of
+        # the box's history, so the published figure can never be lower than
+        # what this process has itself seen.
+        self._hb_gap_ever_s = max(self._hb_gap_ever_s, self._hb_gap_max_s)
         if self._hb_gap_max_s > budget and not self._hb_over_warned:
             # The threshold is derived from config and this measurement says the
             # derivation is too tight for this book. Report it; do NOT widen it.
             self._hb_over_warned = True
+            # The JOURNAL, not only stdout. stdout on the deployed box goes to a
+            # file nobody reads, so before straightedge#153 the only durable
+            # trace of a breach was a heartbeat field the next restart
+            # overwrote. The journal is append-only and already the audit log of
+            # a real-money desk, and it is the only surface that can answer HOW
+            # OFTEN this box breaches rather than how bad the worst one was.
+            # Once per process per breach, exactly as the stdout warning was.
+            #
+            # `symbols` and NOT the position count, which is what the issue
+            # floated: a position count means a venue round trip, and a venue
+            # round trip inside the heartbeat writer would add latency to the
+            # very path whose latency this record exists to explain. An
+            # instrument must not perturb its own measurement. The symbol list
+            # is the half of the book that is config, and therefore free.
+            self.journal.write(
+                "tick_gap_breach",
+                gap_s=round(self._hb_gap_max_s, 1),
+                budget_s=budget,
+                symbols=len(self.cfg.symbols),
+                run_id=self._hb_run_id,
+            )
             print(
                 f"heartbeat: a gap of {self._hb_gap_max_s:.1f}s between ticks "
                 f"exceeds the derived budget of {budget}s, so the watchdog "
@@ -2161,6 +2197,7 @@ class Engine:
                 stale_after_s=watchdog.stale_after_seconds(self.cfg),
                 tick_budget_s=budget,
                 tick_gap_max_s=self._hb_gap_max_s,
+                tick_gap_ever_s=self._hb_gap_ever_s,
                 run_id=self._hb_run_id,
                 started_at=self._hb_started_at.isoformat(),
                 # Read on every write rather than cached at construction. A
@@ -2174,6 +2211,89 @@ class Engine:
         )
         os.chmod(tmp, 0o600)
         tmp.replace(dest)
+
+    def _restore_gap_ever(self, dest: Path) -> None:
+        """Carry the worst gap this BOX has seen across a restart. Once.
+
+        TWO QUESTIONS, TWO FIELDS, and that is the whole design decision of
+        straightedge#153, so it is written where a reader meets the fields.
+
+        - `tick_gap_max_s` answers **is THIS PROCESS slow now**. It is per
+          process on purpose and it is UNCHANGED by this issue: a desk whose
+          book has shrunk must be able to report a clean budget again, and an
+          indicator that can never go green is one an operator learns to
+          ignore. That is the module's refusal to WIDEN the threshold on a
+          breach, read from the other end.
+        - `tick_gap_ever_s` answers **has THIS BOX ever been slow**. That is the
+          question `over_budget` was installed for, because what it tests is
+          whether `UNBOUNDED_TAIL_ALLOWANCE` is adequate for this book, and a
+          restart resets neither the allowance nor the book.
+
+        One field answering both is what made this a defect rather than a
+        quirk. The live desk published `tick_gap_max_s=608.5 over_budget=1`,
+        the 2026-10-08 deploy restarted it, and the same surface then published
+        `7.7` and `0`. Both figures were correct for their process; the 608.5
+        became unrecoverable from any live surface, while #143 was citing it as
+        evidence. The reset is also in the dangerous direction, because a desk
+        restarted after a bad episode reports its cleanest possible history.
+
+        WHY THE HEARTBEAT IS THE STORE, having rejected the other two.
+
+        The risk snapshot is out: it is money-path state that fails closed, and
+        putting a diagnostic in it widens what a corrupt snapshot can halt.
+
+        The JOURNAL is out as the STORE, which is less obvious and matters
+        more, because the journal is where the breach RECORD goes. Rotation is
+        a single generation (`Journal._rotate_if_needed` does one
+        `path.replace(path + ".1")`) and `tail()` reads only the live file, so a
+        maximum recovered by scanning the journal is a LOWER BOUND once a
+        rotation has happened, and a lower bound published as a maximum is the
+        defect this issue is about. The journal answers how OFTEN; it cannot
+        soundly answer how BAD.
+
+        So the store is the heartbeat itself: not risk state, not rotated,
+        write-mostly, already 0600, already atomically replaced, and already
+        the file this figure is published in, so the restore source and the
+        published value are the same line. Reading a sidecar in this path is
+        established rather than new: `deployed.describe` is read here on every
+        write.
+
+        WHAT THIS CANNOT SEE, stated rather than implied. The figure is a
+        maximum over the heartbeats that SURVIVED, not over all time. Deleting
+        `journal.heartbeat` resets the box's history and that is the one way to
+        lose it; a desk upgrading from a build with no such field starts the
+        chain at its own observations, and `watchdog.decide` says so rather
+        than reading the absence as a clean history. The figure is never lower
+        than what this process has itself observed, so it is always a true
+        lower bound on the box's history and never an invented one.
+
+        Once per process: the first heartbeat write restores, and every later
+        one only grows the figure. It happens HERE rather than in `start()` so
+        that no call order can publish an unrestored field, because
+        `_write_heartbeat` is reached from `step_all` and not only from a
+        started desk.
+        """
+        if self._hb_ever_restored:
+            return
+        self._hb_ever_restored = True
+        prior = watchdog.read(dest)
+        if prior is None:
+            return
+        raw = prior.fields.get("tick_gap_ever_s", "")
+        if not raw:
+            # An older desk published no such field. Its history is genuinely
+            # unrecoverable, so the chain starts here. `tick_gap_max_s` is
+            # deliberately NOT read as a fallback: it is the previous PROCESS's
+            # figure, and adopting it would answer the box question with the
+            # process question's number, which is the conflation being fixed.
+            return
+        try:
+            self._hb_gap_ever_s = max(self._hb_gap_ever_s, float(raw))
+        except ValueError:
+            # A field that will not parse is not a measurement, and this is the
+            # desk's own file: a value it cannot read means the file was
+            # damaged, never that the box was quiet.
+            return
 
     def step_all(self) -> None:
         self.poll_telegram()
