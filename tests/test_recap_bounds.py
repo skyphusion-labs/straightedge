@@ -24,10 +24,14 @@ shipped path instead of about my own assumption.
 import json
 from datetime import datetime, timedelta, timezone
 
+import pytest
+
 from straightedge.broker.paper import PaperBroker
 from straightedge.config import BotConfig
 from straightedge.engine import Engine
+from straightedge.journal import Journal
 from straightedge.synthetic import generate_bars
+from straightedge.state import snapshot_path_for
 from straightedge.telegram import TelegramClient, TgCommand
 
 RECAP_NOTIFY = frozenset({"start", "stop", "open", "close", "halt", "recap"})
@@ -178,10 +182,19 @@ def test_a_restart_while_halted_does_not_re_send_the_recap(tmp_path) -> None:
     the reachable world in which it fails. It is a pin on the argument for NOT
     persisting the marker, not a proof of defect 2.
 
-    It also pins the live consequence of that ordering, which is worth knowing
-    separately: a desk restarted across midnight never sends the recap for the
-    day that ended. That is a silent MISS, the opposite of this issue, and
-    changing it would add messages; it is not in scope here.
+    The consequence this used to pin as out of scope, a desk restarted across
+    midnight never sending the recap for the day that ended, is FIXED in
+    straightedge#129. This test is unaffected and that is not luck: the first
+    process here already emitted the recap for the 3rd before it stopped, so
+    the restarted process reads that row and stays quiet. What the fix adds is
+    an announcement for a day NOBODY recapped, which is a different state from
+    this one; see the straightedge#129 cases at the end of this file.
+
+    The reasoning above still holds for the in-process marker, with one
+    correction: a recap CAN now be owed across a restart, so "a journal marker
+    would guard an unreachable state" is no longer why `_recapped_day` is in
+    memory. It is in memory because it guards a boundary this process watched;
+    the restart case has its own marker, and that one is the journal.
     """
     clock = [datetime(2024, 1, 3, 12, tzinfo=timezone.utc)]
     cfg = _cfg(tmp_path)
@@ -366,3 +379,501 @@ def test_send_leaves_a_message_that_fits_completely_alone() -> None:
     assert len(sends) == 1
     assert sends[0]["text"] == HELP
     assert "truncated" not in sends[0]["text"]
+
+
+# --- straightedge#129: the day that ended while the desk was down ----------
+#
+# The counterpart to the three defects above: #119 was too many recaps, this is
+# a missing one. `start()` calls `risk.observe()` before the first tick, which
+# rolls `snap.day_key` to today, so `_maybe_daily_recap` can no longer owe a
+# recap for the day that just ended and nothing is emitted at all. Silent: no
+# journal row, no message, and nothing to tell "recapped" from "swallowed".
+#
+# What is emitted instead is deliberately NOT a P&L. The ended day's closing
+# equity was never observed, `day_start_equity` is the only half that survives
+# in the snapshot, and the issue says in as many words that a recap reporting
+# the wrong baseline is worse than no recap. So the row names what it could not
+# measure, in the `unmeasured` shape this repo already uses for a spec and for
+# the venue clock, and carries no `pnl` field at all: a missing field cannot be
+# misread, a zero can.
+
+
+def _recap_days(engine: Engine) -> list[str]:
+    return [str(r.get("day", "")) for r in _recaps(engine)]
+
+
+def test_a_restart_across_midnight_announces_the_day_it_could_not_recap(
+    tmp_path,
+) -> None:
+    """The defect. One process ends on the 3rd, the next starts on the 4th."""
+    clock = [datetime(2024, 1, 3, 12, tzinfo=timezone.utc)]
+    first = _engine(tmp_path, clock, cfg=_cfg(tmp_path))
+    first.start()
+    first.step_all()
+    assert _recaps(first) == [], "nothing is owed yet; the day has not ended"
+    first.stop()
+
+    # The box was down across the boundary: a reboot, a deploy, a crash loop.
+    clock[0] = datetime(2024, 1, 4, 8, 0, tzinfo=timezone.utc)
+    second = _engine(tmp_path, clock, cfg=_cfg(tmp_path))
+    second.start()
+    rows = _recaps(second)
+    assert len(rows) == 1, (
+        "a desk restarted across midnight said nothing about the day that "
+        f"ended while it was down: {rows}"
+    )
+    rec = rows[0]
+    assert rec["day"] == "2024-01-03"
+    assert rec["day_start"] == 10_000.0
+    assert rec["days_skipped"] == 1
+    assert sorted(rec["unmeasured"]) == ["equity", "pnl"]
+    assert "pnl" not in rec, "a pnl nobody measured must not be in the row at all"
+    assert "equity" not in rec
+    second.stop()
+
+
+def test_the_announcement_is_made_once_and_survives_a_crash_loop(tmp_path) -> None:
+    """Three restarts on the same day are one announcement, not three.
+
+    WHAT MAKES THIS PASS IS NOT THE JOURNAL MARKER, and saying so is the point.
+    A review of #198 measured this case green with the marker removed: boot 1's
+    `observe()` rolls the PERSISTED day_key, so boots 2 and 3 return None from
+    `_owed_recap_day` before the journal is ever read. The fixture sits at
+    a state the code itself produced, which is this repo's own named tell.
+
+    It is kept because the OUTCOME is the contract (a crash loop sends one
+    message, not one per boot) and because it pins the persisted-roll half of
+    that outcome. The marker's own case, the one that reds when it is removed,
+    is `test_the_journal_marker_is_what_guards_an_unwritable_snapshot`: a desk
+    whose snapshot cannot be written never lands the roll, so every boot owes
+    the same day and only the journal row stops the flood.
+    """
+    clock = [datetime(2024, 1, 3, 12, tzinfo=timezone.utc)]
+    first = _engine(tmp_path, clock, cfg=_cfg(tmp_path))
+    first.start()
+    first.step_all()
+    first.stop()
+
+    clock[0] = datetime(2024, 1, 4, 8, 0, tzinfo=timezone.utc)
+    for _ in range(3):
+        engine = _engine(tmp_path, clock, cfg=_cfg(tmp_path))
+        engine.start()
+        engine.step_all()
+        engine.stop()
+    seen = _recap_days(engine)
+    assert seen.count("2024-01-03") == 1, f"a crash loop re-announced the day: {seen}"
+
+
+def test_a_week_of_downtime_is_one_announcement_naming_the_count(tmp_path) -> None:
+    """The bound belongs in the design, not in a cap bolted on after.
+
+    A box down for a week must not emit seven recaps on boot. It emits one row
+    for the last day it actually observed, and states how many boundaries it
+    missed, which is bounded by construction.
+    """
+    clock = [datetime(2024, 1, 3, 12, tzinfo=timezone.utc)]
+    first = _engine(tmp_path, clock, cfg=_cfg(tmp_path))
+    first.start()
+    first.step_all()
+    first.stop()
+
+    clock[0] = datetime(2024, 1, 10, 9, 0, tzinfo=timezone.utc)
+    second = _engine(tmp_path, clock, cfg=_cfg(tmp_path))
+    second.start()
+    rows = _recaps(second)
+    assert len(rows) == 1, f"seven days down produced {len(rows)} rows"
+    assert rows[0]["day"] == "2024-01-03"
+    assert rows[0]["days_skipped"] == 7
+    second.stop()
+
+
+def test_a_restart_inside_the_same_day_announces_nothing(tmp_path) -> None:
+    """The positive control. Most restarts cross no boundary at all."""
+    clock = [datetime(2024, 1, 3, 12, tzinfo=timezone.utc)]
+    first = _engine(tmp_path, clock, cfg=_cfg(tmp_path))
+    first.start()
+    first.step_all()
+    first.stop()
+
+    clock[0] = datetime(2024, 1, 3, 23, 59, tzinfo=timezone.utc)
+    second = _engine(tmp_path, clock, cfg=_cfg(tmp_path))
+    second.start()
+    assert _recaps(second) == [], "a same-day restart invented a recap"
+    second.stop()
+
+
+def test_a_first_ever_start_announces_nothing(tmp_path) -> None:
+    """No snapshot, no observed day, nothing owed. The other control."""
+    clock = [datetime(2024, 1, 3, 12, tzinfo=timezone.utc)]
+    engine = _engine(tmp_path, clock, cfg=_cfg(tmp_path))
+    engine.start()
+    assert _recaps(engine) == []
+    engine.stop()
+
+
+def test_the_operator_sees_it_on_an_install_that_enumerates_notify_events(
+    tmp_path,
+) -> None:
+    """It reaches chat, and that is why it is a `recap` row and not a new event.
+
+    Every config.toml written before this change enumerates `notify_events`
+    explicitly (`telegram.py`, ALWAYS_NOTIFY_EVENTS carries the same argument),
+    so a new event name would have reached nobody on the live box: the operator
+    who most needs this row is the one whose desk restarted. It is therefore
+    the same `recap` event, with its own rendering.
+    """
+    clock = [datetime(2024, 1, 3, 12, tzinfo=timezone.utc)]
+    first = _engine(tmp_path, clock, cfg=_cfg(tmp_path))
+    first.start()
+    first.step_all()
+    first.stop()
+
+    transport = FakeTransport()
+    tg = TelegramClient(
+        token="t", chat_id="1", notify_events=RECAP_NOTIFY, transport=transport
+    )
+    clock[0] = datetime(2024, 1, 4, 8, 0, tzinfo=timezone.utc)
+    second = _engine(tmp_path, clock, telegram=tg, cfg=_cfg(tmp_path))
+    second.start()
+    texts = [
+        p.get("text", "")
+        for url, p in transport.sent
+        if url.endswith("/sendMessage")
+    ]
+    recap_lines = [t for t in texts if t.startswith("RECAP")]
+    assert len(recap_lines) == 1, f"the missed recap did not reach chat: {texts}"
+    line = recap_lines[0]
+    assert "2024-01-03" in line
+    assert "NOT MEASURED" in line, (
+        "the line reported a number for a day whose close was never observed: " + line
+    )
+    assert "pnl=+0" not in line, "a zero stood in for an unanswered question: " + line
+    second.stop()
+
+
+def test_a_death_between_the_roll_and_the_row_does_not_lose_the_day(
+    tmp_path, monkeypatch
+) -> None:
+    """The window a review of #198 measured, closed by CONSTRUCTION.
+
+    `observe()` persists the roll the instant the durable tuple moves, so a
+    process that died between the roll and the announcement lost the day for
+    good: every later boot read the rolled key, owed nothing, and no row or
+    message ever named it. #129's own symptom in a narrower window, and the
+    expected failure mode on a supervised desk rather than a rare one.
+
+    The owed day is derived from the JOURNAL now, which never rolls, so the
+    DECISION has no window to preserve and no ordering for a future edit to
+    break. THAT IS TRUE OF THE SECOND ASSERTION AND NOT OF THE FIRST, and the
+    two are worth telling apart because they do different jobs. The first,
+    that the dying boot already wrote the row, pins the pre-roll POSITION
+    deliberately: it reds when the two statements are swapped, because the
+    baseline `day_start` exists only until the roll overwrites it. The second,
+    that the NEXT boot reaches the same conclusion, is the
+    ordering-independent half and is what the snapshot-derived version could
+    not do at all. Review of #198 found this docstring claiming the whole case
+    was ordering-independent while its first line was the only thing in the
+    suite pinning that ordering.
+    """
+    clock = [datetime(2024, 1, 3, 12, tzinfo=timezone.utc)]
+    first = _engine(tmp_path, clock, cfg=_cfg(tmp_path))
+    first.start()
+    first.step_all()
+    assert _recaps(first) == []
+    first.stop()
+
+    clock[0] = datetime(2024, 1, 4, 8, 0, tzinfo=timezone.utc)
+    dying = _engine(tmp_path, clock, cfg=_cfg(tmp_path))
+    real_observe = dying.risk.observe
+
+    def observe_then_die(acct, now):
+        real_observe(acct, now)
+        raise RuntimeError("killed between the roll and whatever came next")
+
+    monkeypatch.setattr(dying.risk, "observe", observe_then_die)
+    with pytest.raises(RuntimeError):
+        dying.start()
+    # The roll is durable now, which is what made this unrecoverable before.
+    assert dying.risk.snapshot.day_key == "2024-01-04"
+    assert _recap_days(dying) == ["2024-01-03"], (
+        "the day was lost in the window between the roll and the row"
+    )
+
+    clean = _engine(tmp_path, clock, cfg=_cfg(tmp_path))
+    clean.start()
+    assert _recap_days(clean).count("2024-01-03") == 1, (
+        "the next boot either lost it or repeated it: " + repr(_recap_days(clean))
+    )
+    clean.stop()
+
+
+def test_a_boot_that_rolled_without_writing_the_row_leaves_the_day_recoverable(
+    tmp_path, monkeypatch
+) -> None:
+    """The property that only a DURABLE derivation gives, isolated.
+
+    The case above drives the kill point a review of #198 used, but it cannot
+    distinguish the two candidate fixes: the row is written before the roll
+    either way, so a snapshot-derived version passes it too. This one removes
+    that confound. The roll is allowed to land and the row is suppressed, which
+    is the state "the snapshot has moved on and nobody announced", however a
+    future edit arranges the two statements.
+
+    A snapshot-derived owed day cannot recover from that at all, because the
+    only record of the ended day has been overwritten. The journal can, because
+    the `start` row from that day is still there and `recap` rows are the only
+    thing that marks a day as announced.
+    """
+    clock = [datetime(2024, 1, 3, 12, tzinfo=timezone.utc)]
+    first = _engine(tmp_path, clock, cfg=_cfg(tmp_path))
+    first.start()
+    first.step_all()
+    first.stop()
+
+    clock[0] = datetime(2024, 1, 4, 8, 0, tzinfo=timezone.utc)
+    silent = _engine(tmp_path, clock, cfg=_cfg(tmp_path))
+    monkeypatch.setattr(silent, "_announce_unrecapped_day", lambda owed: None)
+    silent.start()
+    assert silent.risk.snapshot.day_key == "2024-01-04", "the roll has to have landed"
+    assert _recaps(silent) == [], "this boot is the one that said nothing"
+    silent.stop()
+
+    clean = _engine(tmp_path, clock, cfg=_cfg(tmp_path))
+    clean.start()
+    days = _recap_days(clean)
+    assert days == ["2024-01-03"], (
+        "the day was unrecoverable once the roll had landed: " + repr(days)
+    )
+    clean.stop()
+
+
+def test_the_journal_marker_is_what_guards_an_unwritable_snapshot(
+    tmp_path, monkeypatch
+) -> None:
+    """The state the marker UNIQUELY guards, which is not every restart.
+
+    A review of #198 found the crash-loop case passing with the marker removed,
+    and it was right: on the ordinary path the PERSISTED day_key is what stops
+    a second announcement, because boot 2 owes nothing before the marker is
+    ever read. The marker earns its place on a desk whose snapshot cannot be
+    WRITTEN: `_persist_state` halts on `StateUnwritable`, the roll never lands,
+    so every boot restores the same old `day_key` and owes the same day. Three
+    boots then send three messages unless the journal says otherwise.
+
+    `state_unreadable` does NOT reach this, which is the opposite of the
+    obvious reading: an unreadable snapshot leaves `day_key` empty, so nothing
+    is owed at all. Asserted below so the distinction cannot rot.
+    """
+    clock = [datetime(2024, 1, 3, 12, tzinfo=timezone.utc)]
+    first = _engine(tmp_path, clock, cfg=_cfg(tmp_path))
+    first.start()
+    first.step_all()
+    first.stop()
+
+    def boom(*_a, **_k):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr("straightedge.state.os.replace", boom)
+    clock[0] = datetime(2024, 1, 4, 8, 0, tzinfo=timezone.utc)
+    last = None
+    for boot in range(3):
+        engine = _engine(tmp_path, clock, cfg=_cfg(tmp_path))
+        engine.start()
+        assert engine.risk.halt_reason == "state_unwritable", (
+            f"boot {boot} did not reach the state this test is about"
+        )
+        # The roll could not be persisted, so every boot still owes the day.
+        assert engine.risk.snapshot.day_key == "2024-01-04"
+        last = engine
+        engine.stop()
+    assert last is not None
+    days = _recap_days(last)
+    assert days.count("2024-01-03") == 1, (
+        "an unwritable snapshot turned a crash loop into one message per boot: "
+        + repr(days)
+    )
+
+
+def test_an_unreadable_snapshot_still_announces_and_names_what_it_lost(
+    tmp_path,
+) -> None:
+    """The case a review of #198 asked for, whose OUTCOME this design changes.
+
+    `_persist_state` returns early on `state_unreadable`, so the roll never
+    lands and the snapshot carries no `day_key` at all. Against the first
+    version of this change, which read the owed day from the snapshot, that
+    meant a desk which could not read its own state announced NOTHING: #129's
+    silent miss, surviving in the exact state where an operator most needs the
+    record.
+
+    Deriving the owed day from the JOURNAL removes the dependency entirely.
+    The day is still announced, and the baseline, which really is gone, is
+    named as unmeasured rather than invented. Three unmeasured fields instead
+    of one is the honest reading of a day whose snapshot cannot be read.
+    """
+    clock = [datetime(2024, 1, 3, 12, tzinfo=timezone.utc)]
+    cfg = _cfg(tmp_path)
+    first = _engine(tmp_path, clock, cfg=cfg)
+    first.start()
+    first.step_all()
+    first.stop()
+
+    snapshot_path_for(cfg.journal_path).write_text("{not json at all", encoding="utf-8")
+    clock[0] = datetime(2024, 1, 4, 8, 0, tzinfo=timezone.utc)
+    second = _engine(tmp_path, clock, cfg=_cfg(tmp_path))
+    assert second.risk.halt_reason == "state_unreadable"
+    assert second.risk.snapshot.day_key == "", (
+        "an unreadable snapshot leaves no observed day, which is why the "
+        "snapshot cannot be what decides this"
+    )
+    second.start()
+    rows = _recaps(second)
+    assert len(rows) == 1, (
+        "a desk that cannot read its state said nothing about the day that "
+        f"ended while it was down: {rows}"
+    )
+    assert rows[0]["day"] == "2024-01-03"
+    assert sorted(rows[0]["unmeasured"]) == ["day_start", "equity", "pnl"]
+    assert "day_start" not in rows[0], "a baseline that is gone must not be invented"
+    second.stop()
+
+
+def test_a_first_ever_start_with_an_unreadable_snapshot_announces_nothing(
+    tmp_path,
+) -> None:
+    """The control for the case above: no session evidence, nothing owed.
+
+    The journal is the authority now, so the question is no longer "what does
+    the snapshot say" but "was this desk ever alive on a day that has ended".
+    A first boot has no `start` or `stop` row before today, so there is nothing
+    to announce and nothing is invented.
+    """
+    clock = [datetime(2024, 1, 4, 8, 0, tzinfo=timezone.utc)]
+    cfg = _cfg(tmp_path)
+    snapshot_path_for(cfg.journal_path).write_text("{not json at all", encoding="utf-8")
+    engine = _engine(tmp_path, clock, cfg=cfg)
+    engine.start()
+    assert _recaps(engine) == [], "a desk with no history invented a recap"
+    engine.stop()
+
+
+def test_a_rotation_between_two_boots_does_not_hide_the_ended_day(
+    tmp_path,
+) -> None:
+    """The `.1` read, pinned. Removing it costs a MISSED day, not a duplicate.
+
+    `last_session_day_before` scans the rotated file as well as the current
+    one, and its docstring says why: a 10MB rotation between two boots leaves
+    today's fresh journal with no `start` or `stop` row before today, so
+    nothing would be owed and the day would go out silently. Review of #198
+    removed that read and the whole suite stayed green, which is the shape this
+    repo keeps naming in `docs/TESTING.md`: a claim beside a mechanism,
+    correct about intent, with no reachable state in which its removal is
+    visible.
+
+    The DIRECTION of harm is what earns it a case of its own. The recap MARKER
+    is read from the current file only, so a rotation there costs one DUPLICATE
+    message; this read is what stops a MISS, and a silently missed day is #129
+    itself. The two are not symmetrical and only the duplicate side was
+    covered.
+
+    The rotation is driven by a rename rather than by writing 10MB, which is
+    exactly what `Journal._rotate_if_needed` does to get there.
+
+    THREE PRECONDITIONS MAKE THIS CASE CAPABLE OF REDDING, measured rather
+    than assumed, because dropping the `.1` read is an EQUIVALENT mutant
+    without all three. (1) A session row before today must exist in `.1`, or
+    both versions of the scan find nothing and neither owes the day. (2) No
+    session row before today may exist in the CURRENT file, or the mutated
+    scan finds the day there too and both announce. (3) No `recap` row
+    covering the ended day may be readable by the MARKER, which reads the
+    current file ONLY, or `_owed_recap_day` returns None on both trees. A
+    fresh current file supplies (2) and (3) at once, which is exactly what a
+    real rotation leaves behind, and the assertions below say so instead of
+    relying on it.
+
+    A `recap` row in `.1` ALONE does not break the red, because the marker
+    cannot see it. That asymmetry is the very thing this case exists to pin,
+    so it is stated here rather than discovered by the next person who tries
+    to strengthen the fixture.
+    """
+    clock = [datetime(2024, 1, 3, 12, tzinfo=timezone.utc)]
+    first = _engine(tmp_path, clock, cfg=_cfg(tmp_path))
+    first.start()
+    first.step_all()
+    first.stop()
+
+    live = tmp_path / "j.jsonl"
+    assert "2024-01-03" in live.read_text(encoding="utf-8"), (
+        "the fixture never wrote the session rows this test rotates away"
+    )
+    live.rename(tmp_path / "j.jsonl.1")
+    rotated = [
+        json.loads(line)
+        for line in (tmp_path / "j.jsonl.1").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    # P1. Without a session row in `.1` both versions of the scan find
+    # nothing, and the mutation is equivalent.
+    assert [r for r in rotated if r.get("event") in ("start", "stop")], (
+        "the rotated file holds no session row, so this case cannot red: "
+        "both versions of the scan would find nothing"
+    )
+    # P2 and P3 at once, because the current file does not exist at all: the
+    # mutated scan has no session row to find there, and the MARKER, which
+    # reads the current file only, has no `recap` row to find either. This is
+    # precisely the state a real rotation leaves between two boots.
+    assert not live.exists()
+
+    clock[0] = datetime(2024, 1, 4, 8, 0, tzinfo=timezone.utc)
+    second = _engine(tmp_path, clock, cfg=_cfg(tmp_path))
+    second.start()
+    rows = _recaps(second)
+    assert len(rows) == 1, (
+        "a journal rotation between two boots hid the day that ended and the "
+        f"recap was silently missed: {rows}"
+    )
+    assert rows[0]["day"] == "2024-01-03"
+    second.stop()
+
+
+def test_a_recap_row_is_not_evidence_that_the_desk_was_alive(tmp_path) -> None:
+    """`SESSION_EVENTS` scoping, pinned. An announcement cannot justify itself.
+
+    The scan is scoped to `start` and `stop` deliberately: a `recap` row also
+    carries `day`, so counting one as session evidence would let the
+    announcement stand in for the thing it announces. Review of #198 added
+    `"recap"` to `SESSION_EVENTS` and every case still passed, so the reasoning
+    was right and nothing held it.
+
+    THE RECAP ROW HERE NAMES A LATER DAY THAN THE SESSION ROWS, and that is
+    the precondition that makes this case capable of redding. A recap row
+    naming a day the session rows already name cannot red anything, because it
+    loses the `best < stamp` comparison either way; this one WINS it and
+    changes the answer. That is why the obvious version of this assertion, a
+    journal holding only recap rows, is not the one written here: it returns
+    nothing owed on both trees and the mutation is equivalent.
+
+    The second precondition is that a session row exists at all, and it is
+    enforced by the assertion VALUE rather than by a separate line: a scan that
+    found nothing would return the empty string and fail the comparison
+    against `2024-01-02`.
+    """
+    journal = Journal(tmp_path / "j.jsonl")
+    journal.write("start", day="2024-01-02")
+    journal.write("stop", day="2024-01-02")
+    journal.write("recap", day="2024-01-03")
+
+    assert journal.last_session_day_before("2024-01-04") == "2024-01-02", (
+        "a recap row counted as evidence the desk was alive on the day it "
+        "announced, which makes the announcement its own justification"
+    )
+
+    # The positive control, in the same case so it cannot drift from it: the
+    # scan CAN return 2024-01-03, so the assertion above is an exclusion by
+    # SCOPE and not an inability to see the row at all.
+    journal.write("start", day="2024-01-03")
+    assert journal.last_session_day_before("2024-01-04") == "2024-01-03", (
+        "the scan cannot report this day at all, so the assertion above "
+        "proves nothing about scoping"
+    )
