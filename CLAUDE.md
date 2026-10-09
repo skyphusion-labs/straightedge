@@ -11,8 +11,16 @@ The bot = the Python process (`src/straightedge/`). The desk = Telegram chat com
 agent = the Cloudflare Worker AI advisor (`agent/`, `AI_PROVIDER=computer`, routed through the
 AI Gateway named in README's Names table; `tests/test_venue_vocabulary.py` pins that literal
 gateway id, so this file points at README rather than restating it). `grok` and `claude` are
-the other two `AI_PROVIDER` values, BYOK straight to `api.x.ai` / `api.anthropic.com`, no
-gateway. The circuit = halt, daily-loss, and drawdown gates.
+the other two `AI_PROVIDER` values. `grok` is BYOK straight to `api.x.ai`. **`claude` routes
+by URL, not by a mode flag:** point `advice.claude_url` at a Cloudflare AI Gateway
+(`gateway.ai.cloudflare.com/...`) and it authenticates with `cf-aig-authorization` and sends
+no Anthropic key at all, because Unified Billing supplies the provider credential; leave it at
+`api.anthropic.com` and it stays BYOK with `x-api-key`. One credential field, `claude_key`,
+carries whichever token the URL implies. The URL decides so there is no second setting that
+can disagree with it, and a self-hoster with their own Anthropic key and no Cloudflare account
+keeps the original behaviour by changing nothing.
+
+The circuit = halt, daily-loss, and drawdown gates.
 
 ## Broker layer
 

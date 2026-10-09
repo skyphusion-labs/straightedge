@@ -469,7 +469,7 @@ class AdviceConfig:
     #: the send cap above cannot see this spend at all.
     max_turns_per_day: int = 0
     grok_model: str = "grok-4"
-    claude_model: str = "claude-sonnet-5"
+    claude_model: str = "claude-opus-5-5"
     grok_key: str = ""
     claude_key: str = ""
     grok_url: str = "https://api.x.ai/v1/chat/completions"
@@ -847,7 +847,7 @@ def load_config(path: str | Path | None = None) -> BotConfig:
             provider=provider if provider in {"grok", "claude", "computer"} else "grok",
             max_turns_per_day=int(advice_s.get("max_turns_per_day", 0)),
             grok_model=str(advice_s.get("grok_model", "grok-4")),
-            claude_model=str(advice_s.get("claude_model", "claude-sonnet-5")),
+            claude_model=str(advice_s.get("claude_model", "claude-opus-5-5")),
             grok_key=grok_key,
             claude_key=claude_key,
             grok_url=str(advice_s.get("grok_url", "https://api.x.ai/v1/chat/completions")),
