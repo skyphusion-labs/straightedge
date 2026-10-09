@@ -158,7 +158,7 @@ jobs:
           python-version: "3.12"
           cache: pip
       - run: pip install -e ".[dev]"
-      - run: ruff check src/
+      - run: ruff check src/ tests/
       - run: mypy src/straightedge
 
   # The org ruleset (aviation-grade-main-org, 18677665) requires status
