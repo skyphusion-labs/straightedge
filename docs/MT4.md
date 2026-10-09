@@ -702,6 +702,14 @@ Two layers, and only the second is a guarantee:
    | `claimed` | the shared name was already gone, so the Expert HAS it and may be executing it now. This is the ambiguous-money case. |
    | `locked` | still there and could not be removed. It can still fire, and `ttl_ms` is the only guard left. |
 
+   **This survives the shim hop.** With `mt4.mailbox_url` set, the withdrawal is
+   measured on the shim's host and travels back in the `504` refusal body as a
+   `withdrawal=` line, so an off-box desk reads the same three words a
+   co-located one does (#135). A body with no `withdrawal=` line, or one
+   carrying a word outside the three, reads as `claimed`: that is an old shim or
+   a confused one, and neither is a measurement. The key is read on a `504`
+   only, because a `503` means nothing was ever written.
+
 2. the Expert refuses a request older than its `ttl_ms`. This is the layer that
    survives the desk not being there any more, and it is the only one that does.
 
