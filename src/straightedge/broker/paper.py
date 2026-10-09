@@ -10,6 +10,7 @@ Pending limit/stop orders fill on tick (bid/ask vs price) or on bar
 
 from __future__ import annotations
 
+import math
 from dataclasses import replace
 
 from straightedge.constants import (
@@ -432,6 +433,32 @@ class PaperBroker:
         if pos is None:
             return OrderResult(retcode=TRADE_RETCODE_POSITION_CLOSED, comment="gone", request=request)
         volume = float(request.get("volume", pos.volume))
+        # SECOND LAYER, AND IT IS UNREACHABLE THROUGH THE DESK TODAY (#210).
+        # `Engine.close_ticket` refuses a non-finite volume before it gets
+        # here, and the only other volume that reaches this method is a stored
+        # scale-out, which `normalize_volume` has already validated. So no live
+        # path arrives here non-finite, and that is stated rather than implied.
+        #
+        # It is kept, and it is a gate rather than decoration, because the
+        # consequence is asymmetric. Both comparisons below are False for a
+        # non-finite operand, so without this the request falls through to the
+        # partial-close branch and runs
+        # `self._balance += pnl * (volume / pos.volume)` and
+        # `pos.volume = round(pos.volume - volume, 8)`, then returns DONE. The
+        # account and the book are `nan` for the rest of the session, nothing
+        # later can recover either, and the caller is told the close succeeded.
+        # A wrong reason word is cosmetic; this is irreversible, and refusing a
+        # request it cannot send is the adapter's own job rather than something
+        # it should rely on one caller to do.
+        #
+        # The PR's mutation table is the proof this can fire: with the engine
+        # guard removed, the adapter test is what still reds.
+        if not math.isfinite(volume):
+            return OrderResult(
+                retcode=TRADE_RETCODE_INVALID_VOLUME,
+                comment="close volume not finite",
+                request=request,
+            )
         if volume > pos.volume + 1e-12:
             return OrderResult(retcode=TRADE_RETCODE_INVALID_VOLUME, comment="close volume", request=request)
         spec = self.symbol(pos.symbol)

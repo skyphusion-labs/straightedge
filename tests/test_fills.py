@@ -1,7 +1,9 @@
+import math
 from dataclasses import replace
 from datetime import datetime, timezone
 
 from straightedge.broker.paper import PaperBroker, default_spec
+from straightedge.constants import TRADE_RETCODE_INVALID_VOLUME
 from straightedge.config import BotConfig
 from straightedge.engine import Engine
 from straightedge.models import Bar
@@ -904,3 +906,173 @@ def test_an_ordinary_replacement_still_succeeds(tmp_path) -> None:
     )
     engine.stop()
     assert f"replace #{order.ticket}" in reply, reply
+
+
+# --- #210: a non-finite close volume -------------------------------------
+
+
+def _one_open_position(engine):
+    """One ordinary long, so a close has something real to act on."""
+    engine.handle_command(TgCommand("1", 1, "/buy EURUSD", 1))
+    engine.handle_command(TgCommand("1", 1, "/confirm", 2))
+    return engine.broker.positions()[0]
+
+
+def test_close_with_a_non_finite_volume_refuses_and_does_not_answer_closed(tmp_path) -> None:
+    """#210, P0. `nan <= 0` is False, so the one volume guard passed it through.
+
+    THE OUTCOME WAS WRONG IN THE DANGEROUS DIRECTION, which is why this asserts
+    the REPLY and the book together. Measured on the pre-fix tree, `/close
+    TICKET nan` answered `closed` while the position stayed open, and the
+    partial-close arithmetic then wrote `nan` into BOTH `pos.volume` and the
+    account balance: `_balance += pnl * (nan / pos.volume)`.
+
+    So an assertion that the position is still open passes BEFORE the fix and
+    proves nothing; pre-fix it was still open too, just corrupted. The
+    discriminating assertions are that the reply is not `closed`, and that
+    equity is still a number, since every circuit gate reads equity and a `nan`
+    equity makes daily-loss and drawdown comparisons False forever.
+    """
+    import math
+
+    for value in (math.nan, -math.nan):
+        engine = _engine(tmp_path / f"c{value}")
+        pos = _one_open_position(engine)
+        before = pos.volume
+        reply = engine.handle_command(
+            TgCommand("1", 1, f"/close {pos.ticket} {value}", 3)
+        )
+        assert reply != "closed", f"volume={value} answered closed"
+        assert "volume_unusable" in reply, f"volume={value}: {reply}"
+        still = engine.broker.positions()
+        assert still, f"volume={value} removed the position"
+        assert still[0].volume == before, f"volume={value} changed the position volume"
+        acct = engine.broker.account()
+        assert math.isfinite(acct.balance), f"volume={value} corrupted balance"
+        assert math.isfinite(acct.equity), f"volume={value} corrupted equity"
+
+
+def test_close_volume_refusal_names_the_value_for_every_unusable_kind(tmp_path) -> None:
+    """One reason WORD, the value carrying the diagnosis.
+
+    `inf` and `-inf` were already safe pre-fix, by two different accidents:
+    `inf > pos.volume + 1e-12` is True so the adapter rejected it as too large,
+    and `-inf <= 0` is True so the old guard caught it. Both were reported as
+    something they are not, `inf` as an over-large volume rather than an
+    unreadable one. They are pinned here so a future change cannot quietly
+    reclassify them, and so the refusal reads the same for every kind.
+    """
+    import math
+
+    for value in (math.inf, -math.inf, 0.0, -0.5):
+        engine = _engine(tmp_path / f"k{value}")
+        pos = _one_open_position(engine)
+        reply = engine.handle_command(
+            TgCommand("1", 1, f"/close {pos.ticket} {value}", 3)
+        )
+        assert "refused: volume_unusable:" in reply, f"volume={value}: {reply}"
+        assert str(value) in reply, f"volume={value} not named in {reply}"
+        assert engine.broker.positions(), f"volume={value} closed something"
+
+
+def test_an_ordinary_partial_close_still_works(tmp_path) -> None:
+    """CONTROL. A guard that refuses everything would satisfy the tests above."""
+    engine = _engine(tmp_path / "ok")
+    pos = _one_open_position(engine)
+    # SNAPSHOT FIRST. `PaperBroker` hands out live references to a mutable
+    # dataclass, which `Engine._close` comments on for the same reason, so
+    # reading `pos.volume` after the close reads the ALREADY-REDUCED value and
+    # the arithmetic below silently compares the result against itself. Caught
+    # by this control failing pre-fix, which is what a control is for.
+    before = pos.volume
+    half = round(before / 2, 2)
+    reply = engine.handle_command(TgCommand("1", 1, f"/close {pos.ticket} {half}", 3))
+    assert reply == "closed", reply
+    still = engine.broker.positions()
+    assert still, "a partial close removed the whole position"
+    assert abs(still[0].volume - (before - half)) < 1e-9, still[0].volume
+    assert math.isfinite(engine.broker.account().balance)
+
+
+def test_a_full_close_still_works(tmp_path) -> None:
+    """CONTROL, the other direction: the whole-position close is untouched."""
+    engine = _engine(tmp_path / "full")
+    pos = _one_open_position(engine)
+    reply = engine.handle_command(TgCommand("1", 1, f"/close {pos.ticket}", 3))
+    assert reply == "closed", reply
+    assert not engine.broker.positions(), "a full close left the position open"
+
+
+def test_scale_out_with_a_non_finite_volume_refuses_instead_of_escaping(tmp_path) -> None:
+    """Same family, second entry point, and `inf` ESCAPED the desk entirely.
+
+    `_set_scale_out` passes the operator volume to `normalize_volume`, which
+    does `math.floor(raw / step + 1e-12)`. Measured pre-fix on the operator
+    route: `nan` surfaced the interpreter's own words, `cannot convert float
+    NaN to integer`, and **`inf` raised OverflowError, which is not a
+    ValueError and is not in the `(ValueError, RuntimeError, OSError)` tuple
+    `handle_command` and `poll_telegram` catch.** So `/tp TICKET PX inf` left
+    the desk's command handler by an uncaught exception.
+
+    That is an availability defect rather than a wrong report, so it is
+    asserted as a reply arriving at all, and specifically as the same named
+    refusal the close path gives, not as an interpreter message.
+    """
+    import math
+
+    for value in (math.nan, math.inf, -math.inf):
+        engine = _engine(tmp_path / f"s{value}")
+        pos = _one_open_position(engine)
+        px = round(pos.price_open + 0.005, 5)
+        reply = engine.handle_command(
+            TgCommand("1", 1, f"/tp {pos.ticket} {px} {value}", 3)
+        )
+        assert "refused: volume_unusable:" in reply, f"volume={value}: {reply}"
+        assert "convert float" not in reply, f"volume={value} leaked internals: {reply}"
+        assert not engine._scale_outs, f"volume={value} stored a scale-out"
+
+
+def test_an_ordinary_scale_out_still_works(tmp_path) -> None:
+    """CONTROL for the scale-out guard."""
+    engine = _engine(tmp_path / "sok")
+    pos = _one_open_position(engine)
+    px = round(pos.price_open + 0.005, 5)
+    half = round(pos.volume / 2, 2)
+    reply = engine.handle_command(TgCommand("1", 1, f"/tp {pos.ticket} {px} {half}", 3))
+    assert "refused" not in reply, reply
+    assert engine._scale_outs, "an ordinary scale-out was not stored"
+
+
+def test_the_adapter_refuses_a_non_finite_close_volume_on_its_own(tmp_path) -> None:
+    """SECOND LAYER, and it is unreachable through the desk by design.
+
+    The engine guard above means no live path can hand `paper.py` a non-finite
+    volume, so this calls the adapter directly. It is kept because the
+    consequence is asymmetric: a wrong reason word is cosmetic, while
+    `_balance += pnl * (nan / pos.volume)` and `pos.volume = round(pos.volume -
+    nan, 8)` corrupt the account and the book irreversibly for the rest of the
+    session, and every circuit gate then reads a `nan` equity.
+
+    Proof that this layer is a gate and not decoration is in the PR's mutation
+    table: with the engine guard removed, this test is what still reds.
+    """
+    import math
+
+    engine = _engine(tmp_path / "adapter")
+    pos = _one_open_position(engine)
+    before_vol = pos.volume
+    before_bal = engine.broker.account().balance
+    result = engine.broker.close_position(
+        pos.ticket,
+        symbol=pos.symbol,
+        side=pos.side.value,
+        volume=math.nan,
+        price=engine.broker.tick(pos.symbol).bid,
+        comment="direct",
+        magic=engine.cfg.risk.magic,
+        deviation=20,
+    )
+    assert not result.ok, "the adapter accepted a non-finite close volume"
+    assert result.retcode == TRADE_RETCODE_INVALID_VOLUME, result.retcode
+    assert engine.broker.positions()[0].volume == before_vol
+    assert engine.broker.account().balance == before_bal

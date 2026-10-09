@@ -44,6 +44,7 @@ from straightedge.sizing import (
     money_per_lot_at_stop,
     normalize_volume,
     unusable_stop,
+    unusable_volume,
 )
 from straightedge.state import snapshot_path_for
 from straightedge.strategy import TrendStrategy
@@ -1696,8 +1697,32 @@ class Engine:
         pos = self._pos(ticket)
         if pos is None:
             return "no such ticket"
-        if volume is not None and volume <= 0:
-            raise ValueError("volume must be > 0")
+        if volume is not None:
+            # A NON-FINITE VOLUME IS NOT A MAGNITUDE PROBLEM (#210), and this
+            # is the guard that has to catch it, because NOTHING downstream
+            # does. That is what separates this from #187 and #208, where the
+            # outcome was already safe and only the reason was wrong.
+            #
+            # Measured on the pre-fix tree, via the operator route: `nan <= 0`
+            # is False, so `nan` passed the magnitude guard that used to be the
+            # whole of this check. `paper.py::_close` then let it through both
+            # of ITS comparisons for the same reason, since `nan > vol + 1e-12`
+            # and `abs(nan - vol) < 1e-12` are both False, so it fell to the
+            # partial-close branch and ran
+            # `self._balance += pnl * (nan / pos.volume)` followed by
+            # `pos.volume = round(pos.volume - nan, 8)`. The desk answered
+            # `closed`; the position was still on the book with a `nan` volume
+            # and the account balance was `nan`.
+            #
+            # The severity is the blinding, not the failed close. Every circuit
+            # gate reads equity, and a `nan` equity compares False against the
+            # daily-loss and drawdown bounds forever, so this one bad input
+            # disables the guards that exist to catch the next one. An operator
+            # told they are flat, who is not, then trades against a book they
+            # believe is empty with the risk engine silently inert.
+            bad = unusable_volume(volume)
+            if bad is not None:
+                raise ValueError(f"refused: {bad}")
         result = self._close(pos, reason, volume)
         if not result.ok:
             return f"close failed retcode={result.retcode} {result.comment}"
@@ -1759,6 +1784,31 @@ class Engine:
         trip = self.risk.circuit(self.broker.account(), self.now_fn())
         if not trip.allowed:
             return f"refused: {trip.reason}"
+        # SAME FAMILY, SECOND ENTRY POINT, AND THIS ONE ESCAPED THE DESK
+        # (#210). `normalize_volume` computes
+        # `math.floor(raw / spec.volume_step + 1e-12)`, and `math.floor` refuses
+        # a non-finite argument with TWO different exceptions: ValueError for
+        # `nan`, but **OverflowError for `inf`**. OverflowError derives from
+        # ArithmeticError, not from ValueError, so it is not in the
+        # `(ValueError, RuntimeError, OSError)` tuple that `handle_command` and
+        # `poll_telegram` catch.
+        #
+        # Measured on the operator route pre-fix: `/tp TICKET PX inf` left the
+        # command handler by an UNCAUGHT exception, and `/tp TICKET PX nan`
+        # replied with the interpreter's own words, `cannot convert float NaN to
+        # integer`. One is an availability defect and the other leaks internals
+        # where a refusal belongs.
+        #
+        # So refuse before the arithmetic rather than widening an except clause
+        # after it: the operator gets the same named refusal `/close` gives, and
+        # the desk is not asked to survive an exception class it never
+        # classified. Placed here, immediately before the arithmetic, rather
+        # than at the top of the function, so that no currently reachable
+        # refusal changes precedence; the only behaviour that moves is the
+        # non-finite case, which had none worth keeping.
+        bad = unusable_volume(volume)
+        if bad is not None:
+            return f"refused: {bad}"
         spec = self.broker.symbol(pos.symbol)
         vol = normalize_volume(volume, spec)
         if vol <= 0:
