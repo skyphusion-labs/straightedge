@@ -38,7 +38,12 @@ from straightedge.risk import (
     currency_exposure,
     day_key,
 )
-from straightedge.sizing import MissingStop, money_per_lot_at_stop, normalize_volume
+from straightedge.sizing import (
+    MissingStop,
+    money_per_lot_at_stop,
+    normalize_volume,
+    unusable_stop,
+)
 from straightedge.state import snapshot_path_for
 from straightedge.strategy import TrendStrategy
 from straightedge.telegram import TelegramClient, TgCommand
@@ -1770,6 +1775,26 @@ class Engine:
         else:
             return "working kind must be limit or stop"
         sl, tp = order.sl, order.tp
+        # A NON-FINITE STOP IS NOT A GEOMETRY PROBLEM (#208), and this has to run
+        # BEFORE the comparisons below or the operator is told the wrong thing.
+        #
+        # Measured on the pre-fix tree: with `sl = nan`, `nan < px` is False, so
+        # the buy arm returned "buy needs sl < entry < tp" and the arithmetic was
+        # never reached. The outcome was already safe, nothing was sent and the
+        # order did not move, so the defect was entirely in the REASON: a corrupt
+        # venue field reported as a stop/entry/target ordering mistake sends the
+        # operator to re-read geometry they got right instead of to the venue.
+        #
+        # This consults `unusable_stop`, the same authority `money_per_lot_at_stop`
+        # raises from, rather than comparing again here. This is about naming,
+        # not about safety: the outcome was already a refusal.
+        #
+        # `_stop_guard` already carries the finiteness check on the POSITION path
+        # (`if not math.isfinite(sl)`), earned by a measured -$58,058 run, so this
+        # brings the working-order path level with it.
+        bad_stop = unusable_stop(sl)
+        if bad_stop is not None:
+            return f"refused: {bad_stop}"
         if order.side.value == "buy" and not (sl < px and (tp <= 0 or px < tp)):
             return "buy needs sl < entry < tp"
         if order.side.value == "sell" and not (sl > px and (tp <= 0 or tp < px)):
@@ -1819,8 +1844,22 @@ class Engine:
             # WHAT IS ALREADY RESTING, measured the same way, because the question
             # the cap should ask is whether this replacement ADDS risk (#164).
             worst_resting = money_per_lot_at_stop(order.price, order.sl, spec) * order.volume
-        except MissingStop:
-            return "refused: sl_required"
+        except MissingStop as exc:
+            # TRIPWIRE, NOT A GATE, and the same idiom `risk.currency_exposure`
+            # uses for `UnclassifiedSymbol`. Both calls above receive the SAME
+            # `sl` that `unusable_stop` validated a few lines up, so by
+            # construction this cannot fire today, and a mutation that replaces
+            # `exc.reason` with a hardcoded string leaves the whole suite green.
+            # That is recorded rather than papered over: an unreachable branch
+            # cannot be covered, and a test pretending to cover it would be the
+            # decorative kind.
+            #
+            # It is kept because the NAME still comes from the exception rather
+            # than from this call site. A future refactor that removes or
+            # reorders the early check, or a new caller that reaches the
+            # arithmetic another way, then produces the correct reason instead
+            # of silently reverting to a hardcoded one.
+            return f"refused: {exc.reason}"
         account = self.broker.account()
         r = self.cfg.risk
         per_trade = account.equity * r.risk_pct * r.max_risk_multiple
