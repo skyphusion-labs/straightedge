@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from straightedge.models import VenueClock
 from straightedge.__main__ import build_parser, main, paper_round_trip, run_loop, telegram_ping
 from straightedge.config import BotConfig, TelegramConfig
 from straightedge.journal import InstanceLock, InstanceLockError, Journal, lock_path_for
@@ -68,6 +69,14 @@ class _FakeConnectBroker:
         self.calls.append("rates")
         return _healthy_rates(name, timeframe, count)
 
+    # A venue has to be able to state its clock (straightedge#172).
+    # Zero is this fake stamping UTC, which keeps THIS test's
+    # subject unchanged; the clock's own suite is
+    # tests/test_venue_clock.py.
+    def venue_clock(self, name, *, max_staleness_sec=None):
+        del name, max_staleness_sec
+        return VenueClock.declared(0, source="fake")
+
 
 def test_doctor(capsys, monkeypatch) -> None:
     monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
@@ -128,6 +137,14 @@ def test_doctor_connect_mt4(capsys, monkeypatch, tmp_path) -> None:
         def rates(self, name, timeframe, count):
             self.calls.append("rates")
             return _healthy_rates(name, timeframe, count)
+
+        # A venue has to be able to state its clock (straightedge#172).
+        # Zero is this fake stamping UTC, which keeps THIS test's
+        # subject unchanged; the clock's own suite is
+        # tests/test_venue_clock.py.
+        def venue_clock(self, name, *, max_staleness_sec=None):
+            del name, max_staleness_sec
+            return VenueClock.declared(0, source="fake")
 
     monkeypatch.setattr("straightedge.broker.mt4_live.Mt4Broker", FakeMt4Broker)
     assert main(["doctor", "--connect"]) == 0
@@ -289,6 +306,14 @@ def test_doctor_connect_falls_back_to_connect(capsys, monkeypatch) -> None:
             self.calls.append("rates")
             return _healthy_rates(name, timeframe, count)
 
+        # A venue has to be able to state its clock (straightedge#172).
+        # Zero is this fake stamping UTC, which keeps THIS test's
+        # subject unchanged; the clock's own suite is
+        # tests/test_venue_clock.py.
+        def venue_clock(self, name, *, max_staleness_sec=None):
+            del name, max_staleness_sec
+            return VenueClock.declared(0, source="fake")
+
     monkeypatch.setattr("straightedge.broker.mt5_live.load_mt5_module", lambda: object())
     monkeypatch.setattr("straightedge.broker.mt5_live.Mt5Broker", NoEnsure)
     assert main(["doctor", "--connect"]) == 0
@@ -331,6 +356,14 @@ def test_doctor_connect_disconnect_error_still_ok(capsys, monkeypatch) -> None:
 
         def rates(self, name, timeframe, count):
             return _healthy_rates(name, timeframe, count)
+
+        # A venue has to be able to state its clock (straightedge#172).
+        # Zero is this fake stamping UTC, which keeps THIS test's
+        # subject unchanged; the clock's own suite is
+        # tests/test_venue_clock.py.
+        def venue_clock(self, name, *, max_staleness_sec=None):
+            del name, max_staleness_sec
+            return VenueClock.declared(0, source="fake")
 
         def disconnect(self) -> None:
             raise RuntimeError("shutdown")

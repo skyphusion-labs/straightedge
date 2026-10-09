@@ -70,6 +70,15 @@ Timeframes: M1=1, M5=5, M15=15, M30=30, H1=16385, H4=16388, D1=16408.
 
 `symbol_info_tick` returns `bid`, `ask`, `last`, `time`, `volume`.
 
+**Both `time` fields are the TRADE SERVER's wall clock, not UTC, and the
+package has no call that states the difference.** That was measured as a
+live defect on the MT4 path (straightedge#172) and MT5 behaves identically
+here, so the adapter is fixed identically: `Mt5Broker.venue_clock` measures
+the offset by pairing `symbol_info_tick().time` with the desk's own UTC
+clock, read either side of the call, and the engine converts bar time with
+it before any gate sees an instant. An unmeasurable offset REFUSES; see
+`docs/VENUE.md`. Nothing here is verified against a live MT5 terminal.
+
 ## Trade request (`order_send` / `order_check`)
 
 Dict mapped onto `MqlTradeRequest`:

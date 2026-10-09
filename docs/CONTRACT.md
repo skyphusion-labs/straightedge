@@ -238,6 +238,36 @@ Trail default is off.
 Manual `/buy` `/sell` skip the session window.
 Auto does not.
 
+### One clock: the UTC day, and the venue offset is measured
+
+Every boundary in this file is the UTC day and the UTC wall clock: the session
+window, `skip_friday_after_utc`, the Saturday/Sunday block, `day_key`, the
+daily-loss budget, the two daily caps and the recap. There is no broker day
+anywhere in the contract.
+
+That had to be DECIDED rather than assumed, because before straightedge#172 it
+was accidentally both. MT4 and MT5 stamp bars with the broker server's own wall
+clock, the auto leg built its instant from the last bar's stamp and labelled it
+UTC without converting it, and the desk and recap paths used the bot's clock.
+One daily-loss budget had two different day boundaries, and which one applied
+depended on whether a human or the regime fired the trade. On the live UTC+3
+server the auto leg ran three hours early, which moved a configured 07:00-17:00
+window to 04:00-14:00 and let a `daily_loss` halt release three hours before
+the UTC day it was measured in had ended.
+
+The UTC day is the boundary, for three reasons. The operator's config is
+written in UTC (`start_utc`, `end_utc`, `skip_friday_after_utc`), so a budget
+on any other boundary is a budget the operator cannot see. The desk, the recap
+and the persisted `day_key` already roll on it. And a broker day is a
+per-server, DST-varying property, so keying the money budget to it would key it
+to something that moves without anyone editing anything.
+
+A bar's timestamp is therefore CONVERTED to UTC at the one seam where it enters
+the engine, using an offset measured off the venue (`docs/VENUE.md`, "The
+venue's clock is not UTC"). When that offset cannot be measured the auto leg
+REFUSES with `venue_clock_unmeasured` rather than assuming UTC. Manual commands
+are unaffected: they time themselves off the bot's clock and never off a bar.
+
 ## Loop survival
 
 `run --loop` retries Telegram HTTP 429 and 5xx with backoff.
