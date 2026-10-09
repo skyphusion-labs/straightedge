@@ -311,24 +311,36 @@ def test_doctor_names_the_keys_and_never_the_values(
         assert value not in out, "doctor printed a secret VALUE"
 
 
-def test_doctor_labels_a_gateway_credential_by_function(tmp_path, capsys) -> None:
+def test_doctor_labels_a_gateway_credential_by_function(
+    tmp_path: Path, clean_env: None, capsys
+) -> None:
     """With an AI Gateway URL, doctor must not call the token an Anthropic key.
 
-    The pre-live check is the one place an operator reads to find out what the
+    THIS TEST DRIVES DOCTOR. An earlier version of it asserted `_is_cf_gateway`
+    directly, took `tmp_path` and `capsys` and used neither, and therefore left
+    exactly the state its own docstring promised to prevent: with the label
+    hardcoded to the anthropic wording in BOTH branches, both doctor tests still
+    passed. A test that names a guarantee it does not provide is worse than no
+    test, because it is counted.
+
+    The pre-live check is the one screen an operator reads to find out what the
     desk thinks it holds. Calling a Cloudflare token "anthropic key" there is
-    wrong by function, and it is wrong in the direction that wastes the most time:
-    the operator goes looking for an Anthropic account they do not need.
-
-    This is the OTHER branch of the conditional asserted above. Without both, the
-    label could be hardcoded to either wording and one test would still pass.
+    wrong by function and wrong in the expensive direction: it sends them looking
+    for an Anthropic account they do not need.
     """
-    from straightedge.llm import _is_cf_gateway
+    from straightedge.__main__ import main
 
-    gw = (
-        "https://gateway.ai.cloudflare.com/v1/acct/mygw/anthropic/v1/messages"
+    path = _write(
+        tmp_path,
+        '[account]\nmode = "paper"\n\n[advice]\n'
+        'claude_url = "https://gateway.ai.cloudflare.com/v1/a/g/anthropic/v1/messages"\n'
+        'claude_key = "cf-token-value"\n',
     )
-    assert _is_cf_gateway(gw), "fixture URL must be recognised as a gateway"
-    assert not _is_cf_gateway("https://api.anthropic.com/v1/messages")
+    main(["--config", path, "doctor"])
+    out = capsys.readouterr().out
+    assert "claude credential (cloudflare gateway token): SET" in out
+    assert "anthropic key" not in out, "a gateway token labelled as an Anthropic key"
+    assert "cf-token-value" not in out, "doctor printed a secret VALUE"
 
 
 def test_doctor_names_the_environment_as_the_source_when_it_wins(
