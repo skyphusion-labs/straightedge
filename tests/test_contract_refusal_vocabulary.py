@@ -179,3 +179,73 @@ def test_prose_refusals_are_pinned_rather_than_ignored() -> None:
         f"{PINNED_PROSE!r}. A new one is either a reason word that should be "
         "named and documented, or prose that belongs in this pin."
     )
+
+
+#: Module-level `unusable_*` functions in `sizing.py` whose words are
+#: DELIBERATELY NOT operator vocabulary, with the reason, so the exclusion is a
+#: decision on the record instead of an omission.
+#:
+#: `unusable_price` (#221) returns `"unreadable"` and `"absent"`. Both are
+#: INTERNAL discriminators: `engine.py` consumes them as
+#: `unusable_price(value) == "unreadable"` and raises `RuntimeError` with prose
+#: ("unreadable tick for EURUSD: bid=nan ..."), so neither word is ever rendered
+#: after `refused: `. Documenting them in the contract's refusal table would
+#: tell an operator to expect a reply they can never receive.
+NOT_OPERATOR_VOCABULARY = frozenset({"unusable_price"})
+
+
+def _unusable_functions() -> frozenset[str]:
+    """Every module-level `unusable_*` function `sizing.py` defines."""
+    import ast
+
+    tree = ast.parse((SRC / "sizing.py").read_text(encoding="utf-8"))
+    return frozenset(
+        node.name
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name.startswith("unusable_")
+    )
+
+
+def test_every_refusal_authority_is_classified() -> None:
+    """A NEW authority function must be classified by a person, not guessed.
+
+    `REASON_AUTHORITIES` is a hardcoded tuple, and hardcoding is CORRECT here:
+    whether a word reaches the operator is a fact about how `engine.py` renders
+    it, which cannot be derived from the function's name. Auto-discovering every
+    `unusable_*` function would wrongly demand that `unusable_price`'s internal
+    discriminators be documented as refusals.
+
+    But a hardcoded list has the failure mode `scan_decision_reasons` was added
+    for: **the population moves and the scanner does not notice.** #221 added a
+    third authority beside the two this file was written against, and nothing
+    here would have said so.
+
+    So the list is not auto-derived, it is RECONCILED: every `unusable_*`
+    function must be either operator vocabulary or explicitly excluded with a
+    reason. A fourth one fails here until somebody decides which it is.
+
+    Deliberately tolerant of both trees: this passes whether or not
+    `unusable_price` is present, because it asserts that nothing is
+    UNCLASSIFIED rather than pinning an exact set, and the set legitimately
+    differs across a merge boundary.
+    """
+    from refusal_scan import REASON_AUTHORITIES
+
+    found = _unusable_functions()
+    classified = frozenset(REASON_AUTHORITIES) | NOT_OPERATOR_VOCABULARY
+    unclassified = sorted(found - classified)
+    assert not unclassified, (
+        f"sizing.py defines {unclassified!r}, which is neither in "
+        "REASON_AUTHORITIES (its words reach the operator as `refused: "
+        "<reason>` and must be in docs/CONTRACT.md) nor in "
+        "NOT_OPERATOR_VOCABULARY (its words are internal and must say why). "
+        "Decide which, rather than leaving the vocabulary silently short."
+    )
+    # And the vocabulary authorities must actually EXIST, so a rename cannot
+    # quietly empty the list while this test still passes.
+    missing = sorted(frozenset(REASON_AUTHORITIES) - found)
+    assert not missing, (
+        f"REASON_AUTHORITIES names {missing!r}, which sizing.py does not "
+        "define; the vocabulary scan is reading nothing for those"
+    )
