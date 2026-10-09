@@ -45,6 +45,7 @@ from pathlib import Path
 
 import pytest
 
+from straightedge.models import VenueClock
 from straightedge.broker.mt4_live import FileBridge, Mt4Broker
 from straightedge.config import BotConfig
 from straightedge.engine import Engine, _format_event
@@ -649,6 +650,14 @@ class TestDoctorGate:
                     )
                 return HistoryProbe(bars=[], bars_total=0, selected=True, history_error=0)
 
+            # A venue has to be able to state its clock (straightedge#172).
+            # Zero is this fake stamping UTC, which keeps THIS test's
+            # subject unchanged; the clock's own suite is
+            # tests/test_venue_clock.py.
+            def venue_clock(self, name, *, max_staleness_sec=None):
+                del name, max_staleness_sec
+                return VenueClock.declared(0, source="fake")
+
         monkeypatch.setattr("straightedge.broker.mt4_live.Mt4Broker", ColdEurusd)
         monkeypatch.setattr("straightedge.history.ATTEMPTS", 2)
         rc = main(["--config", str(cfg_path), "doctor", "--connect"])
@@ -709,6 +718,14 @@ class TestDoctorGate:
 
             def rates(self, name, timeframe, count):
                 return warm(200)
+
+            # A venue has to be able to state its clock (straightedge#172).
+            # Zero is this fake stamping UTC, which keeps THIS test's
+            # subject unchanged; the clock's own suite is
+            # tests/test_venue_clock.py.
+            def venue_clock(self, name, *, max_staleness_sec=None):
+                del name, max_staleness_sec
+                return VenueClock.declared(0, source="fake")
 
         monkeypatch.setattr("straightedge.broker.mt4_live.Mt4Broker", Warm)
         rc = main(["--config", str(cfg_path), "doctor", "--connect"])
