@@ -7,26 +7,63 @@ from straightedge.config import AdviceConfig, BotConfig, load_config
 
 # --- model pin is current generation (#15 item 5) ---------------------------
 #
-# Denominator: 3 places in src/ + config.example.toml name a Claude model.
-# One is stale. grok_model ("grok-4") and computer_model ("xai/grok-4.6")
-# were checked too and are current; not touched.
+# Denominator: 4 shipped places name a Claude model -- the dataclass default and
+# the load_config fallback in src/straightedge/config.py, plus config.example.toml
+# and config.handover.toml. The handover file is the one that reaches a customer
+# and it is the one that rots unseen: it sat on `claude-sonnet-4-5` while the
+# example file had already moved to `claude-sonnet-5`, so the two shipped configs
+# disagreed by a generation and no test looked at the handover one.
+# These pins exist so a model id cannot go stale silently; when they fail, move
+# every site in the list above, not only the one that failed.
+
+
+def test_shipped_configs_agree_on_the_claude_model() -> None:
+    """The two shipped configs must name the SAME Claude model.
+
+    This is the gate the per-file pins above did not provide. `config.example.toml`
+    moved to `claude-sonnet-5` and `config.handover.toml` stayed on
+    `claude-sonnet-4-5`, a generation apart, because every pin asserted a literal
+    and none compared the files to each other. The handover file is the one a
+    customer runs, so it is the worst one to leave behind and the least likely to
+    be read. Comparing them means a future bump cannot move one and forget the
+    other, whichever direction the drift goes.
+    """
+    import re
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    found = {}
+    for name in ("config.example.toml", "config.handover.toml"):
+        text = (root / name).read_text(encoding="utf-8")
+        m = re.search(r'^claude_model\s*=\s*"([^"]+)"', text, re.M)
+        assert m, f"{name} does not name a claude_model"
+        found[name] = m.group(1)
+    assert len(set(found.values())) == 1, f"shipped configs disagree: {found}"
+
+    from straightedge.config import AdviceConfig
+
+    shipped = next(iter(found.values()))
+    assert shipped == AdviceConfig().claude_model, (
+        f"shipped configs say {shipped!r}, dataclass default says "
+        f"{AdviceConfig().claude_model!r}"
+    )
 
 
 def test_advice_config_default_claude_pin_is_current() -> None:
-    assert AdviceConfig().claude_model == "claude-sonnet-5"
+    assert AdviceConfig().claude_model == "claude-opus-5-5"
 
 
 def test_load_config_default_claude_pin_is_current(tmp_path) -> None:
     path = tmp_path / "config.toml"
     path.write_text("[telegram]\ntoken = \"t\"\nchat_id = \"1\"\n", encoding="utf-8")
     cfg = load_config(path)
-    assert cfg.advice.claude_model == "claude-sonnet-5"
+    assert cfg.advice.claude_model == "claude-opus-5-5"
 
 
 def test_example_config_claude_pin_is_current() -> None:
     root = Path(__file__).resolve().parents[1]
     cfg = load_config(root / "config.example.toml")
-    assert cfg.advice.claude_model == "claude-sonnet-5"
+    assert cfg.advice.claude_model == "claude-opus-5-5"
 
 
 def test_example_config_loads() -> None:

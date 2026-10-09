@@ -238,19 +238,41 @@ class Advisor:
         return str(choices[0].get("message", {}).get("content") or "")
 
     def _claude(self, user: str) -> str:
+        # max_tokens is 8192, not the 800 this carried before, and the reason is
+        # specific to the current models rather than a preference for long answers.
+        # On claude-opus-5-5 thinking is ALWAYS ON and cannot be disabled, and
+        # thinking tokens count against this ceiling. At 800 a real snapshot
+        # question can spend the budget before producing any text, and the block
+        # loop below only collects `type == "text"`, so the desk would receive an
+        # empty string and report it as advice rather than as a failure. The reply
+        # itself stays short because SYSTEM asks for a short reply, not because the
+        # ceiling forces it.
+        body = {
+            "model": self.cfg.claude_model,
+            "max_tokens": 8192,
+            "system": SYSTEM,
+            "messages": [*self._memory, {"role": "user", "content": user}],
+            # Effort is stated rather than defaulted: claude-opus-5-5 defaults to
+            # `medium` where the previous generation defaulted to `high`, so an
+            # unstated effort silently changes depth when the model id moves.
+            "output_config": {"effort": "medium"},
+        }
+        # ONE credential field, TWO endpoint shapes. Routing through a Cloudflare
+        # AI Gateway means the gateway authenticates the caller and supplies the
+        # provider credential itself (Unified Billing), so the Anthropic key is
+        # neither sent nor needed; `claude_key` then carries the Cloudflare token.
+        # Pointing `claude_url` straight at api.anthropic.com keeps the original
+        # BYOK behaviour for a self-hoster with their own key. The URL decides,
+        # so neither operator has to set a mode flag that could disagree with it.
+        if "gateway.ai.cloudflare.com" in self.cfg.claude_url:
+            auth = {"cf-aig-authorization": f"Bearer {self.cfg.claude_key}"}
+        else:
+            auth = {"x-api-key": self.cfg.claude_key}
         data = self.transport.post_json(
             self.cfg.claude_url,
-            {
-                "model": self.cfg.claude_model,
-                "max_tokens": 800,
-                "system": SYSTEM,
-                "messages": [*self._memory, {"role": "user", "content": user}],
-            },
+            body,
             timeout=60.0,
-            headers={
-                "x-api-key": self.cfg.claude_key,
-                "anthropic-version": "2023-06-01",
-            },
+            headers={**auth, "anthropic-version": "2023-06-01"},
         )
         blocks = data.get("content") or []
         parts = []
