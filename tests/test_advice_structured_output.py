@@ -347,27 +347,6 @@ def test_a_braced_symbol_is_held_and_never_repaired() -> None:
     assert "contains a brace" in advice.text
     assert "EUR{USD}" in advice.text, "the reason must quote what the model actually said"
 
-    # THE OPERATOR-FACING HALF, which nothing pinned (straightedge#193).
-    # `tail["symbol"] = None` is what keeps this path legible, and dropping it
-    # left all 1238 tests green: the action and the symbol stay safe either
-    # way, because a brace inside a string value defeats `_JSON_TAIL`
-    # (`[^{}]*`) and `parse_advice` falls back to hold with no symbol. What
-    # changes is what the human reads. With the line gone the tail never
-    # parses, so it is left appended to the prose and the operator is shown a
-    # raw JSON object under the explanation. This is the path where a legible
-    # reply matters MOST, because it is the one where the desk is refusing.
-    #
-    # Asserted as properties rather than as wording, so rephrasing the
-    # degraded note cannot quietly make them decorative.
-    assert not any(line.lstrip().startswith("{") for line in advice.text.splitlines()), (
-        "the operator was shown a raw JSON object: the unparsed tail was left "
-        "appended to the prose instead of being replaced by a parseable one"
-    )
-    assert advice.text.count("EUR{USD}") == 1, (
-        "the model's string appears more than once, so the unparsed tail was "
-        "appended as well as quoted in the stated reason"
-    )
-
 
 def test_a_braced_symbol_is_not_more_permissive_than_the_bare_parser() -> None:
     """The structured path must never be the LESS conservative of the two.

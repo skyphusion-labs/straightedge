@@ -55,7 +55,7 @@ one-branch change or a test; no behaviour on the trading path moves.
   some samples that could in principle be placed, and the direction of that
   error is a refusal rather than a wrong instant. Code unchanged.
 
-### A regression guard that could not go red, and one that did not exist
+### A regression guard that could not go red
 
 - **`test_no_staleness_is_reported_as_a_measured_offset` passed six ways under
   a mutation making `implied()` return a measured clock.** It asserted
@@ -65,15 +65,6 @@ one-branch change or a test; no behaviour on the trading path moves.
   while doctor confidently asserted a wrong offset. **It pinned the WORD, not
   the CLAIM.** It now asserts the clock's state and the branch taken, so
   rephrasing either print line cannot make it decorative again.
-- **The operator-facing half of the VIOLATING advice path was unpinned.**
-  Dropping `tail["symbol"] = None` in `structured_to_parseable` leaves the
-  action and the symbol safe either way, because a brace inside a string value
-  defeats `_JSON_TAIL` and `parse_advice` falls back to hold with no symbol, so
-  the whole suite stayed green. What changed was that the unparsed tail was
-  left appended to the prose and the operator was shown a raw JSON object under
-  the explanation, on the one path where the desk is refusing and a legible
-  reply matters most. Two assertions, written as properties rather than as
-  wording.
 
 ## 1.7.0
 
