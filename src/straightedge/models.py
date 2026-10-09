@@ -3,8 +3,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Any
+
+from straightedge.constants import (
+    VENUE_CLOCK_GRID_SEC,
+    VENUE_CLOCK_MAX_OFFSET_SEC,
+    VENUE_CLOCK_MIN_OFFSET_SEC,
+)
 
 
 class Side(str, Enum):
@@ -98,6 +105,283 @@ class Tick:
     @property
     def spread(self) -> float:
         return self.ask - self.bid
+
+
+class VenueClockUnmeasured(RuntimeError):
+    """A venue timestamp was converted while the venue's offset was unknown.
+
+    The backstop, not the control. Every caller is expected to check
+    `VenueClock.measured` and refuse with a named reason; this raise is what
+    stops a FUTURE caller getting a plausible-looking instant out of a
+    measurement that was never taken.
+    """
+
+
+@dataclass(frozen=True)
+class VenueClock:
+    """How the venue STAMPS time, measured against real UTC.
+
+    MT4 and MT5 stamp bars and ticks with the broker server's own wall clock,
+    and nothing on the wire says what that clock's offset from UTC is. A desk
+    that reads one of those integers as UTC is not off by a rounding error, it
+    is off by the server's offset: the live desk runs on a UTC+3 server, so
+    before straightedge#172 its session window, its daily-loss day boundary
+    and its weekend block all ran three hours early.
+
+    `offset_sec` is `server wall clock - UTC`, so UTC+3 is +10800. Convert
+    with `to_utc`, never by hand.
+
+    MEASURED, never configured, and that is the whole design. The offset is a
+    per-server property that moves with the SERVER's DST rules, so a number in
+    a config file is a guess that outlives the first DST change after somebody
+    wrote it. That is straightedge#68 (an instrument-blind constant that
+    silently mis-sized gold) with a clock in place of a tick value, and the
+    standing rule from that issue applies unchanged: an unmeasured spec
+    REFUSES, it never defaults.
+
+    So `offset_sec` is `None` exactly when the measurement failed, and
+    `unmeasured` names what could not be measured. There is deliberately no
+    "assume UTC" path: zero is a PLAUSIBLE offset, because a UTC-stamped
+    server is ordinary, which means a defaulted zero is an absent measurement
+    wearing a measurement's clothes. That is the `SymbolSpec.unmeasured` rule
+    applied to the clock, and the two are kept in the same shape on purpose.
+
+    THREE WAYS TO GET ONE, and which one a caller may use is decided by what
+    that caller can measure, not by what it would like to report:
+
+    - `measure(...)`, for a caller that can BOUND how stale the venue's stamp
+      is. The bound is a required argument precisely so that a caller without
+      one cannot obtain a measured clock (the straightedge#182 review).
+    - `implied(...)`, for a caller that cannot. It returns the offset the
+      stamp WOULD imply if the stamp were current, as `implied_offset_sec`,
+      on a clock that is UNMEASURED and says so. Nothing may convert with it.
+    - `declared(...)`, for a venue that is not sampling a server at all. The
+      paper venue stamps its own bars, so it states its offset rather than
+      reading one, and no freshness question exists.
+    """
+
+    offset_sec: int | None
+    #: The UTC epoch the sample was taken at. Zero means the venue answered
+    #: from its own construction rather than from a reading.
+    measured_at: int = 0
+    #: Which venue and which reading. For the journal; never parsed.
+    source: str = ""
+    #: WIRE FIELD names that could not be measured, same shape and same rule
+    #: as `SymbolSpec.unmeasured`. Empty means this is a measurement.
+    unmeasured: frozenset[str] = frozenset()
+    #: Why the measurement failed, in words, when `unmeasured` is non-empty.
+    detail: str = ""
+    #: The offset the venue's stamp would imply IF the stamp were current.
+    #:
+    #: Diagnostic only, and set only on an UNMEASURED clock. It exists so an
+    #: operator can be shown something actionable ("the stamp implies UTC+3,
+    #: and freshness is not established") instead of a bare refusal, and so
+    #: that showing it cannot be confused with vouching for it: `offset_sec`
+    #: is still None, `measured` is still False, and `to_utc` still raises.
+    #: NEVER convert with this field.
+    implied_offset_sec: int | None = None
+
+    def __post_init__(self) -> None:
+        """A half-measured clock cannot be built at all.
+
+        Two fields carry the same fact (`offset_sec is None`, and a non-empty
+        `unmeasured`), and two fields carrying one fact is how a caller comes
+        to check the wrong one. They are asserted consistent HERE, at
+        construction, so that no call site has to. `implied_offset_sec` is held
+        to the same rule from the other side: it may exist only where there is
+        no measurement to confuse it with.
+        """
+        if (self.offset_sec is None) is not bool(self.unmeasured):
+            raise ValueError(
+                "VenueClock is inconsistent: offset_sec="
+                f"{self.offset_sec!r} with unmeasured={sorted(self.unmeasured)!r}. "
+                "An unmeasured clock has offset_sec None and names the field; a "
+                "measured one has an offset and names nothing."
+            )
+        if self.implied_offset_sec is not None and self.offset_sec is not None:
+            raise ValueError(
+                "VenueClock carries both a measurement and an implication: "
+                f"offset_sec={self.offset_sec!r}, "
+                f"implied_offset_sec={self.implied_offset_sec!r}. An implication "
+                "is what there is INSTEAD of a measurement, never beside one."
+            )
+
+    @property
+    def measured(self) -> bool:
+        return not self.unmeasured
+
+    def to_utc(self, venue_epoch: int) -> datetime:
+        """The real UTC instant a venue timestamp names."""
+        if self.offset_sec is None:
+            raise VenueClockUnmeasured(
+                "refusing to convert a venue timestamp: this venue's UTC "
+                f"offset is not measured ({sorted(self.unmeasured)}, "
+                f"source={self.source!r}, detail={self.detail!r})"
+            )
+        return datetime.fromtimestamp(int(venue_epoch) - self.offset_sec, tz=timezone.utc)
+
+    @classmethod
+    def not_measured(
+        cls,
+        *fields: str,
+        source: str = "",
+        measured_at: int = 0,
+        detail: str = "",
+        implied_offset_sec: int | None = None,
+    ) -> VenueClock:
+        return cls(
+            offset_sec=None,
+            measured_at=measured_at,
+            source=source,
+            unmeasured=frozenset(fields or ("offset_sec",)),
+            detail=detail,
+            implied_offset_sec=implied_offset_sec,
+        )
+
+    @classmethod
+    def declared(cls, offset_sec: int, *, source: str, measured_at: int = 0) -> VenueClock:
+        """A venue that stamps its own bars, STATING the offset it stamps with.
+
+        For the paper venue, which has no server to sample: its bars carry
+        whatever the simulator or the backtest put there. No staleness exists,
+        so no bound is needed and none is accepted.
+        """
+        return cls(offset_sec=int(offset_sec), measured_at=measured_at, source=source)
+
+    @classmethod
+    def implied(
+        cls, venue_epoch: int, utc_epoch: float, *, source: str
+    ) -> VenueClock:
+        """What the stamp would imply, from a caller that cannot bound it.
+
+        The venue stamp on every reply is `TimeCurrent()` on MT4 and
+        `symbol_info_tick().time` on MT5, and both are the time of the LAST
+        TICK rather than of now. The difference against our clock is therefore
+        `offset - staleness`, and with no bound on staleness the two cannot be
+        separated at all: 2h stale on a UTC+3 server is indistinguishable from
+        a fresh UTC+1 server, and 11h stale is indistinguishable from UTC-8.
+        Both were measured through the real adapter during the straightedge#182
+        review, and the civil band rejected neither.
+
+        So this returns an UNMEASURED clock that carries the implication for
+        DISPLAY and refuses every conversion. A caller holding one may print
+        it, next to the fact that freshness is not established; it may not act
+        on it.
+        """
+        taken_at = int(utc_epoch)
+        if int(venue_epoch) <= 0:
+            return cls.not_measured(
+                "server_time",
+                source=source,
+                measured_at=taken_at,
+                detail="the venue sent no server timestamp",
+            )
+        raw = float(venue_epoch) - float(utc_epoch)
+        snapped = int(round(raw / VENUE_CLOCK_GRID_SEC)) * VENUE_CLOCK_GRID_SEC
+        return cls.not_measured(
+            "freshness",
+            source=source,
+            measured_at=taken_at,
+            detail=(
+                "the venue stamps its LAST TICK and this caller cannot bound "
+                "how old that is, so offset and staleness cannot be separated"
+            ),
+            implied_offset_sec=snapped,
+        )
+
+    @classmethod
+    def measure(
+        cls,
+        venue_epoch: int,
+        utc_epoch: float,
+        *,
+        source: str,
+        max_staleness_sec: float,
+        round_trip_sec: float = 0.0,
+    ) -> VenueClock:
+        """One paired sample plus a BOUND on how stale the venue's half is.
+
+        `max_staleness_sec` has no default on purpose. It is the precondition
+        that makes a sample into a measurement, and a precondition that can be
+        omitted is a precondition that will be inherited: the straightedge#182
+        review found exactly that, a bound argued correctly for ONE of three
+        callers and then written down unconditionally in three documents. A
+        caller that cannot measure the bound cannot call this method, and uses
+        `implied()` instead.
+
+        WHAT THE BOUND MUST BE. The largest possible age of the venue's stamp
+        at the moment it was read, MEASURED by the caller, not derived from a
+        config value and not assumed. `Engine.step_symbol` measures it as the
+        elapsed time since its own previous poll of that symbol: a bar
+        advanced between those two polls, so a tick arrived in that interval,
+        so the stamp cannot be older than it. A derived poll cadence is NOT
+        acceptable here: this repo's own tick budget for a live MT4 config is
+        270s of bounded part with an explicitly unbounded tail, which is why
+        `watchdog.py` publishes `tick_gap_max_s` rather than trusting the
+        budget. A number that the codebase already instruments because it can
+        be false is not a bound.
+
+        HOW IT IS USED. The sample's total uncertainty is the bound plus the
+        round trip it was read across. Two grid points are
+        `VENUE_CLOCK_GRID_SEC` apart, so the nearest grid point is the only
+        one consistent with the sample when twice that uncertainty is under
+        one grid step; otherwise several are, and the honest answer is that
+        nothing was measured. The residual check then catches a venue that is
+        not on the grid at all, or a bound that was violated by a non-multiple
+        of the grid.
+
+        WHAT NO VERSION OF THIS CAN DETECT, stated rather than implied: a
+        stamp stale by an exact multiple of 900s lands on a grid point and
+        looks perfect. The band does not see it either (11h is 44 grid steps).
+        Nothing here detects that case, and nothing is claimed to: the only
+        defence is that the bound is MEASURED, so on the engine's path a stamp
+        that old is impossible rather than merely unlikely.
+        """
+        taken_at = int(utc_epoch)
+        if int(venue_epoch) <= 0:
+            return cls.not_measured(
+                "server_time",
+                source=source,
+                measured_at=taken_at,
+                detail="the venue sent no server timestamp",
+            )
+        bound = max(0.0, float(max_staleness_sec))
+        uncertainty = bound + max(0.0, float(round_trip_sec))
+        if 2.0 * uncertainty >= VENUE_CLOCK_GRID_SEC:
+            return cls.not_measured(
+                "offset_sec",
+                source=source,
+                measured_at=taken_at,
+                detail=(
+                    f"uncertainty {uncertainty:.0f}s (staleness bound {bound:.0f}s "
+                    f"plus round trip) is too wide for the {VENUE_CLOCK_GRID_SEC}s "
+                    "grid, so more than one offset fits this sample"
+                ),
+            )
+        raw = float(venue_epoch) - float(utc_epoch)
+        snapped = int(round(raw / VENUE_CLOCK_GRID_SEC)) * VENUE_CLOCK_GRID_SEC
+        if abs(raw - snapped) > uncertainty:
+            return cls.not_measured(
+                "offset_sec",
+                source=source,
+                measured_at=taken_at,
+                detail=(
+                    f"raw offset {raw:.0f}s is {abs(raw - snapped):.0f}s off the "
+                    f"{VENUE_CLOCK_GRID_SEC}s grid, wider than the {uncertainty:.0f}s "
+                    "this sample allows, so it is not an offset"
+                ),
+            )
+        if not VENUE_CLOCK_MIN_OFFSET_SEC <= snapped <= VENUE_CLOCK_MAX_OFFSET_SEC:
+            return cls.not_measured(
+                "offset_sec",
+                source=source,
+                measured_at=taken_at,
+                detail=(
+                    f"offset {snapped}s is outside the civil timezone band, so the "
+                    "venue clock is frozen or stale rather than offset"
+                ),
+            )
+        return cls(offset_sec=snapped, measured_at=taken_at, source=source)
 
 
 @dataclass(frozen=True)
