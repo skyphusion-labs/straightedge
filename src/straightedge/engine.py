@@ -372,6 +372,28 @@ class Engine:
         # nowhere else: once it has rolled, the only record that a day ended
         # while this desk was down is gone (straightedge#129).
         owed = self._owed_day_before_roll(self.now_fn())
+        # ANNOUNCED BEFORE THE ROLL, and the order is the whole guard.
+        #
+        # `observe()` calls `_persist_state()` the moment the durable tuple
+        # moves, and a `day_key` roll always moves it, so the roll is DURABLE
+        # the instant it happens. With the announcement later in `start()`, a
+        # process that died in between lost the day for good: the next boot
+        # reads the rolled key, owes nothing, and no journal row or message
+        # ever named it. That is straightedge#129's own symptom surviving in a
+        # narrower window, and it is not exotic on this desk: supervision
+        # restarts it on a repeating trigger (#151), so a death during
+        # `start()` is the expected failure mode and a crash loop lands in that
+        # window on every pass. Found in review of #198.
+        #
+        # THE WINDOW THIS ACCEPTS, stated rather than implied: a death between
+        # the journal write and the roll leaves the row written and the key
+        # unrolled, so the next boot owes the day again and the journal marker
+        # declines to repeat it. A torn journal line is skipped as unparseable
+        # by `tail`/`last_event`, which costs one duplicate message, the same
+        # bound the rotation case already carries. Nothing here needs the roll
+        # to have happened: the row is a journal write, and the journal is the
+        # marker.
+        self._announce_unrecapped_day(owed)
         self.risk.observe(acct, self.now_fn())
         self._emit(
             "start",
@@ -410,11 +432,6 @@ class Engine:
         }
         self.desk.restore_from_journal(self.journal)
         self.advisor.load()
-        # LAST in start(), and after the `start` event: the chat reads start
-        # then recap, and a raising announcement cannot leave the gates
-        # without an observed snapshot or the desk without its restored
-        # state. Nothing below this line needs it.
-        self._announce_unrecapped_day(owed)
 
     def warm_history(self, symbols: list[str] | None = None) -> HistoryReport:
         """Warm and measure the configured symbols, then journal the result.
@@ -2239,13 +2256,29 @@ class Engine:
         seven skipped boundaries, not seven recaps. The bound is the design, not
         a cap applied afterwards.
 
-        The marker is the JOURNAL, not `_recapped_day`, because every restart
-        clears in-process memory and a crash loop would otherwise announce the
-        same day on every boot: that is straightedge#119's defect arriving by
-        the other door. The last `recap` row's `day` is the authority, which
-        also means a journal rotation (10MB) landing between two boots could
-        allow one duplicate; one extra message after a 10MB day is a better
-        failure than a new durable field in the money gate's own input file.
+        THE MARKER IS THE JOURNAL, and the honest reason is narrower than
+        "memory does not survive a restart". On the ordinary path it is the
+        PERSISTED day_key that stops a second announcement: boot 1 rolls it,
+        and boot 2 owes nothing before this function is ever reached. The state
+        this marker uniquely guards is a desk whose snapshot cannot be WRITTEN.
+        `_persist_state` halts on `StateUnwritable` and the roll never lands,
+        so every boot restores the old `day_key`, every boot owes the same day,
+        and without the journal row a crash loop sends one message per boot:
+        straightedge#119's defect arriving by the other door. Found in review
+        of #198, which measured the ordinary path passing with this marker
+        removed.
+
+        It is NOT reached by `state_unreadable`, and the difference inverts the
+        obvious reading: an unreadable snapshot leaves `day_key` at its
+        constructor default of `""`, so `_owed_day_before_roll` returns None
+        and nothing is owed at all. Unwritable is the live case; unreadable
+        cannot reach here.
+
+        The journal being the authority also means a rotation (10MB) landing
+        between two boots can allow exactly ONE duplicate, because
+        `Journal.last_event` scans the current file and never `.1`. One extra
+        message after a 10MB day beats a new durable field in the money gate's
+        own input file.
         """
         if owed is None:
             return

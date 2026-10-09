@@ -24,10 +24,13 @@ shipped path instead of about my own assumption.
 import json
 from datetime import datetime, timedelta, timezone
 
+import pytest
+
 from straightedge.broker.paper import PaperBroker
 from straightedge.config import BotConfig
 from straightedge.engine import Engine
 from straightedge.synthetic import generate_bars
+from straightedge.state import snapshot_path_for
 from straightedge.telegram import TelegramClient, TgCommand
 
 RECAP_NOTIFY = frozenset({"start", "stop", "open", "close", "halt", "recap"})
@@ -431,9 +434,18 @@ def test_a_restart_across_midnight_announces_the_day_it_could_not_recap(
 def test_the_announcement_is_made_once_and_survives_a_crash_loop(tmp_path) -> None:
     """Three restarts on the same day are one announcement, not three.
 
-    This is #119's failure mode arriving by the other door, so the marker for
-    this one cannot be the in-process memory `_recapped_day` is: every restart
-    clears that. The journal is what the next process reads.
+    WHAT MAKES THIS PASS IS NOT THE JOURNAL MARKER, and saying so is the point.
+    A review of #198 measured this case green with the marker removed: boot 1's
+    `observe()` rolls the PERSISTED day_key, so boots 2 and 3 return None from
+    `_owed_day_before_roll` before the journal is ever read. The fixture sits at
+    a state the code itself produced, which is this repo's own named tell.
+
+    It is kept because the OUTCOME is the contract (a crash loop sends one
+    message, not one per boot) and because it pins the persisted-roll half of
+    that outcome. The marker's own case, the one that reds when it is removed,
+    is `test_the_journal_marker_is_what_guards_an_unwritable_snapshot`: a desk
+    whose snapshot cannot be written never lands the roll, so every boot owes
+    the same day and only the journal row stops the flood.
     """
     clock = [datetime(2024, 1, 3, 12, tzinfo=timezone.utc)]
     first = _engine(tmp_path, clock, cfg=_cfg(tmp_path))
@@ -536,3 +548,122 @@ def test_the_operator_sees_it_on_an_install_that_enumerates_notify_events(
     )
     assert "pnl=+0" not in line, "a zero stood in for an unanswered question: " + line
     second.stop()
+
+
+def test_a_death_between_the_roll_and_the_row_does_not_lose_the_day(
+    tmp_path, monkeypatch
+) -> None:
+    """The window a review of #198 measured, closed by ORDERING.
+
+    `observe()` persists the roll the instant the durable tuple moves, so with
+    the announcement later in `start()` a process that died in between lost the
+    day for good: the next boot read the rolled key, owed nothing, and no row
+    or message ever named it. #129's own symptom in a narrower window, and the
+    expected failure mode on a supervised desk rather than a rare one.
+
+    Driven by killing `start()` in exactly that window: the snapshot write is
+    allowed, then the next thing after it raises. The announcement now precedes
+    the roll, so the row is already in the journal when the process dies.
+    """
+    clock = [datetime(2024, 1, 3, 12, tzinfo=timezone.utc)]
+    first = _engine(tmp_path, clock, cfg=_cfg(tmp_path))
+    first.start()
+    first.step_all()
+    assert _recaps(first) == []
+    first.stop()
+
+    clock[0] = datetime(2024, 1, 4, 8, 0, tzinfo=timezone.utc)
+    dying = _engine(tmp_path, clock, cfg=_cfg(tmp_path))
+    real_observe = dying.risk.observe
+
+    def observe_then_die(acct, now):
+        real_observe(acct, now)
+        raise RuntimeError("killed between the roll and whatever came next")
+
+    monkeypatch.setattr(dying.risk, "observe", observe_then_die)
+    with pytest.raises(RuntimeError):
+        dying.start()
+    # The roll is durable now, which is what made this unrecoverable before.
+    assert dying.risk.snapshot.day_key == "2024-01-04"
+    assert _recap_days(dying) == ["2024-01-03"], (
+        "the day was lost in the window between the roll and the row"
+    )
+
+    clean = _engine(tmp_path, clock, cfg=_cfg(tmp_path))
+    clean.start()
+    assert _recap_days(clean).count("2024-01-03") == 1, (
+        "the next boot either lost it or repeated it: " + repr(_recap_days(clean))
+    )
+    clean.stop()
+
+
+def test_the_journal_marker_is_what_guards_an_unwritable_snapshot(
+    tmp_path, monkeypatch
+) -> None:
+    """The state the marker UNIQUELY guards, which is not every restart.
+
+    A review of #198 found the crash-loop case passing with the marker removed,
+    and it was right: on the ordinary path the PERSISTED day_key is what stops
+    a second announcement, because boot 2 owes nothing before the marker is
+    ever read. The marker earns its place on a desk whose snapshot cannot be
+    WRITTEN: `_persist_state` halts on `StateUnwritable`, the roll never lands,
+    so every boot restores the same old `day_key` and owes the same day. Three
+    boots then send three messages unless the journal says otherwise.
+
+    `state_unreadable` does NOT reach this, which is the opposite of the
+    obvious reading: an unreadable snapshot leaves `day_key` empty, so nothing
+    is owed at all. Asserted below so the distinction cannot rot.
+    """
+    clock = [datetime(2024, 1, 3, 12, tzinfo=timezone.utc)]
+    first = _engine(tmp_path, clock, cfg=_cfg(tmp_path))
+    first.start()
+    first.step_all()
+    first.stop()
+
+    def boom(*_a, **_k):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr("straightedge.state.os.replace", boom)
+    clock[0] = datetime(2024, 1, 4, 8, 0, tzinfo=timezone.utc)
+    last = None
+    for boot in range(3):
+        engine = _engine(tmp_path, clock, cfg=_cfg(tmp_path))
+        engine.start()
+        assert engine.risk.halt_reason == "state_unwritable", (
+            f"boot {boot} did not reach the state this test is about"
+        )
+        # The roll could not be persisted, so every boot still owes the day.
+        assert engine.risk.snapshot.day_key == "2024-01-04"
+        last = engine
+        engine.stop()
+    assert last is not None
+    days = _recap_days(last)
+    assert days.count("2024-01-03") == 1, (
+        "an unwritable snapshot turned a crash loop into one message per boot: "
+        + repr(days)
+    )
+
+
+def test_an_unreadable_snapshot_owes_nothing_rather_than_everything(
+    tmp_path,
+) -> None:
+    """The other half of the distinction above, asserted rather than assumed.
+
+    An unreadable snapshot leaves `day_key` at its constructor default, so
+    there is no observed day to owe a recap for. A desk that cannot read its
+    own state must not also invent a recap for a day it cannot name.
+    """
+    clock = [datetime(2024, 1, 4, 8, 0, tzinfo=timezone.utc)]
+    cfg = _cfg(tmp_path)
+    snapshot_path_for(cfg.journal_path).write_text("{not json at all", encoding="utf-8")
+    engine = _engine(tmp_path, clock, cfg=cfg)
+    # BEFORE start(). `observe()` sets the in-memory key to today even here,
+    # where the write is refused, so the state that decides whether anything is
+    # owed is the one the RiskManager restored at construction.
+    assert engine.risk.halt_reason == "state_unreadable"
+    assert engine.risk.snapshot.day_key == "", (
+        "an unreadable snapshot is supposed to leave no observed day at all"
+    )
+    engine.start()
+    assert _recaps(engine) == [], "a desk that cannot read its state invented a recap"
+    engine.stop()

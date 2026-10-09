@@ -42,15 +42,37 @@ measured.
 single row naming the last day it observed and `days_skipped=7`. The bound is
 the design rather than a cap applied afterwards.
 
-**Announced once, and the marker is the JOURNAL.** A crash loop clears
-in-process memory, so `_recapped_day` cannot guard this: three restarts would
-be three announcements, which is #119's defect arriving by the other door. The
-next process reads the last `recap` row's `day` instead. The equity snapshot
-deliberately gains no field and no `SNAPSHOT_VERSION` bump: that file is the
-money gate's input and recap bookkeeping has no business in it. The known cost
-is stated rather than hidden: a journal rotation (10MB) landing between two
-boots could allow one duplicate message, which is a better failure than
-versioning the money file.
+**Announced BEFORE the roll, which is what makes it recoverable at all.**
+`observe()` persists the roll the instant the durable tuple moves, so with the
+announcement later in `start()` a process that died in between lost the day for
+good: the next boot read the rolled key, owed nothing, and no row or message
+ever named it. That is this issue's own symptom surviving in a narrower window,
+and it is the EXPECTED failure mode here rather than a rare one, because
+supervision restarts this desk on a repeating trigger (#151) and a crash loop
+lands in that window on every pass. Found in review of #198 and closed by
+ordering: the row is a journal write and the journal is the marker, so nothing
+about it needs the roll to have happened. The window that remains is stated at
+the call site: a death between the row and the roll leaves the day owed again
+and the marker declines to repeat it.
+
+**Announced once, and the marker is the JOURNAL, for a narrower reason than
+"memory does not survive a restart".** On the ordinary path the PERSISTED
+day_key is what stops a second announcement, because boot 2 owes nothing before
+the marker is ever read; the same review measured the crash-loop case passing
+with the marker removed, and that test now says so rather than claiming credit.
+The state the marker uniquely guards is a desk whose snapshot cannot be
+WRITTEN: `_persist_state` halts on `StateUnwritable`, the roll never lands,
+every boot restores the same day_key and owes the same day, and without the
+journal row three boots send three messages. `state_unreadable` does NOT reach
+it, which inverts the obvious reading: an unreadable snapshot leaves `day_key`
+empty, so nothing is owed at all. Both states now have a case.
+
+The equity snapshot deliberately gains no field and no `SNAPSHOT_VERSION` bump:
+that file is the money gate's input and recap bookkeeping has no business in
+it. The known cost is stated rather than hidden: a journal rotation (10MB)
+landing between two boots could allow one duplicate message, because
+`Journal.last_event` scans the current file and never `.1`, which is a better
+failure than versioning the money file.
 
 **It is a `recap` event rather than a new event name, and that is a delivery
 decision.** Every `config.toml` written before this change enumerates
