@@ -16,7 +16,49 @@ def ticks_between(a: float, b: float, spec: SymbolSpec) -> float:
     return abs(a - b) / tick
 
 
+class MissingStop(ValueError):
+    """Raised when a worst-case loss is asked for without a stop to measure to.
+
+    A ValueError so the desk's existing command handling reports it instead of
+    dying: `poll_telegram` already catches ValueError and replies with the
+    message.
+    """
+
+
 def money_per_lot_at_stop(entry: float, sl: float, spec: SymbolSpec) -> float:
+    """Money lost per lot if price travels from `entry` to `sl`.
+
+    REFUSES on a missing stop instead of computing one (#187). `sl = 0` is the
+    venue encoding for "no stop", and `ticks_between(price, 0, spec)` is
+    `price / tick_size`, which is enormous: measured, a 0.1 lot EURUSD order
+    resting with no stop produced a worst case of 11,506.70 against a 50.00
+    per-trade cap. Arithmetic then proceeded on that as though it were a
+    measurement.
+
+    `Position.risk_distance` already treats `sl <= 0` as not-measurable, so the
+    two functions disagreed about what a missing stop MEANS, and a third opinion
+    at each call site is how that family spreads: the next caller inherits
+    whichever one it happens to reach. The disagreement is resolved here, where
+    the number is produced.
+
+    It RAISES rather than returning 0.0, and that asymmetry with `risk_distance`
+    is deliberate. A 0.0 here would make every caller's `worst` zero and pass
+    every cap trivially, which is precisely the #161 fail-open this repo has
+    already paid for once. The two agree that a missing stop is not a
+    measurement; only one of them has a sentinel that fails closed.
+
+    Every current caller is audited to never reach this: `_stop_guard` returns
+    early on `sl <= 0`, and `risk.evaluate` refuses `sl_required` before both
+    its own call and `lots_for_risk`. `replace_pending` is the one site that can
+    see a venue-supplied `sl = 0`, and it names the refusal. A future caller
+    that reaches this gets a loud failure rather than a confident number, which
+    is the correct direction for an unaudited path on a real-money desk.
+    """
+    if sl <= 0:
+        raise MissingStop(
+            f"no stop to measure to: sl={sl!r}. A missing stop is not a distance, "
+            "and a worst case cannot be computed without one."
+        )
     ticks = ticks_between(entry, sl, spec)
     return ticks * spec.trade_tick_value
 

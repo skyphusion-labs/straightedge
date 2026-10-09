@@ -1246,6 +1246,10 @@ server clock in the terminal. `doctor` exits non-zero only when the clock
 cannot be read at all, and, from config alone, when `engine.poll_seconds` is
 too slow for any sample to be bounded.
 
+`symbol_not_allowed` names the symbol the MODEL sent, byte for byte, and not an uppercased
+version of it. If that string looks odd, read it as odd: a name that is not ASCII is refused on
+sight, because uppercasing one can turn it into a real instrument
+(`EURU\u017fD` uppercases to `EURUSD`). Nothing is staged from it.
 `venue_clock_bar_disagrees` is the other clock refusal and it means the
 opposite: the offset WAS measured, and the venue's own forming bar contradicts
 it. The record carries `offset_sec`, `bar_time` and `implied_server_now`. A
