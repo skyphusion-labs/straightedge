@@ -72,7 +72,15 @@ jobs:
             if (-not (Test-Path "$PWD\tasks\$name.xml")) {
               throw "$name was registered and did not dump; the round trip is broken"
             }
+            # The liveness sidecar (#151). The audit reports
+            # liveness_unmeasured without it, so an exporter that silently
+            # stopped writing it would turn every live audit back into a
+            # declaration audit, which is the defect being closed here.
+            if (-not (Test-Path "$PWD\tasks\$name.info.json")) {
+              throw "$name dumped no .info.json; the liveness half of the audit is unmeasured"
+            }
           }
+          Get-Content "$PWD\tasks\straightedge-desk.info.json"
           python -m straightedge --config config.example.toml supervision --tasks "$PWD\tasks"
           if ($LASTEXITCODE -ne 0) { throw "the audit failed on a dump of the declarations this repo ships" }
       - name: the audit can still go red on this runner
@@ -90,6 +98,46 @@ jobs:
           # step WANTED from the audit. Without this the control passing looks
           # identical to the control failing, which is the shape of defect this
           # whole job exists to catch.
+          exit 0
+      # THE SHAPE THAT ACTUALLY HAPPENED, against real Task Scheduler (#151).
+      #
+      # The control above removes the repetition entirely, which is the easy
+      # case any trigger check catches. The live box's desk task had its PT5M
+      # repetition sitting ON the LogonTrigger, which is why a human reading
+      # that XML concluded it was supervised, and measured against the audit as
+      # merged in #146 that shape returned ZERO findings and exit 0.
+      #
+      # A unit fixture proves the decision path. Only Task Scheduler proves
+      # that this is a shape it accepts and what it then reports for
+      # NextRunTime, so the shape is registered for real here.
+      - name: the audit reds on the shape that passed it, registered for real
+        shell: pwsh
+        run: |
+          $logon = New-ScheduledTaskTrigger -AtLogOn
+          # The documented idiom for hanging a repetition on a non-time
+          # trigger: build a throwaway -Once trigger for its Repetition and
+          # graft that onto the logon trigger.
+          $donor = New-ScheduledTaskTrigger -Once -At (Get-Date) `
+            -RepetitionInterval (New-TimeSpan -Minutes 5)
+          $logon.Repetition = $donor.Repetition
+          Set-ScheduledTask -TaskName straightedge-desk -Trigger $logon | Out-Null
+          .\deploy\windows\Export-Tasks.ps1 -OutDir "$PWD\tasks-prefix"
+          # Printed before the assertion, because if Task Scheduler reports
+          # this shape differently from the live box then THAT is the finding
+          # and a bare red would hide it.
+          Write-Host "--- what Task Scheduler holds for the pre-fix shape ---"
+          Get-Content "$PWD\tasks-prefix\straightedge-desk.info.json"
+          Select-String -Path "$PWD\tasks-prefix\straightedge-desk.xml" -Pattern "Repetition|Interval|LogonTrigger|TimeTrigger"
+          $out = python -m straightedge --config config.example.toml supervision --tasks "$PWD\tasks-prefix" 2>&1 | Out-String
+          $code = $LASTEXITCODE
+          Write-Host $out
+          if ($code -eq 0) {
+            throw "the audit PASSED a PT5M repetition hung on a LogonTrigger. That is the exact shape that ran zero times in twelve days on the live box, and #151 exists because the merged audit returned exit 0 on it"
+          }
+          if ($out -notmatch "repetition_not_on_a_clock") {
+            throw "the audit went red, but not for the #151 reason; it must name repetition_not_on_a_clock so the finding does not contradict the artifact"
+          }
+          Write-Host "the audit named repetition_not_on_a_clock against real Task Scheduler, as it must"
           exit 0
       # Deploy-Desk.ps1 is PowerShell that cannot run on a Mac at all, so
       # without this its first execution would be against a live real-money

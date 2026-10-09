@@ -258,7 +258,10 @@ def cmd_supervision(args: argparse.Namespace) -> int:
     )
     print(
         supervision.report(
-            findings, max_interval_s=ceiling, measurable=measurable
+            findings,
+            max_interval_s=ceiling,
+            measurable=measurable,
+            liveness=supervision.liveness_note(views),
         )
     )
     return supervision.exit_code(findings)
