@@ -74,6 +74,19 @@ the derived budget. The desk deliberately does NOT widen its own threshold when
 that happens. A gate that relaxes itself until it stops firing is a gate that
 can no longer go red; it reports the breach and keeps the derived number.
 
+That figure is per PROCESS, and on its own it answered the wrong question. What
+a breach tests is whether `UNBOUNDED_TAIL_ALLOWANCE` is adequate for this BOOK,
+and a restart changes neither the allowance nor the book, so a restart used to
+erase the answer while leaving the question open: the live desk published
+`tick_gap_max_s=608.5 over_budget=1`, a deploy restarted it, and the same
+surface then published `7.7` and `0`. Both were correct for their process. So
+the file carries BOTH figures now (straightedge#153). `tick_gap_max_s` and
+`over_budget` stay per process, because a desk whose book has shrunk must be
+able to report a clean budget again and an indicator that can never go green is
+one an operator learns to ignore. `tick_gap_ever_s` and `over_budget_ever` are
+carried forward across restarts, and `Engine._restore_gap_ever` holds the
+design note, the store decision and the one thing the pair cannot see.
+
 Send-only, and it never fights the desk for updates
 ---------------------------------------------------
 Two processes calling `getUpdates` on one bot token steal each other's
@@ -210,6 +223,7 @@ def render(
     stale_after_s: int,
     tick_budget_s: int,
     tick_gap_max_s: float,
+    tick_gap_ever_s: float,
     run_id: str,
     started_at: str,
     deployed: str,
@@ -238,6 +252,12 @@ def render(
     it was most likely to be watched.
     """
     over = 1 if tick_gap_max_s > tick_budget_s else 0
+    # Two figures, because they answer two questions and a restart resets one
+    # of them. `over_budget` is this PROCESS and must be able to go green
+    # again; `over_budget_ever` is this BOX and must not be erasable by a
+    # restart (straightedge#153). `Engine._restore_gap_ever` carries the
+    # design note and the one thing the pair cannot see.
+    over_ever = 1 if tick_gap_ever_s > tick_budget_s else 0
     lines = [
         ts.isoformat(),
         f"blocked={blocked}",
@@ -246,6 +266,8 @@ def render(
         f"tick_budget_s={int(tick_budget_s)}",
         f"tick_gap_max_s={tick_gap_max_s:.1f}",
         f"over_budget={over}",
+        f"tick_gap_ever_s={tick_gap_ever_s:.1f}",
+        f"over_budget_ever={over_ever}",
         f"run_id={run_id}",
         f"started_at={started_at}",
         f"deployed={deployed}",
@@ -440,6 +462,30 @@ def decide(path: str | Path, *, now: datetime, cfg: Any = None) -> Report:
             f"own budget (tick_gap_max_s={hb.fields.get('tick_gap_max_s')}), so "
             "this threshold is too tight for that book and can produce a false "
             "STALE. It was NOT widened automatically."
+        )
+    ever = hb.fields.get("over_budget_ever", "")
+    if ever == "1" and hb.fields.get("over_budget") != "1":
+        # The reading straightedge#153 is about. A desk restarted after a bad
+        # episode publishes its cleanest possible history, so the per-process
+        # figure alone reassures an operator at exactly the moment it is least
+        # likely to be earned. The box's figure outlives the process now, and a
+        # human has to be TOLD when the two disagree, or the durable one is
+        # published to nobody.
+        notes.append(
+            "NOTE: THIS PROCESS is inside its budget, but this BOX has "
+            f"breached it before (tick_gap_ever_s={hb.fields.get('tick_gap_ever_s')} "
+            f"against tick_budget_s={hb.fields.get('tick_budget_s')}). A restart "
+            "resets the per-process figure and does not make the threshold any "
+            "less tight for this book. Journal event tick_gap_breach carries "
+            "each occurrence."
+        )
+    elif not ever:
+        notes.append(
+            "NOTE: this desk publishes no over_budget_ever, so a breach before "
+            "the last restart cannot be seen from this file. Upgrade the desk; "
+            "until then this watcher can report the current process's budget "
+            "and cannot report the box's history. The absence is NOT read as a "
+            "clean history."
         )
     if age > stale_after:
         return Report(

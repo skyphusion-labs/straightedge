@@ -6,6 +6,7 @@ import math
 import os
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 from straightedge.broker.base import Broker, venue_clock_of
@@ -38,7 +39,13 @@ from straightedge.risk import (
     currency_exposure,
     day_key,
 )
-from straightedge.sizing import MissingStop, money_per_lot_at_stop, normalize_volume
+from straightedge.sizing import (
+    MissingStop,
+    money_per_lot_at_stop,
+    normalize_volume,
+    unusable_stop,
+    unusable_volume,
+)
 from straightedge.state import snapshot_path_for
 from straightedge.strategy import TrendStrategy
 from straightedge.telegram import TelegramClient, TgCommand
@@ -238,12 +245,25 @@ class Engine:
         #: daily-loss budget is measured against, so it would change refusal
         #: behaviour on the real-money path.
         #:
-        #: In memory on purpose, and this is the reachability argument for it:
-        #: `start()` calls `risk.observe()` before the first tick, so after any
-        #: restart `snap.day_key` already equals today and `_maybe_daily_recap`
-        #: cannot owe a recap for a day that ended before the restart. A
-        #: journal-restored marker would therefore guard a state no restart can
-        #: reach, which is decoration, not safety.
+        #: In memory, and the argument for that is now NARROWER than it was.
+        #: It used to read: `start()` calls `risk.observe()` before the first
+        #: tick, so after any restart `snap.day_key` already equals today and
+        #: `_maybe_daily_recap` cannot owe a recap for a day that ended before
+        #: the restart, so a journal-restored marker would guard a state no
+        #: restart can reach. The first half is still true and the conclusion
+        #: was wrong: the state IS reachable, it just is not reachable through
+        #: THIS marker. The day that ended while the desk was down is owed by
+        #: nobody and was therefore silently lost (straightedge#129).
+        #:
+        #: So the two paths now have two markers, deliberately, because they
+        #: guard two different things. `_maybe_daily_recap` is in-process and
+        #: in-memory: it fires on a boundary this process watched, so its marker
+        #: only has to outlive a tick. `_announce_unrecapped_day` reads the
+        #: JOURNAL instead, because the thing it must not repeat is an
+        #: announcement made by a PREVIOUS process, and a crash loop clears
+        #: anything in memory. Neither marker is in the equity snapshot: that
+        #: file is the money gate's input and a recap bookkeeping field has no
+        #: business in it.
         self._recapped_day = ""
         #: Heartbeat bookkeeping. `_hb_gap_max_s` is the largest gap between two
         #: heartbeat writes this process has actually seen, published so the
@@ -253,6 +273,13 @@ class Engine:
         self._hb_last_mono: float | None = None
         self._hb_gap_max_s = 0.0
         self._hb_over_warned = False
+        #: The worst gap THIS BOX has ever published, carried across restarts.
+        #: A DIFFERENT question from `_hb_gap_max_s` one line up, which is why
+        #: it is a second field rather than a change to the first;
+        #: `_restore_gap_ever` states which question each one answers, where a
+        #: reader meets them.
+        self._hb_gap_ever_s = 0.0
+        self._hb_ever_restored = False
         #: This process's identity, published in the heartbeat so that a
         #: supervised restart is observable from OUTSIDE the process. Assigned
         #: in __init__ and never reassigned: a desk that re-read its own config
@@ -367,9 +394,30 @@ class Engine:
                 error=self.risk.state_error,
                 path=str(self.risk.state_path),
             )
+        # BEFORE the roll. `observe()` advances `snapshot.day_key` to today
+        # whenever it differs, and the ended day's identity and baseline live
+        # nowhere else: once it has rolled, the only record that a day ended
+        # while this desk was down is gone (straightedge#129).
+        owed = self._owed_recap_day(self.now_fn())
+        # Read before `observe()`, and NOT because correctness depends on it.
+        # `_owed_recap_day` decides from the journal, which never rolls, so
+        # there is no window here to preserve and no ordering for a future
+        # edit to break: a boot that dies anywhere in `start()` leaves the next
+        # one able to reach the same conclusion. What the pre-roll position
+        # buys is the BASELINE: `day_start_equity` for the ended day exists
+        # only until the roll overwrites it, so reading here attaches a real
+        # number where one survives and the row names it unmeasured where it
+        # does not. Review of #198 ruled this direction over ordering for
+        # exactly that reason.
+        self._announce_unrecapped_day(owed)
         self.risk.observe(acct, self.now_fn())
         self._emit(
             "start",
+            # The engine's OWN day, which is what makes this row durable
+            # evidence of a session for `_owed_recap_day`. `ts` is the wall
+            # clock and the gates are not, so the two must not be conflated
+            # (#182); `journal.last_session_day_before` reads THIS field.
+            day=day_key(self.now_fn()),
             mode=self.cfg.mode,
             login=acct.login,
             equity=acct.equity,
@@ -443,7 +491,10 @@ class Engine:
         return report
 
     def stop(self) -> None:
-        self._emit("stop")
+        # `day` for the same reason as the `start` row: session evidence on
+        # the engine's clock. A session that ran for days is better
+        # evidenced by where it ENDED than by where it began.
+        self._emit("stop", day=day_key(self.now_fn()))
         self.broker.disconnect()
 
     def flatten(self, reason: str) -> FlattenReport:
@@ -1646,8 +1697,32 @@ class Engine:
         pos = self._pos(ticket)
         if pos is None:
             return "no such ticket"
-        if volume is not None and volume <= 0:
-            raise ValueError("volume must be > 0")
+        if volume is not None:
+            # A NON-FINITE VOLUME IS NOT A MAGNITUDE PROBLEM (#210), and this
+            # is the guard that has to catch it, because NOTHING downstream
+            # does. That is what separates this from #187 and #208, where the
+            # outcome was already safe and only the reason was wrong.
+            #
+            # Measured on the pre-fix tree, via the operator route: `nan <= 0`
+            # is False, so `nan` passed the magnitude guard that used to be the
+            # whole of this check. `paper.py::_close` then let it through both
+            # of ITS comparisons for the same reason, since `nan > vol + 1e-12`
+            # and `abs(nan - vol) < 1e-12` are both False, so it fell to the
+            # partial-close branch and ran
+            # `self._balance += pnl * (nan / pos.volume)` followed by
+            # `pos.volume = round(pos.volume - nan, 8)`. The desk answered
+            # `closed`; the position was still on the book with a `nan` volume
+            # and the account balance was `nan`.
+            #
+            # The severity is the blinding, not the failed close. Every circuit
+            # gate reads equity, and a `nan` equity compares False against the
+            # daily-loss and drawdown bounds forever, so this one bad input
+            # disables the guards that exist to catch the next one. An operator
+            # told they are flat, who is not, then trades against a book they
+            # believe is empty with the risk engine silently inert.
+            bad = unusable_volume(volume)
+            if bad is not None:
+                raise ValueError(f"refused: {bad}")
         result = self._close(pos, reason, volume)
         if not result.ok:
             return f"close failed retcode={result.retcode} {result.comment}"
@@ -1709,6 +1784,31 @@ class Engine:
         trip = self.risk.circuit(self.broker.account(), self.now_fn())
         if not trip.allowed:
             return f"refused: {trip.reason}"
+        # SAME FAMILY, SECOND ENTRY POINT, AND THIS ONE ESCAPED THE DESK
+        # (#210). `normalize_volume` computes
+        # `math.floor(raw / spec.volume_step + 1e-12)`, and `math.floor` refuses
+        # a non-finite argument with TWO different exceptions: ValueError for
+        # `nan`, but **OverflowError for `inf`**. OverflowError derives from
+        # ArithmeticError, not from ValueError, so it is not in the
+        # `(ValueError, RuntimeError, OSError)` tuple that `handle_command` and
+        # `poll_telegram` catch.
+        #
+        # Measured on the operator route pre-fix: `/tp TICKET PX inf` left the
+        # command handler by an UNCAUGHT exception, and `/tp TICKET PX nan`
+        # replied with the interpreter's own words, `cannot convert float NaN to
+        # integer`. One is an availability defect and the other leaks internals
+        # where a refusal belongs.
+        #
+        # So refuse before the arithmetic rather than widening an except clause
+        # after it: the operator gets the same named refusal `/close` gives, and
+        # the desk is not asked to survive an exception class it never
+        # classified. Placed here, immediately before the arithmetic, rather
+        # than at the top of the function, so that no currently reachable
+        # refusal changes precedence; the only behaviour that moves is the
+        # non-finite case, which had none worth keeping.
+        bad = unusable_volume(volume)
+        if bad is not None:
+            return f"refused: {bad}"
         spec = self.broker.symbol(pos.symbol)
         vol = normalize_volume(volume, spec)
         if vol <= 0:
@@ -1770,6 +1870,26 @@ class Engine:
         else:
             return "working kind must be limit or stop"
         sl, tp = order.sl, order.tp
+        # A NON-FINITE STOP IS NOT A GEOMETRY PROBLEM (#208), and this has to run
+        # BEFORE the comparisons below or the operator is told the wrong thing.
+        #
+        # Measured on the pre-fix tree: with `sl = nan`, `nan < px` is False, so
+        # the buy arm returned "buy needs sl < entry < tp" and the arithmetic was
+        # never reached. The outcome was already safe, nothing was sent and the
+        # order did not move, so the defect was entirely in the REASON: a corrupt
+        # venue field reported as a stop/entry/target ordering mistake sends the
+        # operator to re-read geometry they got right instead of to the venue.
+        #
+        # This consults `unusable_stop`, the same authority `money_per_lot_at_stop`
+        # raises from, rather than comparing again here. This is about naming,
+        # not about safety: the outcome was already a refusal.
+        #
+        # `_stop_guard` already carries the finiteness check on the POSITION path
+        # (`if not math.isfinite(sl)`), earned by a measured -$58,058 run, so this
+        # brings the working-order path level with it.
+        bad_stop = unusable_stop(sl)
+        if bad_stop is not None:
+            return f"refused: {bad_stop}"
         if order.side.value == "buy" and not (sl < px and (tp <= 0 or px < tp)):
             return "buy needs sl < entry < tp"
         if order.side.value == "sell" and not (sl > px and (tp <= 0 or tp < px)):
@@ -1819,8 +1939,22 @@ class Engine:
             # WHAT IS ALREADY RESTING, measured the same way, because the question
             # the cap should ask is whether this replacement ADDS risk (#164).
             worst_resting = money_per_lot_at_stop(order.price, order.sl, spec) * order.volume
-        except MissingStop:
-            return "refused: sl_required"
+        except MissingStop as exc:
+            # TRIPWIRE, NOT A GATE, and the same idiom `risk.currency_exposure`
+            # uses for `UnclassifiedSymbol`. Both calls above receive the SAME
+            # `sl` that `unusable_stop` validated a few lines up, so by
+            # construction this cannot fire today, and a mutation that replaces
+            # `exc.reason` with a hardcoded string leaves the whole suite green.
+            # That is recorded rather than papered over: an unreachable branch
+            # cannot be covered, and a test pretending to cover it would be the
+            # decorative kind.
+            #
+            # It is kept because the NAME still comes from the exception rather
+            # than from this call site. A future refactor that removes or
+            # reorders the early check, or a new caller that reaches the
+            # arithmetic another way, then produces the correct reason instead
+            # of silently reverting to a hardcoded one.
+            return f"refused: {exc.reason}"
         account = self.broker.account()
         r = self.cfg.risk
         per_trade = account.equity * r.risk_pct * r.max_risk_multiple
@@ -2183,6 +2317,146 @@ class Engine:
             return f"{head}\n{tail}"
         return head
 
+    def _owed_recap_day(self, now: datetime) -> dict[str, Any] | None:
+        """The day that ended with nobody announcing it, or None. DURABLE.
+
+        DERIVED FROM THE JOURNAL, not from the equity snapshot, and that is
+        what removes the window rather than relocating it. The first version of
+        this read `snapshot.day_key` before `observe()` rolled it, which is
+        correct only while nothing can die in between; `observe()` persists the
+        roll the instant the durable tuple moves, so a process that died after
+        the roll and before the announcement lost the day for good, and no
+        later boot could know it was owed. On a desk that supervision restarts
+        on a repeating trigger (#151) that is the EXPECTED failure, not a rare
+        one. Measured in review of #198; ruled there that the fix is to make
+        the owed day recoverable rather than to order two statements carefully.
+
+        Two durable facts answer it, both from the journal, which never rolls:
+
+        * `last_session_day_before(today)`: the most recent day a `start` or
+          `stop` row names, which is evidence the desk was alive on a day that
+          has since ended. Today's rows cannot erase it, because they are
+          stamped today, so a boot that dies mid-`start()` leaves the next boot
+          able to reach the same conclusion.
+        * the last `recap` row's `day`: what has already been announced, by
+          this process or any previous one.
+
+        A day is owed when the first exists, is strictly before today, and the
+        second does not already cover it. Nothing here consults the snapshot to
+        DECIDE, so the decision survives any ordering, any crash point, and an
+        unreadable state file.
+
+        THE BASELINE IS ENRICHMENT, NOT EVIDENCE. `day_start_equity` for the
+        ended day exists only in the pre-roll snapshot, so it is attached when
+        the snapshot still names that day and is reported as unmeasured when it
+        does not. That is the one thing the journal cannot supply, and the
+        honest answer to it is the same as for the closing equity: name the
+        field, never invent a number.
+        """
+        today = day_key(now)
+        ended = self.journal.last_session_day_before(today)
+        if not ended:
+            # No durable evidence of a day that has ended. A first-ever start,
+            # or a journal whose only rows are from today.
+            return None
+        previous = self.journal.last_event("recap")
+        announced = str((previous or {}).get("day") or "")
+        if announced and announced >= ended:
+            return None
+        snap = self.risk.snapshot
+        owed: dict[str, Any] = {
+            "day": ended,
+            "days_skipped": (
+                datetime.strptime(today, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+                - datetime.strptime(ended, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+            ).days,
+        }
+        if snap.day_key == ended:
+            owed["day_start"] = snap.day_start_equity
+            owed["last_observed_equity"] = snap.equity
+            owed["last_observed_at"] = snap.time
+        return owed
+
+    def _announce_unrecapped_day(self, owed: dict[str, Any] | None) -> None:
+        """Say that a day ended unobserved. ONE row, no P&L, named unmeasured.
+
+        It is a `recap` event rather than a new event name, and that is a
+        delivery decision rather than a taxonomy one: every `config.toml`
+        written before this change enumerates `notify_events` explicitly (the
+        same argument `telegram.ALWAYS_NOTIFY_EVENTS` carries), so a new name
+        would have reached nobody on the box this is for. The operator who
+        needs this row is the one whose desk just restarted.
+
+        IT CARRIES NO `pnl` AND NO `equity`. The ended day's closing equity was
+        never observed: the persisted snapshot holds `equity` only as of its
+        last durable write, which on a losing day is the last peak and is
+        therefore ABOVE the real close, so a P&L computed from it would be
+        wrong in the flattering direction. The issue is explicit that a recap
+        with the wrong baseline is worse than none, so the two fields are
+        ABSENT and `unmeasured` names them, in the shape `SymbolSpec` and
+        `VenueClock` already use. A missing field cannot be misread; a zero can.
+
+        `day_start` joins them when the snapshot has already rolled past the
+        ended day, which happens exactly when a previous boot died between the
+        roll and this row. The row then names three unmeasured fields instead
+        of one, which is the honest reading of a day whose baseline no longer
+        exists anywhere.
+
+        ONE ROW FOR ANY OUTAGE. A box down for a week emits one row naming
+        seven skipped boundaries, not seven recaps. The bound is the design,
+        not a cap applied afterwards.
+
+        THE MARKER IS THE JOURNAL, and with the derivation above it is the SAME
+        fact rather than a second one: `_owed_recap_day` returns None once a
+        `recap` row covers the day, so the row this writes is what stops the
+        next boot repeating it. A crash loop therefore sends one message
+        whatever state the snapshot is in, including a snapshot that cannot be
+        read or cannot be written, where the roll never lands at all. Removing
+        the marker makes every boot owe the same day again, which is
+        straightedge#119's defect arriving by the other door.
+
+        AT MOST ONCE, AND IT ERRS TOWARD SILENCE RATHER THAN REPETITION.
+        `_emit` journals FIRST and notifies SECOND, and the journal row is also
+        what suppresses a retry, so a send that dies between the two loses the
+        ANNOUNCEMENT for good: the row survives for `/recap` and a journal
+        read, and no later boot tells the operator, including a boot a
+        supervisor brings up automatically. That asymmetry is deliberate.
+        Marking the day done only after a successful notify would retry, and a
+        desk whose Telegram stays broken would then send one message per boot,
+        which is straightedge#119 arriving by the other door and the thing this
+        marker exists to prevent. One lost announcement on a transport that is
+        already failing is the cheaper error than an unbounded flood on one
+        that keeps failing, so the design accepts the miss. Measured in review
+        of #198.
+        """
+        if owed is None:
+            return
+        day = str(owed.get("day") or "")
+        if not day:
+            return
+        unmeasured = ["equity", "pnl"]
+        fields: dict[str, Any] = {
+            "day": day,
+            "days_skipped": int(owed.get("days_skipped") or 0),
+            "reason": "desk_down_across_the_day_boundary",
+        }
+        if owed.get("day_start") is None:
+            # The baseline died with the snapshot roll. Named, never invented.
+            unmeasured.append("day_start")
+        else:
+            fields["day_start"] = round(float(owed["day_start"]), 2)
+            if owed.get("last_observed_equity") is not None:
+                fields["last_observed_equity"] = round(
+                    float(owed["last_observed_equity"]), 2
+                )
+            if owed.get("last_observed_at"):
+                fields["last_observed_at"] = int(owed["last_observed_at"])
+        fields["unmeasured"] = sorted(unmeasured)
+        self._emit("recap", **fields)
+        # AFTER the emit, same rule as `_maybe_daily_recap`: a raising `_emit`
+        # must not mark the day done.
+        self._recapped_day = day
+
     def _maybe_daily_recap(self, acct, now) -> None:
         key = day_key(now)
         snap = self.risk.snapshot
@@ -2326,16 +2600,44 @@ class Engine:
         """
         dest = watchdog.heartbeat_path_for(self.journal.path)
         tmp = dest.with_name(dest.name + ".tmp")
+        # BEFORE anything is written. This method REPLACES `dest`, so the only
+        # moment the previous process's figure is still readable is here.
+        self._restore_gap_ever(dest)
         ts = now or self.now_fn()
         mono = time.monotonic()
         if self._hb_last_mono is not None:
             self._hb_gap_max_s = max(self._hb_gap_max_s, mono - self._hb_last_mono)
         self._hb_last_mono = mono
         budget = watchdog.tick_budget_seconds(self.cfg)
+        # Monotonic, by construction: this desk's own observations are part of
+        # the box's history, so the published figure can never be lower than
+        # what this process has itself seen.
+        self._hb_gap_ever_s = max(self._hb_gap_ever_s, self._hb_gap_max_s)
         if self._hb_gap_max_s > budget and not self._hb_over_warned:
             # The threshold is derived from config and this measurement says the
             # derivation is too tight for this book. Report it; do NOT widen it.
             self._hb_over_warned = True
+            # The JOURNAL, not only stdout. stdout on the deployed box goes to a
+            # file nobody reads, so before straightedge#153 the only durable
+            # trace of a breach was a heartbeat field the next restart
+            # overwrote. The journal is append-only and already the audit log of
+            # a real-money desk, and it is the only surface that can answer HOW
+            # OFTEN this box breaches rather than how bad the worst one was.
+            # Once per process per breach, exactly as the stdout warning was.
+            #
+            # `symbols` and NOT the position count, which is what the issue
+            # floated: a position count means a venue round trip, and a venue
+            # round trip inside the heartbeat writer would add latency to the
+            # very path whose latency this record exists to explain. An
+            # instrument must not perturb its own measurement. The symbol list
+            # is the half of the book that is config, and therefore free.
+            self.journal.write(
+                "tick_gap_breach",
+                gap_s=round(self._hb_gap_max_s, 1),
+                budget_s=budget,
+                symbols=len(self.cfg.symbols),
+                run_id=self._hb_run_id,
+            )
             print(
                 f"heartbeat: a gap of {self._hb_gap_max_s:.1f}s between ticks "
                 f"exceeds the derived budget of {budget}s, so the watchdog "
@@ -2350,6 +2652,7 @@ class Engine:
                 stale_after_s=watchdog.stale_after_seconds(self.cfg),
                 tick_budget_s=budget,
                 tick_gap_max_s=self._hb_gap_max_s,
+                tick_gap_ever_s=self._hb_gap_ever_s,
                 run_id=self._hb_run_id,
                 started_at=self._hb_started_at.isoformat(),
                 # Read on every write rather than cached at construction. A
@@ -2363,6 +2666,89 @@ class Engine:
         )
         os.chmod(tmp, 0o600)
         tmp.replace(dest)
+
+    def _restore_gap_ever(self, dest: Path) -> None:
+        """Carry the worst gap this BOX has seen across a restart. Once.
+
+        TWO QUESTIONS, TWO FIELDS, and that is the whole design decision of
+        straightedge#153, so it is written where a reader meets the fields.
+
+        - `tick_gap_max_s` answers **is THIS PROCESS slow now**. It is per
+          process on purpose and it is UNCHANGED by this issue: a desk whose
+          book has shrunk must be able to report a clean budget again, and an
+          indicator that can never go green is one an operator learns to
+          ignore. That is the module's refusal to WIDEN the threshold on a
+          breach, read from the other end.
+        - `tick_gap_ever_s` answers **has THIS BOX ever been slow**. That is the
+          question `over_budget` was installed for, because what it tests is
+          whether `UNBOUNDED_TAIL_ALLOWANCE` is adequate for this book, and a
+          restart resets neither the allowance nor the book.
+
+        One field answering both is what made this a defect rather than a
+        quirk. The live desk published `tick_gap_max_s=608.5 over_budget=1`,
+        the 2026-10-08 deploy restarted it, and the same surface then published
+        `7.7` and `0`. Both figures were correct for their process; the 608.5
+        became unrecoverable from any live surface, while #143 was citing it as
+        evidence. The reset is also in the dangerous direction, because a desk
+        restarted after a bad episode reports its cleanest possible history.
+
+        WHY THE HEARTBEAT IS THE STORE, having rejected the other two.
+
+        The risk snapshot is out: it is money-path state that fails closed, and
+        putting a diagnostic in it widens what a corrupt snapshot can halt.
+
+        The JOURNAL is out as the STORE, which is less obvious and matters
+        more, because the journal is where the breach RECORD goes. Rotation is
+        a single generation (`Journal._rotate_if_needed` does one
+        `path.replace(path + ".1")`) and `tail()` reads only the live file, so a
+        maximum recovered by scanning the journal is a LOWER BOUND once a
+        rotation has happened, and a lower bound published as a maximum is the
+        defect this issue is about. The journal answers how OFTEN; it cannot
+        soundly answer how BAD.
+
+        So the store is the heartbeat itself: not risk state, not rotated,
+        write-mostly, already 0600, already atomically replaced, and already
+        the file this figure is published in, so the restore source and the
+        published value are the same line. Reading a sidecar in this path is
+        established rather than new: `deployed.describe` is read here on every
+        write.
+
+        WHAT THIS CANNOT SEE, stated rather than implied. The figure is a
+        maximum over the heartbeats that SURVIVED, not over all time. Deleting
+        `journal.heartbeat` resets the box's history and that is the one way to
+        lose it; a desk upgrading from a build with no such field starts the
+        chain at its own observations, and `watchdog.decide` says so rather
+        than reading the absence as a clean history. The figure is never lower
+        than what this process has itself observed, so it is always a true
+        lower bound on the box's history and never an invented one.
+
+        Once per process: the first heartbeat write restores, and every later
+        one only grows the figure. It happens HERE rather than in `start()` so
+        that no call order can publish an unrestored field, because
+        `_write_heartbeat` is reached from `step_all` and not only from a
+        started desk.
+        """
+        if self._hb_ever_restored:
+            return
+        self._hb_ever_restored = True
+        prior = watchdog.read(dest)
+        if prior is None:
+            return
+        raw = prior.fields.get("tick_gap_ever_s", "")
+        if not raw:
+            # An older desk published no such field. Its history is genuinely
+            # unrecoverable, so the chain starts here. `tick_gap_max_s` is
+            # deliberately NOT read as a fallback: it is the previous PROCESS's
+            # figure, and adopting it would answer the box question with the
+            # process question's number, which is the conflation being fixed.
+            return
+        try:
+            self._hb_gap_ever_s = max(self._hb_gap_ever_s, float(raw))
+        except ValueError:
+            # A field that will not parse is not a measurement, and this is the
+            # desk's own file: a value it cannot read means the file was
+            # damaged, never that the box was quiet.
+            return
 
     def step_all(self) -> None:
         self.poll_telegram()
@@ -2492,6 +2878,24 @@ def _format_event(event: str, fields: dict[str, Any]) -> str:
             f"ok={fields.get('ok')} order={fields.get('order')}"
         )
     if event == "recap":
+        unmeasured = list(fields.get("unmeasured") or [])
+        if unmeasured:
+            # FIRST, before anything reads `pnl`. `float(None or 0)` is 0.0, so
+            # the line below would render `pnl=+0` for a day whose result was
+            # never observed, which is the zero-standing-in-for-an-unanswered
+            # question this repo keeps finding (straightedge#129).
+            skipped = fields.get("days_skipped")
+            tail = ""
+            if fields.get("last_observed_equity") is not None:
+                tail = f", last observed equity={fields.get('last_observed_equity')}"
+            boundaries = (
+                f" ({skipped} day boundary(s) missed)" if skipped is not None else ""
+            )
+            return (
+                f"RECAP {fields.get('day')} day_start={fields.get('day_start')} "
+                f"pnl=NOT MEASURED: the desk was down across the day boundary"
+                f"{boundaries}{tail}"
+            )
         pnl = float(fields.get("pnl") or 0)
         sign = "+" if pnl >= 0 else ""
         # Head only. The day's rows are a PULL (`/recap`), never pushed: see
