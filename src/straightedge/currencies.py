@@ -113,3 +113,40 @@ CRYPTO_CODES = frozenset(_CRYPTO_CODES.split())
 
 #: The one table `parse_fx` checks both halves against.
 CURRENCY_CODES = ISO_AND_METAL_CODES | CRYPTO_CODES
+
+
+# --- a model-chosen name is recognised or refused, never cleaned up --------
+#
+# straightedge#197. `"EURU\u017fD".upper()` is `"EURUSD"`: Unicode uppercasing
+# maps U+017F LATIN SMALL LETTER LONG S onto ASCII `S`, so a transform on a
+# model-chosen symbol can MANUFACTURE a tradeable instrument the model never
+# named. The same holds for the ligatures (U+FB00 `ff`, U+FB01 `fi`, U+FB06
+# `st`), for U+0131 dotless i, and for U+00DF sharp s, which expands to `SS`.
+#
+# This is #181's brace defect with one character changed: a repair on `symbol`
+# converts a NAMED REFUSAL into an order. It lives here, in the vocabulary
+# module, because three callers need the identical answer and this is the only
+# module all three can import without a cycle: `config.advice_allows` (the
+# whitelist gate, reachable with no parser in front of it), `llm.parse_advice`
+# (the only gate the `grok` and `computer` providers have) and `desk` (which
+# must NAME the string the model actually sent).
+#
+# ASCII is the test, and not a list of offending codepoints, because every real
+# instrument name is ASCII and the next case-mapping character is always one
+# nobody enumerated. A blocklist is a denylist the next Unicode release defeats.
+
+
+def may_transform_symbol(name: str) -> bool:
+    """Whether uppercasing `name` can only case-fold it, never rename it."""
+    return name.isascii()
+
+
+def normalize_model_symbol(name: str) -> str:
+    """Uppercase a model-chosen symbol ONLY where that cannot manufacture one.
+
+    `eurusd` is the same instrument in a different case and must keep working,
+    which is why the rule is ASCII-before-transform rather than no transform at
+    all. Anything else is returned EXACTLY as it arrived, so the whitelist gate
+    refuses it by name and the operator is told what the model really said.
+    """
+    return name.upper() if may_transform_symbol(name) else name

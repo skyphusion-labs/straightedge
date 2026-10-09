@@ -18,6 +18,8 @@ from tempfile import TemporaryDirectory
 
 from straightedge import __version__
 from straightedge.broker import broker_for
+from straightedge.broker.base import venue_clock_of
+from straightedge.constants import VENUE_CLOCK_GRID_SEC
 from straightedge.broker.mt4_net import (
     DEFAULT_SHIM_PORT,
     TOKEN_ENV,
@@ -282,6 +284,116 @@ def telegram_ping(cfg: BotConfig, *, transport=None) -> str:
     return "ok" if ok else "fail"
 
 
+def _hhmm_offset(offset_sec: int) -> str:
+    """`+03:00` / `-05:00`, for a human reading a line next to a terminal."""
+    sign = "+" if offset_sec >= 0 else "-"
+    hh, mm = divmod(abs(int(offset_sec)) // 60, 60)
+    return f"UTC{sign}{hh:02d}:{mm:02d}"
+
+
+def venue_clock_cadence_check(cfg: BotConfig) -> int:
+    """Can the configured loop EVER bound the venue clock? Pure config.
+
+    The venue offset is measured from a sample whose staleness the desk bounds
+    by the elapsed time since its own previous poll of that symbol. A poll
+    cadence at or past half a grid step therefore cannot produce a bound tight
+    enough for any sample, so the auto leg would refuse every signal for as
+    long as that config is in force.
+
+    Checked statically, because it is knowable with no terminal at all, which
+    also means it cannot turn into a weekend red that teaches an operator to
+    ignore `doctor`.
+    """
+    poll = max(0, int(getattr(cfg, "poll_seconds", 0) or 0))
+    if 2 * poll < VENUE_CLOCK_GRID_SEC:
+        return 0
+    print(
+        f"venue clock: poll_seconds={poll} is too slow to bound the venue clock "
+        f"(needs 2x poll < {VENUE_CLOCK_GRID_SEC}s, the offset grid). The auto "
+        "leg would refuse every signal; lower engine.poll_seconds."
+    )
+    return 1
+
+
+def venue_clock_check(cfg: BotConfig, broker: object) -> int:
+    """Say what the venue's clock reads, and never overstate it. Exit code.
+
+    `doctor` has NO previous poll and NO bar advance, so it cannot bound how
+    old the venue's stamp is, and it therefore passes `max_staleness_sec=None`
+    and can never print a measurement for a venue that SAMPLES a server. That
+    is the straightedge#182 review finding, and it was measured rather than
+    reasoned: with `TimeCurrent()` frozen at Friday's close on a genuinely
+    UTC+3 server, the earlier version of this gate printed
+    `server UTC+01:00 measured` at 2h stale, `UTC-02:00` at 5h and `UTC-08:00`
+    at 11h, each with exit 0, and the civil band rejected nothing until past
+    15h. A gate that asserts a confident wrong number to a human deciding
+    whether to start a live loop is worse than no gate, and the market closes
+    every Friday, so that is a condition this would meet every week.
+
+    THE TWO FACTS ARE PRINTED SEPARATELY, because they are two facts: what the
+    stamp IMPLIES, and whether freshness is established. Only the second is
+    missing here, and the first is still worth printing: an operator can
+    compare it against the server clock in their own terminal, which is what
+    `docs/RUNBOOK.md` asks them to do.
+
+    EXIT CODE. Non-zero means the clock cannot be READ at all, which is a
+    run-affecting condition: no venue stamp, or a venue that cannot answer.
+    An unestablished freshness exits ZERO on purpose. It is the normal state
+    of a closed market, and an operator who sees a red `doctor` every weekend
+    learns to ignore `doctor`, which costs more than this line is worth. The
+    engine still refuses to act on an unmeasured clock; that gate is not this
+    gate.
+    """
+    clock = venue_clock_of(
+        broker, cfg.symbols[0] if cfg.symbols else "EURUSD", max_staleness_sec=None
+    )
+    if clock.measured:
+        # Only a venue that DECLARES its own stamping reaches here, because
+        # doctor supplied no bound. Paper is the one that does.
+        print(
+            f"venue clock: server {_hhmm_offset(clock.offset_sec or 0)} declared by "
+            f"the venue ({clock.source}). Nothing is sampled, so there is no "
+            "freshness question."
+        )
+        return 0
+    if clock.unmeasured == frozenset({"freshness"}):
+        # Two readings share this branch and the exit code, because both are
+        # the same fact about freshness and neither is a run-affecting fault.
+        # `implied_offset_sec` absent means the stamp is so far from our clock
+        # that it implies no timezone at all; printing the arithmetic there
+        # (UTC-17:00 at 20h stale, UTC-45:00 at 48h) stated a number that is
+        # not an offset and lost the stale-versus-absurd distinction the
+        # pre-straightedge#182 gate used to give (straightedge#193).
+        implied = clock.implied_offset_sec
+        if implied is None:
+            print(
+                "venue clock: the stamp implies NO offset, freshness NOT "
+                f"established ({clock.source}; {clock.detail}). The venue is "
+                "almost certainly closed or its clock has stopped. Check the "
+                "terminal is connected; the desk itself measures this per poll "
+                "and refuses when it cannot."
+            )
+            return 0
+        print(
+            "venue clock: stamp implies "
+            f"{_hhmm_offset(implied)}, freshness NOT established "
+            f"({clock.source}; the venue stamps its LAST TICK and doctor has no "
+            "previous poll to bound how old that is, so a stale stamp on a "
+            "closed market is indistinguishable from a different offset). "
+            "Compare it against the server clock in the terminal; the desk "
+            "itself measures this per poll and refuses when it cannot."
+        )
+        return 0
+    print(
+        "venue clock: NOT MEASURED ("
+        + ", ".join(sorted(clock.unmeasured))
+        + (f": {clock.detail}" if clock.detail else "")
+        + "). The auto leg REFUSES every signal while this holds, because "
+        "reading a broker stamp as UTC is straightedge#172."
+    )
+    return 1
+
+
 def history_check(cfg: BotConfig, broker: object) -> int:
     """Per-symbol bars and ATR against a live terminal. Returns an exit code.
 
@@ -418,6 +530,8 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     rc = 0
     if ping.startswith("fail") or paper != "ok":
         rc = 1
+    if venue_clock_cadence_check(cfg):
+        rc = 1
     if not args.connect:
         # An absent check reads exactly like a passed one, so say it was not
         # run. Per-symbol history can only be measured against a live terminal.
@@ -451,6 +565,8 @@ def cmd_doctor(args: argparse.Namespace) -> int:
                     print(line)
                     if "TOO SHORT" in line:
                         rc = 1
+                if venue_clock_check(cfg, broker):
+                    rc = 1
                 if history_check(cfg, broker):
                     rc = 1
             except (RuntimeError, OSError, ValueError) as exc:
@@ -478,6 +594,8 @@ def cmd_doctor(args: argparse.Namespace) -> int:
                 f"connected login={mask_account_id(acct.login)} server={acct.server} "
                 f"equity={acct.equity:.2f} {acct.currency} trade_mode={acct.trade_mode}"
             )
+            if venue_clock_check(cfg, broker):
+                rc = 1
             if history_check(cfg, broker):
                 rc = 1
         except (RuntimeError, OSError, ValueError) as exc:

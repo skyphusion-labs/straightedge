@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from straightedge.config import AdviceConfig
+from straightedge.currencies import may_transform_symbol, normalize_model_symbol
 from straightedge.journal import redact_text
 from straightedge.telegram import Transport, UrlLibTransport
 from urllib.parse import urlsplit
@@ -87,6 +88,184 @@ def _is_cf_gateway(url: str) -> bool:
     return host == CF_GATEWAY_HOST or host.endswith("." + CF_GATEWAY_HOST)
 
 
+#: The action vocabulary, in ONE place. `parse_advice` COERCES anything outside
+#: this set to "hold"; the schema REFUSES it at generation time. Both read this
+#: name so the two gates cannot drift apart, which is the whole point of pinning
+#: it: a schema-valid action is only safer than a parsed one if the set is CLOSED.
+ADVICE_ACTIONS = ("buy", "sell", "close", "hold")
+
+#: The keys `parse_advice` reads out of the trailing JSON object, in the order
+#: SYSTEM prints them. `text` is deliberately NOT here: it is the prose, and
+#: prose is what goes BEFORE the object.
+_TAIL_KEYS = ("action", "symbol", "sl", "tp", "limit", "stop", "ticket", "summary")
+
+#: What `output_config.format` constrains the Claude reply to.
+#:
+#: DERIVED FROM `Advice` AND `parse_advice`, field by field, and NOT from
+#: SYSTEM's prose. SYSTEM is a request; this is the contract, and where the two
+#: disagree the parser is what actually runs. So: `action` is the closed set
+#: above; `symbol` is a string or null because `parse_advice` does
+#: `str(sym).upper() if sym else None`; the four prices are number-or-null
+#: because `_num` returns `float | None`; `ticket` is integer-or-null because
+#: `_int` floors through `_num`; `summary` is a string because
+#: `str(obj.get("summary") or "")` is. `additionalProperties` is false and every
+#: key is required, which is the "and no more" half: the parser ignores unknown
+#: keys silently, and a field nobody reads is a field nobody notices is wrong.
+#:
+#: `text` is in the schema because structured output replaces the whole reply
+#: with one JSON object. Without a prose field the operator would be shown raw
+#: JSON, since `Advice.text` is what the desk renders.
+#: Named separately so `_schema_violations` validates against the SAME property
+#: table the request sends, rather than a second copy of it that could drift.
+ADVICE_PROPERTIES: dict[str, Any] = {
+    "text": {"type": "string"},
+    "action": {"type": "string", "enum": list(ADVICE_ACTIONS)},
+    "symbol": {"type": ["string", "null"]},
+    "sl": {"type": ["number", "null"]},
+    "tp": {"type": ["number", "null"]},
+    "limit": {"type": ["number", "null"]},
+    "stop": {"type": ["number", "null"]},
+    "ticket": {"type": ["integer", "null"]},
+    "summary": {"type": "string"},
+}
+
+ADVICE_FORMAT: dict[str, Any] = {
+    "type": "json_schema",
+    "schema": {
+        "type": "object",
+        "properties": ADVICE_PROPERTIES,
+        "required": ["text", *_TAIL_KEYS],
+        "additionalProperties": False,
+    },
+}
+
+
+def _is_num(v: Any) -> bool:
+    # bool is an int in Python, and `True` as a price is not a price.
+    return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+
+def _schema_violations(obj: dict[str, Any]) -> list[str]:
+    """How `obj` breaks ADVICE_FORMAT, as reasons an operator can read.
+
+    Checked on OUR side as well as the API's, because the constraint is applied
+    by a server we do not run and may not reach: `claude_url` can point at a
+    Cloudflare AI Gateway, and a proxy that drops an unknown body key would
+    leave us believing we had a schema gate while having none. A reply that
+    violates the schema is therefore evidence the constraint did not apply, and
+    that is exactly when it must not be trusted.
+    """
+    props = ADVICE_PROPERTIES
+    out: list[str] = []
+    for key in sorted(set(obj) - set(props)):
+        out.append(f"unknown field {key}")
+    for key in sorted(set(props) - set(obj)):
+        out.append(f"missing field {key}")
+    action = obj.get("action")
+    if "action" in obj and action not in ADVICE_ACTIONS:
+        out.append(f"action {action!r} is outside {list(ADVICE_ACTIONS)}")
+    for key in ("text", "summary"):
+        if key in obj and not isinstance(obj[key], str):
+            out.append(f"{key} is not a string")
+    if "symbol" in obj and obj["symbol"] is not None and not isinstance(obj["symbol"], str):
+        out.append("symbol is neither a string nor null")
+    # A BRACE IN `symbol` IS A VIOLATION, not something to clean up. The property
+    # is typed ["string","null"], so a braced symbol is schema-VALID and would
+    # otherwise pass with nothing forced and nothing said. It has to be caught
+    # HERE, because the desk gates a model-chosen symbol on `cfg.advice_allows`:
+    # "EUR{USD}" fails that gate loudly and "EURUSD" passes it, so repairing the
+    # string converts a NAMED REFUSAL into a staged order on an instrument the
+    # model never named.
+    if isinstance(obj.get("symbol"), str) and ("{" in obj["symbol"] or "}" in obj["symbol"]):
+        out.append(f"symbol {obj['symbol']!r} contains a brace")
+    # A NON-ASCII `symbol` IS A VIOLATION, for the same reason and with the same
+    # answer (straightedge#197). It is schema-VALID by type, exactly like the
+    # brace above, and `"EURU\u017fD".upper()` is `"EURUSD"`: the transform
+    # renames it into a tradeable instrument. The parser no longer performs that
+    # transform, so this is not what stops the order; it is what makes the
+    # structured path SAY so and hold, instead of leaving the operator to infer
+    # it from a `symbol_not_allowed` refusal further down. A model that emits a
+    # name outside the instrument vocabulary it was given is also evidence the
+    # constraint did not apply, which is this function's whole subject.
+    if isinstance(obj.get("symbol"), str) and not may_transform_symbol(obj["symbol"]):
+        out.append(f"symbol {obj['symbol']!r} is not ASCII")
+    for key in ("sl", "tp", "limit", "stop"):
+        if key in obj and obj[key] is not None and not _is_num(obj[key]):
+            out.append(f"{key} is neither a number nor null")
+    if "ticket" in obj and obj["ticket"] is not None and not isinstance(obj["ticket"], int):
+        out.append("ticket is neither an integer nor null")
+    return out
+
+
+def structured_to_parseable(raw: str) -> str:
+    """Re-shape a schema-constrained reply into prose + trailing JSON object.
+
+    `parse_advice` STAYS THE ONE GATE that produces an `Advice`. Structured
+    output is a second gate in FRONT of it, not a replacement, so this function
+    hands the parser exactly the shape it was written for rather than building
+    an `Advice` on a second code path that could diverge from it.
+
+    Three inputs, three outcomes, and the fallback is the parser:
+
+    * a schema-valid object -> prose, then the eight tail keys re-serialised.
+    * not JSON at all, or JSON that is not an advice object -> returned
+      UNCHANGED, which is the pre-existing behaviour. That is the degrade the
+      `grok` and `computer` providers keep permanently, and it is what happens
+      if a gateway strips `output_config`.
+    * a structured object that VIOLATES the schema -> action forced to `hold`,
+      and the reason written into the prose. Never silently coerced: the parser
+      already turns an unknown action into `hold` and says nothing, and a desk
+      that cannot tell "the model held" from "we could not read the model" has
+      lost the distinction `docs/CONTRACT.md` requires of every other refusal:
+      its "Refusal record" row says a refusing gate writes a NAMED reason, and
+      "Unmeasured is not refused" says COULD NOT MEASURE stays distinct from
+      REFUSED.
+    """
+    try:
+        obj = json.loads(raw)
+    except json.JSONDecodeError:
+        return raw
+    if not isinstance(obj, dict) or "action" not in obj:
+        return raw
+    bad = _schema_violations(obj)
+    prose = obj.get("text")
+    prose = prose if isinstance(prose, str) else ""
+    tail: dict[str, Any] = {k: obj.get(k) for k in _TAIL_KEYS}
+    if bad:
+        tail["action"] = "hold"
+        note = (
+            "degraded: the reply did not match the advice schema ("
+            + "; ".join(bad)
+            + "); action forced to hold"
+        )
+        prose = f"{prose}\n\n{note}" if prose else note
+    # A BRACE IN A STRING VALUE WOULD DEFEAT `_JSON_TAIL`, whose character class
+    # is `[^{}]*`: the object stops matching, `parse_advice` falls back to
+    # `action="hold"`, and a legitimate close is dropped with nothing said.
+    #
+    # THE TWO FIELDS GET OPPOSITE TREATMENT, and the asymmetry is the point.
+    #
+    # `summary` is a one-line LABEL the desk only displays. Nothing is traded on
+    # it, so stripping braces loses no meaning and buys a parseable tail.
+    #
+    # `symbol` NAMES THE INSTRUMENT. Stripping braces there does not clean a
+    # label, it MANUFACTURES A DIFFERENT, TRADEABLE SYMBOL: "EUR{USD}" became
+    # "EURUSD", which passes the `cfg.advice_allows` gate that "EUR{USD}" fails
+    # loudly, turning a named `symbol_not_allowed` refusal into a staged order on
+    # an instrument the model never named. It also made this path LESS
+    # conservative than the parser it gates in front of: on the same reply `grok`
+    # and `computer` yield symbol=None, action=hold. So a braced symbol is a
+    # violation above, which forces the hold and states the reason, and is
+    # emitted as NULL here. Never repaired.
+    summary = tail.get("summary")
+    if isinstance(summary, str):
+        tail["summary"] = summary.replace("{", "").replace("}", "")
+    symbol = tail.get("symbol")
+    if isinstance(symbol, str) and ("{" in symbol or "}" in symbol):
+        tail["symbol"] = None
+    return f"{prose}\n{json.dumps(tail)}"
+
+
 def parse_advice(raw: str) -> Advice:
     text = (raw or "").strip()
     match = _JSON_TAIL.search(text)
@@ -101,10 +280,20 @@ def parse_advice(raw: str) -> Advice:
             obj = {}
         if isinstance(obj, dict):
             action = str(obj.get("action") or "hold").lower()
-            if action not in {"buy", "sell", "close", "hold"}:
+            # Reads the PINNED vocabulary rather than a second literal. The
+            # comment on ADVICE_ACTIONS claims the two gates cannot drift
+            # apart; with a literal here that claim was unimplemented, and
+            # widening the literal was invisible to every test.
+            if action not in set(ADVICE_ACTIONS):
                 action = "hold"
             sym = obj.get("symbol")
-            symbol = str(sym).upper() if sym else None
+            # NOT `.upper()`. Uppercasing a non-ASCII name can rename it
+            # into a real instrument (straightedge#197), and `grok` and
+            # `computer` have no schema gate in front of this, so the
+            # parser is where the rule has to bind for them. The string is
+            # left exactly as sent, so `cfg.advice_allows` refuses it by
+            # name rather than the desk skipping a `None` symbol silently.
+            symbol = normalize_model_symbol(str(sym)) if sym else None
             sl = _num(obj.get("sl"))
             tp = _num(obj.get("tp"))
             limit = _num(obj.get("limit"))
@@ -288,7 +477,14 @@ class Advisor:
             # Effort is stated rather than defaulted: claude-opus-5-5 defaults to
             # `medium` where the previous generation defaulted to `high`, so an
             # unstated effort silently changes depth when the model id moves.
-            "output_config": {"effort": "medium"},
+            # `format` and `effort` are SIBLINGS inside output_config.
+            # `format` is not a top-level parameter, and the older
+            # top-level `output_format` is deprecated.
+            #
+            # Only the claude path gets this. `grok` and `computer` cannot
+            # constrain their output, and a provider that cannot must not
+            # silently lose the parser, so they keep `parse_advice` alone.
+            "output_config": {"effort": "medium", "format": ADVICE_FORMAT},
         }
         # ONE credential field, TWO endpoint shapes. Routing through a Cloudflare
         # AI Gateway means the gateway authenticates the caller and supplies the
@@ -332,4 +528,4 @@ class Advisor:
             if stop == "refusal":
                 raise RuntimeError("claude refused")
             raise RuntimeError(f"claude empty (stop_reason={stop or 'unknown'})")
-        return text
+        return structured_to_parseable(text)

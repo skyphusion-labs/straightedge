@@ -1,5 +1,7 @@
 # Contract
 
+`docs/TESTING.md` is the companion to this file: this one says what the suite enforces, that one says what a green suite cannot see. Read it before writing a fixture.
+
 Code that disagrees with this file is wrong.
 
 The bot is the Python process on this computer.
@@ -177,6 +179,45 @@ sends"). `Engine.start()` re-announces every open record on EVERY start.
 Advice JSON fields: `action`, `symbol`, `sl`, `tp`, `limit`, `stop`, `ticket`, `summary`.
 `limit` and `stop` are XOR.
 A close action with `ticket` stages that close.
+
+**The `claude` provider constrains the reply to a schema (straightedge#180).** The request sends
+`output_config.format` as a JSON schema whose `action` is an enum over the four actions above, with
+`additionalProperties: false` and every field required. The reply is therefore ONE object of NINE
+fields: the eight listed above plus `text`, which is the prose the operator reads. `text` exists
+because a schema-constrained reply has no room for prose outside the object, and `Advice.text` is
+what the desk renders.
+
+The schema is a second gate, never a replacement. `parse_advice` still produces every `Advice`, and
+the two read one pinned action vocabulary so they cannot disagree about what an action is. A reply
+that is not a schema object, which is what a proxy dropping `output_config` would produce, parses
+exactly as before: that is the degrade, and it is also what `grok` and `computer` use permanently,
+since neither can constrain output.
+
+A reply that VIOLATES the schema is treated as evidence the constraint did not apply, because it is
+applied by a server the desk does not run: the action is forced to `hold` and the reason is STATED
+in the prose. Not silently coerced, which is the distinction the Refusal record and Unmeasured is
+not refused rows require of every other gate.
+
+**A brace in `symbol` is a violation, and the symbol is never repaired.** `_JSON_TAIL` cannot match
+an object with a brace inside a string value, so such a reply used to fall back to `hold` with no
+symbol. `summary` is a label nobody trades on, so braces there are stripped to keep the object
+parseable. `symbol` NAMES THE INSTRUMENT: stripping braces there manufactures a different, tradeable
+symbol, and since the desk gates a model-chosen symbol on `advice.symbols`, `EUR{USD}` fails that
+gate loudly while `EURUSD` passes it. Repairing it would turn a named `symbol_not_allowed` refusal
+into a staged order on an instrument the model never named, so a braced symbol forces the hold and
+is reported as `null`.
+
+**A model-chosen symbol is checked BEFORE it is transformed, and a non-ASCII one is refused.** Same
+rule as the brace, one character further: `"EURU\u017fD".upper()` is `"EURUSD"`, because Unicode
+uppercasing maps U+017F LATIN SMALL LETTER LONG S onto ASCII `S`, so uppercasing a model-chosen name
+can MANUFACTURE a tradeable instrument the model never named. The ligatures `ff`, `fi`, `st`, the
+dotless `i` and `ss` (which expands to `SS`) do the same. So the name must already be ASCII:
+`advice_allows` refuses anything else, `parse_advice` leaves it exactly as sent rather than
+uppercasing it, the structured path reports `symbol ... is not ASCII` as a violation and holds, and
+the refusal NAMES the string the model sent rather than the one it uppercases to. `eurusd` still
+works, because an ASCII case fold is the same instrument. The operator's own whitelist is held to
+the same rule: a non-ASCII entry matches nothing rather than widening the list to a symbol nobody
+typed (straightedge#197).
 Default send is `/confirm`. `/approve always` sends after risk preview.
 `/approve always` is available in paper and demo without a live fuse.
 On `trade_mode=2`, arm live first (`--i-accept-risk` or `/live on I-ACCEPT-RISK`).
@@ -237,6 +278,51 @@ Trail default is off.
 
 Manual `/buy` `/sell` skip the session window.
 Auto does not.
+
+### One clock: the UTC day, and the venue offset is measured
+
+Every boundary in this file is the UTC day and the UTC wall clock: the session
+window, `skip_friday_after_utc`, the Saturday/Sunday block, `day_key`, the
+daily-loss budget, the two daily caps and the recap. There is no broker day
+anywhere in the contract.
+
+That had to be DECIDED rather than assumed, because before straightedge#172 it
+was accidentally both. MT4 and MT5 stamp bars with the broker server's own wall
+clock, the auto leg built its instant from the last bar's stamp and labelled it
+UTC without converting it, and the desk and recap paths used the bot's clock.
+One daily-loss budget had two different day boundaries, and which one applied
+depended on whether a human or the regime fired the trade. On the live UTC+3
+server the auto leg ran three hours early, which moved a configured 07:00-17:00
+window to 04:00-14:00 and let a `daily_loss` halt release three hours before
+the UTC day it was measured in had ended.
+
+The UTC day is the boundary, for three reasons. The operator's config is
+written in UTC (`start_utc`, `end_utc`, `skip_friday_after_utc`), so a budget
+on any other boundary is a budget the operator cannot see. The desk, the recap
+and the persisted `day_key` already roll on it. And a broker day is a
+per-server, DST-varying property, so keying the money budget to it would key it
+to something that moves without anyone editing anything.
+
+**The window is exact only to within the venue clock's measurement
+uncertainty.** A terminal whose own clock is drifted stamps its bars and its
+ticks identically, so the drift cancels from the measured difference and the
+grid snap then takes it out of the offset while the bar stamp keeps it: the
+instant every gate sees moves by that drift. The residual check caps it at the
+sample's uncertainty, which `2u < VENUE_CLOCK_GRID_SEC` (`constants.py`) holds
+strictly under half a grid step, so a configured 17:00 close is soft by at most
+that, in the direction of staying armed slightly longer. On the desk's own
+path the uncertainty is the MEASURED gap since its previous poll, seconds in a
+live loop, and anything beyond it refuses rather than sliding: measured through
+a real engine, a 90s drift against a 15s bound refuses, while the same 90s
+against a declared 180s bound moved a 17:00:00 instant to 16:58:30 and the
+session gate did not fire. The number has one home, `VENUE_CLOCK_GRID_SEC`;
+nothing here restates it.
+
+A bar's timestamp is therefore CONVERTED to UTC at the one seam where it enters
+the engine, using an offset measured off the venue (`docs/VENUE.md`, "The
+venue's clock is not UTC"). When that offset cannot be measured the auto leg
+REFUSES with `venue_clock_unmeasured` rather than assuming UTC. Manual commands
+are unaffected: they time themselves off the bot's clock and never off a bar.
 
 ## Loop survival
 

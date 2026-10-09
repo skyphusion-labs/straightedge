@@ -8,7 +8,7 @@ import time
 from datetime import datetime, timezone
 from typing import Any
 
-from straightedge.broker.base import Broker
+from straightedge.broker.base import Broker, venue_clock_of
 from straightedge.config import BotConfig
 from straightedge.constants import MT4_SEND_TIMEOUT_UNKNOWN
 from straightedge.desk import Desk
@@ -38,7 +38,7 @@ from straightedge.risk import (
     currency_exposure,
     day_key,
 )
-from straightedge.sizing import money_per_lot_at_stop, normalize_volume
+from straightedge.sizing import MissingStop, money_per_lot_at_stop, normalize_volume
 from straightedge.state import snapshot_path_for
 from straightedge.strategy import TrendStrategy
 from straightedge.telegram import TelegramClient, TgCommand
@@ -129,6 +129,59 @@ def _loss_distance(pos: Position, sl: float) -> float:
 #: REFUSED, COULD NOT MEASURE.
 ORDERS_UNMEASURED = "orders_unmeasured"
 
+#: The venue could not state its UTC offset, so WHEN it is cannot be measured.
+#:
+#: Same partition as `ORDERS_UNMEASURED` one line up, applied to the clock
+#: instead of the book: PASSED, REFUSED, COULD NOT MEASURE. A bar's `time`
+#: is the broker server's wall clock, every gate below the auto leg is
+#: written in UTC, and the offset between the two is a measurement. When it
+#: is missing the leg refuses, because the alternative is to assume UTC, and
+#: assuming UTC IS straightedge#172.
+VENUE_CLOCK_UNMEASURED = "venue_clock_unmeasured"
+
+#: The clock was measured and the venue's OWN BARS contradict it.
+#:
+#: A measured offset says what the server's wall clock reads now. The
+#: forming bar's open time is that same clock, from a different reply, and
+#: a server cannot be forming a bar that has not opened yet. So if the
+#: offset implies a server time EARLIER than the bar the venue just served,
+#: the tick stamp the offset came from was stale and the offset is wrong by
+#: that staleness.
+#:
+#: This NARROWS the one hole `VenueClock.measure` cannot close on its own; it
+#: does not close it, and the difference is measured rather than argued
+#: (straightedge#193). A staleness that is an exact multiple of the offset
+#: grid lands on a grid point and looks perfect, and the civil timezone band
+#: does not see it either (11h is 44 whole grid steps). Measured through the
+#: real adapter during the straightedge#182 review: a stamp frozen 2h at
+#: Friday's close on a UTC+3 server read as UTC+01:00, 5h as UTC-02:00, 11h
+#: as UTC-08:00. Every one of those implies a server time hours before the
+#: bar in hand, so every one of them refuses here.
+#:
+#: WHAT IT DOES NOT CATCH. The comparison is against the forming bar's OPEN,
+#: so it sees a staleness only once that staleness exceeds the AGE of that
+#: bar. It is therefore blind in the last moments before a bar closes:
+#: measured at a bar 899s old on a 900s series, with the caller's bound
+#: VIOLATED, a 900s-stale stamp is accepted and the instant is wrong by 900s.
+#: The residual is bounded by one bar period and the hole only opens when the
+#: measured bound is violated, which takes a defect in `step_symbol`'s own
+#: bookkeeping rather than anything a venue can do. The boundary is pinned by
+#: test rather than left to this sentence.
+#:
+#: It cannot produce a false refusal: a correct offset implies the server's
+#: real `now`, and the forming bar opened at or before that instant by
+#: definition. Both readings come from the same server clock, so our own
+#: clock cancels out of the comparison entirely. Swept across bar ages and
+#: staleness with an honest bound during the straightedge#182 review: 0 false
+#: refusals in 32 combinations.
+VENUE_CLOCK_BAR_DISAGREES = "venue_clock_bar_disagrees"
+
+#: Slack on that comparison, for the integer rounding of the paired sample
+#: only. It is NOT a staleness allowance: one second is below the grid by
+#: three orders of magnitude, so it can absorb a rounding edge and nothing
+#: else.
+VENUE_CLOCK_BAR_SLACK_SEC = 1
+
 
 class Engine:
     def __init__(
@@ -155,6 +208,23 @@ class Engine:
         self.strategy = TrendStrategy(cfg.strategy)
         self.now_fn = now_fn or (lambda: datetime.now(timezone.utc))
         self.last_bar_time: dict[str, int] = {}
+        #: When this symbol was last polled, on the MONOTONIC clock.
+        #:
+        #: This is the measured staleness bound for the venue clock, and it
+        #: is the whole reason a bar-derived instant can be trusted. A bar
+        #: advanced between the previous poll and this one, so a tick
+        #: arrived in that interval, so `TimeCurrent()` cannot be older
+        #: than the interval. Monotonic on purpose: a wall-clock step (NTP,
+        #: a DST-confused host) must not be able to widen a safety bound.
+        #:
+        #: It is MEASURED rather than derived from `poll_seconds`, because
+        #: this repo's own tick budget for a live MT4 config is 270s of
+        #: bounded part with an explicitly unbounded tail, and
+        #: `watchdog.py` publishes `tick_gap_max_s` precisely because that
+        #: budget can be exceeded. A number the codebase already
+        #: instruments because it can be false is not a bound
+        #: (straightedge#182 review).
+        self._last_poll_mono: dict[str, float] = {}
         self.halted = False
         #: The `day_key` the daily recap has already been emitted for.
         #:
@@ -957,6 +1027,9 @@ class Engine:
             return
         last_t = bars[-1].time
         prev = self.last_bar_time.get(symbol)
+        polled_at = time.monotonic()
+        since_last_poll = polled_at - self._last_poll_mono.get(symbol, polled_at)
+        self._last_poll_mono[symbol] = polled_at
         if prev is None:
             # First poll: pin the last bar so we do not dump-trade history.
             self.last_bar_time[symbol] = last_t
@@ -964,15 +1037,114 @@ class Engine:
         if last_t <= prev:
             return
         self.last_bar_time[symbol] = last_t
-        self._act(symbol, bars)
+        # The gate above is what makes the bound below true, and the two have
+        # to stay together: a bar advanced since the previous poll, so a tick
+        # arrived inside `since_last_poll`, so the venue's stamp is no older
+        # than that. Remove the advance gate and this bound becomes a guess.
+        self._act(symbol, bars, max_staleness_sec=since_last_poll)
 
     def replay_symbol(self, symbol: str, bars: list[Bar]) -> None:
+        """Act on bars handed in directly. The backtest and test seam.
+
+        `max_staleness_sec=None`, deliberately: there is no previous poll here
+        and no advance gate, so nothing on this path can bound how old a
+        sampled venue stamp is. A venue that SAMPLES a server therefore cannot
+        be measured through this entry point and the leg refuses by name,
+        which is the honest outcome; a venue that DECLARES its offset (paper,
+        and so every backtest) is unaffected. The straightedge#182 review
+        named this caller as the one that would otherwise inherit the engine's
+        bound without owning the gate that justifies it.
+        """
         if self.halted:
             return
-        self._act(symbol, bars)
+        self._act(symbol, bars, max_staleness_sec=None)
 
-    def _act(self, symbol: str, bars: list[Bar]) -> None:
-        now = datetime.fromtimestamp(bars[-1].time, tz=timezone.utc) if bars else self.now_fn()
+    def _bar_instant(
+        self, symbol: str, bars: list[Bar], max_staleness_sec: float | None
+    ) -> datetime | None:
+        """The real UTC instant the auto leg is acting at, or None to refuse.
+
+        THE one seam where a venue timestamp becomes a wall-clock instant.
+        Everything below this line is written in UTC: `in_session`, the
+        `day_key` the daily-loss budget is keyed on, `weekday()` for the
+        weekend block and the Friday cutoff.
+
+        What straightedge#172 was. This line read
+
+            datetime.fromtimestamp(bars[-1].time, tz=timezone.utc)
+
+        and a bar's `time` is the BROKER SERVER's wall clock (docs/VENUE.md),
+        so `tz=timezone.utc` RELABELLED the instant instead of converting it.
+        On the live UTC+3 desk that moved the configured 07:00-17:00 window to
+        04:00-14:00, gave the auto leg a different day boundary from the desk
+        and the recap (both of which use `now_fn`), and let a `daily_loss`
+        halt clear up to the broker offset EARLY, because `observe()` releases
+        it on the day-key change and the broker day crosses midnight first.
+
+        The offset is MEASURED off the venue and is never configured or
+        guessed; see `VenueClock`. When the venue cannot state it, this leg
+        REFUSES and journals why. It does not fall back to UTC: a fallback
+        here is the defect with a comment on it, and the standing rule from
+        straightedge#68 is that an unmeasured spec refuses rather than
+        defaults. Direction of harm is a missed auto entry.
+
+        `bars` empty keeps the desk clock, unchanged: there is no venue
+        timestamp in play, so there is nothing to convert and nothing to
+        refuse.
+        """
+        if not bars:
+            return self.now_fn()
+        clock = venue_clock_of(
+            self.broker, symbol, max_staleness_sec=max_staleness_sec
+        )
+        if not clock.measured:
+            # journal.write, never _emit: a refusal is not broadcast to chat.
+            # source and stage are what let one reject event name every path
+            # apart, exactly as the ORDERS_UNMEASURED refusal below does.
+            self.journal.write(
+                "reject",
+                source="auto",
+                stage="signal",
+                symbol=symbol,
+                reason=VENUE_CLOCK_UNMEASURED,
+                unmeasured=sorted(clock.unmeasured),
+                venue=clock.source,
+                detail=clock.detail,
+            )
+            return None
+        # The venue's own bars, checked against the venue's own clock. See
+        # VENUE_CLOCK_BAR_DISAGREES: this is what makes a stale stamp
+        # unreachable rather than merely unlikely, and it is the only check
+        # here that can see a staleness sitting exactly on the offset grid.
+        # `clock.sampled` is the gate and `clock.measured_at` is the operand.
+        # Those were one field before straightedge#193, with a zero timestamp
+        # standing in for "nothing was sampled"; `VenueClock.__post_init__`
+        # now guarantees a sampled clock carries a real one, so the arithmetic
+        # below cannot be fed a sentinel.
+        implied_server_now = clock.measured_at + (clock.offset_sec or 0)
+        if clock.sampled and (
+            implied_server_now + VENUE_CLOCK_BAR_SLACK_SEC < bars[-1].time
+        ):
+            self.journal.write(
+                "reject",
+                source="auto",
+                stage="signal",
+                symbol=symbol,
+                reason=VENUE_CLOCK_BAR_DISAGREES,
+                offset_sec=clock.offset_sec,
+                venue=clock.source,
+                bar_time=bars[-1].time,
+                implied_server_now=implied_server_now,
+            )
+            return None
+        return clock.to_utc(bars[-1].time)
+
+    def _act(
+        self, symbol: str, bars: list[Bar], *, max_staleness_sec: float | None
+    ) -> None:
+        now = self._bar_instant(symbol, bars, max_staleness_sec)
+        if now is None:
+            return
         acct = self.broker.account()
         if self._apply_circuit(acct, now):
             return
@@ -1628,10 +1800,27 @@ class Engine:
         not_measured = spec.unmeasured_for_sizing()
         if not_measured:
             return "refused: spec_not_measured:" + ",".join(sorted(not_measured))
-        worst = money_per_lot_at_stop(px, sl, spec) * order.volume
-        # WHAT IS ALREADY RESTING, measured the same way, because the question the
-        # cap should ask is whether this replacement ADDS risk (#164).
-        worst_resting = money_per_lot_at_stop(order.price, order.sl, spec) * order.volume
+        # A MISSING STOP IS NAMED, NOT PRICED (#187). `sl` here is the resting
+        # order's own stop, which `/replace` does not change, so a venue-supplied
+        # `sl = 0` reaches both of these. It is the one call site that can:
+        # `_stop_guard` returns early on `sl <= 0` and `risk.evaluate` refuses
+        # `sl_required` before its own call and before `lots_for_risk`.
+        #
+        # Measured before this refusal existed, on a 0.1 lot order resting with
+        # no stop: `worst_resting` was 11,506.70 against a 50.00 cap, so moving
+        # the entry DOWN entered #164's reduction carve-out and the cap was never
+        # consulted, while moving it UP refused with `size_exceeds_risk`, which
+        # blames the size for a missing stop. Neither sent anything, because
+        # `_modify_pending` refuses `sl <= 0` on the way out, so this was a defect
+        # in what the desk SAYS rather than what it does. Being told the wrong
+        # thing about your own book is the whole reason the vocabulary exists.
+        try:
+            worst = money_per_lot_at_stop(px, sl, spec) * order.volume
+            # WHAT IS ALREADY RESTING, measured the same way, because the question
+            # the cap should ask is whether this replacement ADDS risk (#164).
+            worst_resting = money_per_lot_at_stop(order.price, order.sl, spec) * order.volume
+        except MissingStop:
+            return "refused: sl_required"
         account = self.broker.account()
         r = self.cfg.risk
         per_trade = account.equity * r.risk_pct * r.max_risk_multiple
