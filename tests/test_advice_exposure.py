@@ -30,7 +30,11 @@ from straightedge.risk import currency_exposure
 from straightedge.synthetic import generate_bars
 from straightedge.telegram import TgCommand
 
-_ROW = re.compile(r"^([A-Z]{2,8}) net=([+-]\d+) room=(\d+)$")
+# `room` accepts a MINUS on purpose (#175). The clamp is what keeps room
+# non-negative, so a parser that cannot match a negative cannot observe the
+# clamp failing: the row would simply stop matching and the test would red on
+# a KeyError instead of on the number it exists to check.
+_ROW = re.compile(r"^([A-Z]{2,8}) net=([+-]\d+) room=(-?\d+)$")
 
 
 class FakeLlm:
@@ -408,4 +412,103 @@ def test_risk_text_room_is_the_remaining_budget_not_a_constant(tmp_path) -> None
         f"drawdown={dd:.2f}/{dd_cap:.2f} room={max(dd_cap - dd, 0.0):.2f}"
     ) in text, text
     assert "room=0.00" not in text, "a constant zero satisfies a shape-only assertion"
+    engine.stop()
+
+
+def test_a_cap_lowered_below_the_open_book_reports_zero_room(tmp_path) -> None:
+    """The `max(..., 0)` clamp, which no instrument could see before this (#175).
+
+    Strummer swept all 55 `(cap, net)` pairs for cap 0..4 and net -5..+5 against
+    #169: THIRTY report negative room unclamped, and every one of them needs
+    `abs(net) > cap`. That state cannot arise from the gate's own accounting,
+    because the gate refuses the commitment that would cross the cap. It needs
+    either a cap LOWERED in config after positions were already open, or foreign
+    positions carrying our magic.
+
+    This takes the lowered-cap route: reachable through config alone, no
+    foreign-magic fixture, and the same shape as the non-default-cap fixture.
+
+    Why it is worth a test even though it is cosmetic: the number is reported
+    INTO THE ADVICE PROMPT. A negative budget is not merely wrong, it invites
+    the model to treat room as a signed quantity it can spend back toward zero.
+    """
+    engine = _engine(tmp_path)
+    engine.start()
+    _plant_two_usd_shorts(engine)
+
+    # The operator tightens the limit while the book is already open. Nothing
+    # here asks the engine to permit anything, so this changes no decision.
+    engine.cfg.risk.max_currency_exposure = 1
+
+    text = engine.exposure_text()
+    cap, net, room = _parse(text)
+    assert cap == 1
+    assert net["USD"] == -2, "the book must exceed the new cap, or there is nothing to clamp"
+    assert abs(net["USD"]) > cap, (net["USD"], cap)
+
+    # Unclamped this is cap - abs(net) = 1 - 2 = -1.
+    assert room["USD"] == 0, f"reported room {room['USD']} for USD; the clamp did not hold"
+    assert all(v >= 0 for v in room.values()), room
+    assert "room=-" not in text, text
+    engine.stop()
+
+
+def test_a_zero_cap_over_an_open_book_reports_zero_room_everywhere(tmp_path) -> None:
+    """The strongest point in the sweep: every leg goes negative unclamped.
+
+    At cap 0 all three codes are over, so a single-currency assertion cannot be
+    what passes here. Separate from the test above because that one leaves EUR
+    and GBP at exactly zero room rather than past it, so it does not exercise
+    the clamp on them.
+    """
+    engine = _engine(tmp_path)
+    engine.start()
+    _plant_two_usd_shorts(engine)
+    engine.cfg.risk.max_currency_exposure = 0
+
+    text = engine.exposure_text()
+    cap, net, room = _parse(text)
+    assert cap == 0
+    # The codes come from the ENGINE's own computation, not from a literal.
+    # Hardcoding {"EUR","GBP","USD"} coupled this test to which symbols
+    # `_plant_two_usd_shorts` happens to buy: #176 changes its second leg to
+    # LINKUSD so the book is not 3+3, and the two changes merge CLEANLY while
+    # the combined suite reds. Measured, not predicted. A clean merge is not a
+    # passing merge, and an assertion naming a fixture detail it does not care
+    # about is what turns an unrelated fixture edit into a failure.
+    assert set(room) == set(currency_exposure(_committed(engine)))
+    assert all(abs(net[c]) > cap for c in room), net
+    assert set(room.values()) == {0}, room
+    assert "room=-" not in text, text
+    engine.stop()
+
+
+def test_no_negative_room_reaches_the_advice_prompt(tmp_path) -> None:
+    """End of the chain: the snapshot the model is actually handed.
+
+    `exposure_text` can be clamped and the context still carry something else,
+    and the prompt is where the number does its damage.
+    """
+    payload = {
+        "choices": [
+            {
+                "message": {
+                    "content": (
+                        "Hold.\n"
+                        '{"action":"hold","symbol":null,"sl":null,"tp":null,"summary":"x"}'
+                    )
+                }
+            }
+        ]
+    }
+    llm = FakeLlm(payload)
+    engine = _engine(tmp_path, llm=llm)
+    engine.start()
+    _plant_two_usd_shorts(engine)
+    engine.cfg.risk.max_currency_exposure = 1
+    engine.handle_command(TgCommand("1", 1, "/ask how much room is left?", 5))
+
+    blob = str(llm.sent[0][1])
+    assert "USD net=-2 room=0" in blob
+    assert "room=-" not in blob, blob
     engine.stop()

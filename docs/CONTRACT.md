@@ -177,6 +177,33 @@ sends"). `Engine.start()` re-announces every open record on EVERY start.
 Advice JSON fields: `action`, `symbol`, `sl`, `tp`, `limit`, `stop`, `ticket`, `summary`.
 `limit` and `stop` are XOR.
 A close action with `ticket` stages that close.
+
+**The `claude` provider constrains the reply to a schema (straightedge#180).** The request sends
+`output_config.format` as a JSON schema whose `action` is an enum over the four actions above, with
+`additionalProperties: false` and every field required. The reply is therefore ONE object of NINE
+fields: the eight listed above plus `text`, which is the prose the operator reads. `text` exists
+because a schema-constrained reply has no room for prose outside the object, and `Advice.text` is
+what the desk renders.
+
+The schema is a second gate, never a replacement. `parse_advice` still produces every `Advice`, and
+the two read one pinned action vocabulary so they cannot disagree about what an action is. A reply
+that is not a schema object, which is what a proxy dropping `output_config` would produce, parses
+exactly as before: that is the degrade, and it is also what `grok` and `computer` use permanently,
+since neither can constrain output.
+
+A reply that VIOLATES the schema is treated as evidence the constraint did not apply, because it is
+applied by a server the desk does not run: the action is forced to `hold` and the reason is STATED
+in the prose. Not silently coerced, which is the distinction the Refusal record and Unmeasured is
+not refused rows require of every other gate.
+
+**A brace in `symbol` is a violation, and the symbol is never repaired.** `_JSON_TAIL` cannot match
+an object with a brace inside a string value, so such a reply used to fall back to `hold` with no
+symbol. `summary` is a label nobody trades on, so braces there are stripped to keep the object
+parseable. `symbol` NAMES THE INSTRUMENT: stripping braces there manufactures a different, tradeable
+symbol, and since the desk gates a model-chosen symbol on `advice.symbols`, `EUR{USD}` fails that
+gate loudly while `EURUSD` passes it. Repairing it would turn a named `symbol_not_allowed` refusal
+into a staged order on an instrument the model never named, so a braced symbol forces the hold and
+is reported as `null`.
 Default send is `/confirm`. `/approve always` sends after risk preview.
 `/approve always` is available in paper and demo without a live fuse.
 On `trade_mode=2`, arm live first (`--i-accept-risk` or `/live on I-ACCEPT-RISK`).
