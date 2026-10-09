@@ -9,9 +9,7 @@ from straightedge.config import AdviceConfig, BotConfig
 from straightedge.constants import (
     ORDER_TYPE_BUY,
     ORDER_TYPE_SELL,
-    TRADE_ACTION_CLOSE_BY,
     TRADE_ACTION_DEAL,
-    TRADE_ACTION_SLTP,
     TRADE_RETCODE_DONE,
     TRADE_RETCODE_INVALID,
     TRADE_RETCODE_INVALID_STOPS,
