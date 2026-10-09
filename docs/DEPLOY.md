@@ -212,6 +212,63 @@ wrong answer in place of an honest absent one. A corrupt stamp, a stamp that is
 valid JSON but not an object, and a stamp with no commit all read as
 `unstamped` too: a ref that names no tree must not look like an answer.
 
+## A skew check that lives only in the newer half cannot fire (#142)
+
+A record, kept here because this is where someone splitting a deployment across
+two artifacts looks first. No fix is proposed and a version handshake is
+deliberately NOT one (see "Not a version handshake" above).
+
+**The property.** A version-skew check that lives only in the newer half cannot
+fire when the older half is what is deployed. The check and the thing it checks
+arrived in the same commit, so the only configuration in which the check is
+needed is the one in which it is absent.
+
+**The instance.** #84 added a skew check in both directions at once, and every
+symbol below entered the tree in `80a2c4a` and nowhere else (re-measured on
+`main` at `b8d7d74` with `git log --format=%h -S<symbol> -- <file>`; each symbol
+returns only `80a2c4a`):
+
+| half | symbol | role |
+| --- | --- | --- |
+| Expert | `ladder_ms`, `broker_calls`, `fence` on every ping reply | declares its own worst case |
+| desk | `_read_declaration` | reads the declaration |
+| desk | `ea_ladder_ms`, and the WARNING on every ping the budget does not clear | judges it |
+| desk | `send_fence_report` | reports it to `doctor --connect`, which exits 1 on `TOO SHORT` |
+| desk | `declaration_matches_shipped` | reports a disagreement with this repo's own copy |
+
+Measured on the live box on 2026-10-08, and NOT re-measured since (deployment
+status is read live, never assumed; the figures are here so the finding is
+reproducible, not to be quoted as current): the Expert fingerprinted to `80a2c4a`
+(#84) or `c324148` (#94) and declared `ladder_ms`, while the desk was at
+`fe757a4c` (#80), where `_read_declaration`, `send_fence_report`, `ea_ladder_ms`
+and `ladder_ms` each appeared 0 times. So the Expert stated its worst case on
+every ping and nothing listened: the desk ran one 5000ms budget where #84's
+derivation says a send needs 7060ms. `doctor --connect` could not surface it
+either, because the `send fence:` line is in the missing half: a pre-#84 desk
+against a post-#84 Expert reports a clean connect, the shape of a check that
+cannot distinguish two states and reports the reassuring one.
+
+**Resolution of the instance (historical).** #143 was closed as completed on
+2026-10-08T17:37:39Z with "The desk is deployed. 25 commits were behind on the
+demo box. That is fixed." So this skew existed and has been closed by that
+deploy. What remains true is the mechanism, which is the reason this section is
+kept: the next split deployment will have the same shape, and the check will be
+absent in exactly the configuration that needs it.
+
+**Two counting traps found while telling the halves apart.**
+
+- `Select-String` counts matching LINES, not occurrences. `@(Select-String -Path
+  $f -Pattern 'ClaimOpenRetries').Count` returns one object per line, so a
+  version with 3 occurrences on 2 lines reads as `2`, matches no commit by
+  occurrence, and looks stale. Count by line consistently, or by occurrence
+  consistently, and say which.
+- Content fingerprints a deployment; an mtime does not. The deployed Expert's
+  mtime was `2026-09-26T06:08:28Z`, six minutes BEFORE the earliest commit whose
+  content it matches merged (`80a2c4a` was committed `2026-09-26T02:14:49-04:00`,
+  which is `06:14:49Z`). The likely cause is a copy taken off the PR branch
+  before the squash-merge stamped a time. Compare content (a hash against
+  `git show <commit>:mt4/Experts/Mt4RiskBot.mq4`), never timestamps.
+
 ## Installing supervision on a desk that is already running
 
 This is the case the box is actually in: live, unattended, autonomous on gold,
