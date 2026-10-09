@@ -776,3 +776,137 @@ def test_a_stamp_one_poll_stale_still_passes_the_bar_check(tmp_path: Path) -> No
     engine.step_symbol("EURUSD")
     assert "venue_clock_bar_disagrees" not in _reject_reasons(engine)
     engine.stop()
+
+
+# --- 9. the error bar the type does not carry ------------------------------
+
+
+class _DriftedVenue(PaperBroker):
+    """A terminal whose OWN clock is wrong by `drift`, like everything it serves.
+
+    This is the input strummer's addendum found: the drift cancels out of the
+    measured difference, the grid snap takes it out of the offset, and the bar
+    stamp still carries it, so the instant every gate sees moves by exactly
+    `drift`. It is the only error source left in the measured path.
+    """
+
+    def __init__(self, *, drift: float, offset_sec: int = PLUS_3, **kw: object) -> None:
+        super().__init__(utc_offset_sec=offset_sec, **kw)  # type: ignore[arg-type]
+        self.drift = float(drift)
+        self.our_clock = SESSION_CLOSE.timestamp()
+
+    def venue_clock(self, name: str, *, max_staleness_sec: float | None = None):
+        del name
+        stamp = int(self.our_clock + self.utc_offset_sec + self.drift)
+        if max_staleness_sec is None:
+            return VenueClock.implied(stamp, self.our_clock, source="drifted")
+        return VenueClock.measure(
+            stamp,
+            self.our_clock,
+            source="drifted",
+            max_staleness_sec=max_staleness_sec,
+        )
+
+
+#: The bar's TRUE UTC instant, placed exactly on the configured session close.
+SESSION_CLOSE = datetime(2024, 1, 4, 17, 0, tzinfo=timezone.utc)
+#: The widest bound the grid rule can accept, and the first one it cannot.
+WIDEST_LEGAL_BOUND = VENUE_CLOCK_GRID_SEC / 2 - 1
+NARROWEST_ILLEGAL_BOUND = VENUE_CLOCK_GRID_SEC / 2
+
+
+def _session_engine(tmp_path: Path, broker: PaperBroker) -> tuple[Engine, list]:
+    cfg = BotConfig()
+    cfg.journal_path = str(tmp_path / "j.jsonl")
+    cfg.session.enabled = True  # the shipped 07:00-17:00 UTC window
+    cfg.risk.halt_file = str(tmp_path / "HALT")
+    cfg.risk.max_spread_atr_frac = 10.0
+    n = 250
+    last = int(SESSION_CLOSE.timestamp()) + broker.utc_offset_sec + int(
+        getattr(broker, "drift", 0)
+    )
+    bars = generate_bars(
+        n, drift=0.0006, vol=0.0002, seed=7, start_ts=last - (n - 1) * HOUR
+    )
+    broker.seed_bars("EURUSD", bars)
+    engine = Engine(
+        cfg, broker, halt_dir=str(tmp_path), now_fn=lambda: SESSION_CLOSE
+    )
+    return engine, bars
+
+
+def test_no_drift_puts_the_boundary_exactly_where_the_config_says(
+    tmp_path: Path,
+) -> None:
+    """The reference row. A bar ON the close is outside the window."""
+    broker = _DriftedVenue(drift=0, balance=10_000)
+    engine, bars = _session_engine(tmp_path, broker)
+    engine.start()
+    engine._act("EURUSD", bars, max_staleness_sec=POLL)
+    assert "outside_session" in _reject_reasons(engine)
+    engine.stop()
+
+
+@pytest.mark.parametrize("drift", (-90, -179, -449))
+def test_a_drift_wider_than_the_bound_refuses_instead_of_sliding(
+    tmp_path: Path, drift: float
+) -> None:
+    """On the desk's own path the softness is the MEASURED poll gap, seconds.
+
+    Every one of these drifts was absorbed silently under the chosen 180s
+    tolerance this change started with, moving a 17:00:00 instant back inside
+    the window and leaving the desk armed up to three minutes past its
+    configured close. Against a measured bound they refuse by name.
+    """
+    broker = _DriftedVenue(drift=drift, balance=10_000)
+    engine, bars = _session_engine(tmp_path, broker)
+    engine.start()
+    engine._act("EURUSD", bars, max_staleness_sec=POLL)
+    reasons = _reject_reasons(engine)
+    assert VENUE_CLOCK_UNMEASURED in reasons, (
+        f"a {drift}s drift was absorbed against a {POLL}s bound"
+    )
+    assert not engine.broker.positions(magic=engine.cfg.risk.magic)
+    engine.stop()
+
+
+def test_the_worst_legal_bound_absorbs_its_own_width_and_that_is_disclosed(
+    tmp_path: Path,
+) -> None:
+    """The error bar, pinned at its worst legal value.
+
+    A caller declaring the widest bound the grid rule accepts absorbs a drift
+    of that width: the instant slides and the session gate does not fire. That
+    is the softness `docs/CONTRACT.md` and `VenueClock` disclose, and this is
+    the test that keeps the disclosure true. One second wider and nothing is
+    measured at all, so the softness cannot grow past half a grid step.
+    """
+    broker = _DriftedVenue(drift=-WIDEST_LEGAL_BOUND, balance=10_000)
+    engine, bars = _session_engine(tmp_path, broker)
+    engine.start()
+    clock = broker.venue_clock("EURUSD", max_staleness_sec=WIDEST_LEGAL_BOUND)
+    assert clock.measured and clock.offset_sec == PLUS_3
+    seen = clock.to_utc(bars[-1].time)
+    assert seen == SESSION_CLOSE - timedelta(seconds=WIDEST_LEGAL_BOUND), (
+        "the absorbed error is exactly the terminal's drift"
+    )
+    engine._act("EURUSD", bars, max_staleness_sec=WIDEST_LEGAL_BOUND)
+    assert "outside_session" not in _reject_reasons(engine), (
+        "this row is the disclosure: inside the bound, the window is soft"
+    )
+    engine.stop()
+
+
+def test_one_second_past_the_grid_rule_measures_nothing_at_all(
+    tmp_path: Path,
+) -> None:
+    """The cap on that softness, so it cannot be widened by a caller."""
+    broker = _DriftedVenue(drift=0, balance=10_000)
+    engine, bars = _session_engine(tmp_path, broker)
+    engine.start()
+    got = broker.venue_clock("EURUSD", max_staleness_sec=NARROWEST_ILLEGAL_BOUND)
+    assert not got.measured
+    assert "too wide" in got.detail
+    engine._act("EURUSD", bars, max_staleness_sec=NARROWEST_ILLEGAL_BOUND)
+    assert VENUE_CLOCK_UNMEASURED in _reject_reasons(engine)
+    engine.stop()

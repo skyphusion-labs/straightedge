@@ -262,6 +262,21 @@ and the persisted `day_key` already roll on it. And a broker day is a
 per-server, DST-varying property, so keying the money budget to it would key it
 to something that moves without anyone editing anything.
 
+**The window is exact only to within the venue clock's measurement
+uncertainty.** A terminal whose own clock is drifted stamps its bars and its
+ticks identically, so the drift cancels from the measured difference and the
+grid snap then takes it out of the offset while the bar stamp keeps it: the
+instant every gate sees moves by that drift. The residual check caps it at the
+sample's uncertainty, which `2u < VENUE_CLOCK_GRID_SEC` (`constants.py`) holds
+strictly under half a grid step, so a configured 17:00 close is soft by at most
+that, in the direction of staying armed slightly longer. On the desk's own
+path the uncertainty is the MEASURED gap since its previous poll, seconds in a
+live loop, and anything beyond it refuses rather than sliding: measured through
+a real engine, a 90s drift against a 15s bound refuses, while the same 90s
+against a declared 180s bound moved a 17:00:00 instant to 16:58:30 and the
+session gate did not fire. The number has one home, `VENUE_CLOCK_GRID_SEC`;
+nothing here restates it.
+
 A bar's timestamp is therefore CONVERTED to UTC at the one seam where it enters
 the engine, using an offset measured off the venue (`docs/VENUE.md`, "The
 venue's clock is not UTC"). When that offset cannot be measured the auto leg
