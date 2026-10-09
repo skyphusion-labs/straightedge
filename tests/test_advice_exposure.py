@@ -43,7 +43,7 @@ class FakeLlm:
         return self.payload
 
 
-def _engine(tmp_path, *, symbols=("EURUSD", "GBPUSD", "AUDUSD"), llm=None) -> Engine:
+def _engine(tmp_path, *, symbols=("EURUSD", "LINKUSD", "AUDUSD"), llm=None) -> Engine:
     cfg = BotConfig()
     cfg.journal_path = str(tmp_path / "j.jsonl")
     cfg.session.enabled = False
@@ -52,7 +52,9 @@ def _engine(tmp_path, *, symbols=("EURUSD", "GBPUSD", "AUDUSD"), llm=None) -> En
     cfg.symbols = list(symbols)
     broker = PaperBroker(balance=10_000)
     seed = 3
-    for name in ("EURUSD", "GBPUSD", "AUDUSD", "EURJPY", "EURGBP", "DOGEUSD", "US30"):
+    for name in (
+        "EURUSD", "GBPUSD", "LINKUSD", "AUDUSD", "EURJPY", "EURGBP", "DOGEUSD", "US30"
+    ):
         broker.seed_bars(name, generate_bars(120, drift=0.0004, vol=0.0002, seed=seed))
         seed += 1
     advisor = None
@@ -97,9 +99,29 @@ def _committed(engine: Engine) -> list[Position | PendingOrder]:
 
 
 def _plant_two_usd_shorts(engine: Engine) -> None:
-    """Buy EURUSD and GBPUSD: USD reaches -2, which is exactly the cap."""
+    """Buy EURUSD and LINKUSD: USD reaches -2, which is exactly the cap.
+
+    THE SECOND LEG IS NOT 3+3 ON PURPOSE (#176). It was GBPUSD, and every other
+    book in this file is 3+3 too, so a naive `symbol[:3]`/`[3:6]` split agreed
+    with a real `parse_fx` lookup by accident on all of them. That left
+    `test_a_non_three_letter_code_is_netted_the_way_the_gate_nets_it` as the
+    SOLE instrument for two separate properties: the aggregation inside
+    `exposure_text`, and `risk.currency_exposure` resolving rather than
+    splitting. Measured before this change: reverting `currency_exposure` to a
+    naive split red exactly ONE test in this file.
+
+    `LINKUSD` resolves to LINK/USD through the code table and to LIN/KUS under a
+    split, so the nine-odd tests that plant this book can now all see property
+    two. It is a different code from DOGEUSD deliberately, so the two
+    instruments do not share a fate: the issue's own example of how the single
+    instrument could vanish was someone deciding a joke symbol does not belong
+    in a public repo.
+
+    USD still reaches exactly -2, so every assertion built on this book is
+    unchanged; only the currency that is not USD has a different name.
+    """
     assert _open(engine, "/buy EURUSD", 1).startswith("sent buy"), "EURUSD leg did not open"
-    assert _open(engine, "/buy GBPUSD", 3).startswith("sent buy"), "GBPUSD leg did not open"
+    assert _open(engine, "/buy LINKUSD", 3).startswith("sent buy"), "LINKUSD leg did not open"
 
 
 def test_exposure_matches_the_gates_own_computation(tmp_path) -> None:
