@@ -343,6 +343,25 @@ The desk does NOT widen it by itself.
 A gate that widens itself until it stops firing is not a gate.
 Report `over_budget=1`. Do not ignore it.
 
+`tick_gap_max_s` and `over_budget` count THIS PROCESS only.
+A restart sets them back to zero.
+That is correct. After a restart this process really is clean.
+`tick_gap_ever_s` and `over_budget_ever` count THIS BOX.
+A restart does NOT set them back.
+Ask `tick_gap_max_s` if the desk is slow NOW.
+Ask `tick_gap_ever_s` if this box has EVER been slow.
+`over_budget_ever=1` with `over_budget=0` means a breach before the restart.
+Report that too.
+The book did not get smaller because the desk restarted.
+Do not delete `journal.heartbeat`.
+That file carries the box history. Deleting it resets `tick_gap_ever_s`.
+An older desk writes no `over_budget_ever`.
+Then `watch` says it cannot report the box history.
+It does NOT read the missing field as clean.
+Each breach also writes one `tick_gap_breach` record in the journal.
+Use the journal to COUNT breaches.
+The heartbeat holds only the worst one.
+
 ### What `watch` cannot tell you
 
 `STALE` does not prove the process is gone.
@@ -1313,7 +1332,9 @@ Both mean the bot could not measure. Neither is treated as a clean start.
 Unix: flock. Windows: msvcrt.locking.
 `journal.heartbeat` is rewritten each successful `step_all`.
 Line 1 is an ISO timestamp. Then `blocked=`, `mode=`, `stale_after_s=`,
-`tick_budget_s=`, `tick_gap_max_s=`, and `over_budget=`.
+`tick_budget_s=`, `tick_gap_max_s=`, `over_budget=`, `tick_gap_ever_s=`,
+`over_budget_ever=`, `run_id=`, `started_at=`, and `deployed=`.
+This list did not name `run_id=`, `started_at=` or `deployed=`. It does now.
 `blocked=` carries the gate reason, from the same call that refuses a send.
 `watch` reads it. See `Watchdog`.
 Before a write that would exceed 10 MiB, the live file is renamed to `journal.jsonl.1`.

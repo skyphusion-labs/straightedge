@@ -349,7 +349,10 @@ The lock is released on exit or crash.
 Each `step_all` that reaches `account` writes `journal.heartbeat`.
 Line 1 is an ISO timestamp, and that has not changed since 1.0.0.
 After it, one `key=value` per line: `blocked=`, `mode=`, `stale_after_s=`,
-`tick_budget_s=`, `tick_gap_max_s=`, `over_budget=`, `run_id=`, `started_at=`.
+`tick_budget_s=`, `tick_gap_max_s=`, `over_budget=`, `tick_gap_ever_s=`,
+`over_budget_ever=`, `run_id=`, `started_at=`, `deployed=`.
+(`deployed=` was shipped by 1.6.0 and this list did not name it; corrected
+here rather than left for a reader to find in the renderer.)
 `run_id=` is one value per desk PROCESS, assigned at construction and never
 reassigned, and `started_at=` is when that process started.
 A reader compares `run_id` across observations to see a RESTART. It is not the
@@ -366,6 +369,27 @@ ceiling and the venue `timeout_ms` of the mode in use. A reader that finds it
 missing or unreadable reports UNKNOWN and refuses to invent a threshold.
 `over_budget=1` means an observed gap between ticks exceeded the derived budget.
 The desk reports that and does NOT widen its own threshold.
+TWO PAIRS, TWO QUESTIONS, and a reader must not substitute one for the other.
+`tick_gap_max_s` and `over_budget` are THIS PROCESS: the largest gap this desk
+process has observed. A restart resets them, and that is correct, because a
+desk whose book has shrunk has to be able to report a clean budget again.
+`tick_gap_ever_s` and `over_budget_ever` are THIS BOX: the largest gap carried
+forward across restarts. A restart does NOT reset them, because what a breach
+tests is whether the derived allowance is adequate for this BOOK, and a restart
+changes neither the allowance nor the book.
+`over_budget_ever=1` with `over_budget=0` means this box breached before the
+last restart. It is not a stale reading; it is the one a restart used to erase.
+`tick_gap_ever_s` is a maximum over the heartbeats that SURVIVED, and it is
+never lower than what the live process has itself observed. Deleting
+`journal.heartbeat` resets it, and that is the only way to lose the box history.
+A desk too old to publish `over_budget_ever` leaves the box history UNKNOWN. A
+reader says so and does NOT read the missing field as a clean history, the same
+rule this file already states for a missing `stale_after_s`.
+Every breach also appends a `tick_gap_breach` journal record carrying `gap_s`,
+`budget_s`, `symbols` and `run_id`, once per process per breach. The heartbeat
+holds the worst gap; the journal is what can answer how OFTEN. The journal is
+not the store for the maximum: rotation is one generation and `tail` reads only
+the live file, so a maximum recovered by scanning it would be a lower bound.
 The file is chmod 0600, atomic replace.
 A failed reconnect does not.
 `straightedge watch` reads the file. It exits 0 for `ALIVE ARMED`, 3 for
