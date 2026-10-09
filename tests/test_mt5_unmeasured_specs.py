@@ -382,3 +382,110 @@ class TestThereIsNoOtherReader:
             "volume_min"
         ]
         assert len(re.findall(r"d\[key\]", "v = d[key]")) == 1
+
+
+class TestFreezeLevelIsMeasuredAndNotEnforced:
+    """`trade_freeze_level` is populated everywhere and read nowhere (#89).
+
+    `docs/MT5-API.md` said `SYMBOL_TRADE_STOPS_LEVEL` and
+    `SYMBOL_TRADE_FREEZE_LEVEL` were "both enforced before send". Only the first
+    is. The half-truth was the worse part: a reader who checked `stops_level`,
+    found the refusal in `risk.py`, and inferred the rest would believe a guard
+    that does not exist, on a repo that moves real money.
+
+    The doc now states what the code does. This pins the state the doc
+    describes, so the two cannot silently re-diverge in either direction:
+
+    * if a READER of `trade_freeze_level` appears, the enforcement claim became
+      true and the doc must be restored to say so;
+    * if a POPULATION site disappears, the field stopped being measured and the
+      doc's "measured and recorded" is what became false.
+
+    Either way this test sends the next person to `docs/MT5-API.md`, which is
+    the whole point of pinning a documented property rather than trusting prose.
+    """
+
+    #: Every site that WRITES the field, plus its declaration. MEASURED off the
+    #: tree, not remembered; the first draft of this constant said mt5_live.py
+    #: had one site and this test red on its own author, which is the behaviour
+    #: wanted from it.
+    #:
+    #:   models.py          the dataclass field declaration
+    #:   broker/mt5_live.py 2: the MT5 SYMBOL property name handed to measure(),
+    #:                      and the assignment onto the spec
+    #:   broker/mt4_live.py the assignment onto the spec
+    #:   broker/paper.py    2: one per spec constructor
+    #:
+    #: Every one is a WRITE or a declaration. None is a read by a decision path,
+    #: which is what the next test asserts separately.
+    POPULATION = {
+        "models.py": 1,
+        "broker/mt5_live.py": 2,
+        "broker/mt4_live.py": 1,
+        "broker/paper.py": 2,
+    }
+
+    @staticmethod
+    def _src() -> Path:
+        return Path(__file__).resolve().parents[1] / "src" / "straightedge"
+
+    def _sites(self) -> dict[str, int]:
+        src = self._src()
+        found: dict[str, int] = {}
+        for path in sorted(src.rglob("*.py")):
+            n = path.read_text(encoding="utf-8").count("trade_freeze_level")
+            if n:
+                found[path.relative_to(src).as_posix()] = n
+        return found
+
+    def test_the_population_sites_are_these_and_nothing_else(self) -> None:
+        """The denominator, printed, so a zero below means something."""
+        sites = self._sites()
+        print(f"trade_freeze_level sites: {sum(sites.values())} in {len(sites)} file(s) {sites}")
+        assert sites == self.POPULATION, (
+            "trade_freeze_level gained or lost a site. If something now READS "
+            "it, the pre-send freeze check exists and docs/MT5-API.md must say "
+            f"so again (issue #89). Found: {sites!r}"
+        )
+
+    def test_no_decision_module_reads_the_freeze_level(self) -> None:
+        """The claim the doc used to make, asserted as the absence it is.
+
+        `risk.py`, `engine.py` and `desk.py` are where a pre-send guard would
+        have to live, because they are the modules that decide whether to send.
+        A hit in any of them means the guard arrived.
+        """
+        src = self._src()
+        deciders = ("risk.py", "engine.py", "desk.py")
+        hits = {
+            name: (src / name).read_text(encoding="utf-8").count("trade_freeze_level")
+            for name in deciders
+        }
+        print(f"freeze_level reads in the decision modules: {hits}")
+        assert sum(hits.values()) == 0, (
+            "a decision module now reads trade_freeze_level, so the pre-send "
+            f"freeze check exists; update docs/MT5-API.md (issue #89): {hits!r}"
+        )
+
+    def test_the_scanner_can_find_a_reader(self) -> None:
+        """Positive control. An absence is evidence only if a presence shows.
+
+        Both assertions above are "we found nothing". That reads identically to
+        a scanner pointed at the wrong tree or spelling the field wrong, which
+        is the failure this repo keeps finding. So: the same needle, counted
+        over a file that definitely contains it, and over a sample that must
+        match.
+        """
+        models = (self._src() / "models.py").read_text(encoding="utf-8")
+        assert models.count("trade_freeze_level") == 1, (
+            "the scanner cannot find the field in its own declaration, so the "
+            "zero counts above measured the instrument"
+        )
+        assert "trade_freeze_level".count("freeze") == 1
+        # And the enforced half IS findable, which is what makes "only
+        # stops_level is enforced" a measurement rather than an assumption.
+        risk = (self._src() / "risk.py").read_text(encoding="utf-8")
+        print(f"stops_level references in risk.py: {risk.count('stops_level')}")
+        assert risk.count("stops_level") >= 1, (
+            "stops_level is not in risk.py either, so this scanner proves nothing"
+        )

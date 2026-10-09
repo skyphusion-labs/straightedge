@@ -126,7 +126,20 @@ IOC = fill what you can (size can shrink; the bot still sends the computed lot).
 
 `SYMBOL_TRADE_STOPS_LEVEL` is the minimum SL/TP distance in points from the close price.
 `SYMBOL_TRADE_FREEZE_LEVEL` blocks modify when price is that close to SL/TP.
-Both are enforced before send.
+
+**Only `stops_level` is enforced before send** (`risk.py`, the `stops_level`
+refusal). `freeze_level` is MEASURED and recorded on the spec
+(`trade_freeze_level`, populated by the MT5, MT4 and paper adapters) and nothing
+reads it, so this desk sends the modify and the broker rejects it server-side;
+the desk reports a failed modify with the broker's retcode. The claim that both
+are enforced before send was false, and the half-truth was the worse part: a
+reader who checked `stops_level`, found it, and inferred the rest would believe a
+guard that is not there (issue #89).
+
+That is a bounded cost, not an open exposure: the authoritative check lives at
+the broker either way, and the outcome is the same refusal one round trip later.
+If the pre-send freeze check is ever implemented, the pin in
+`tests/test_mt5_unmeasured_specs.py` goes red and sends you back here.
 
 ## Lot math
 
@@ -210,7 +223,11 @@ From "The checks a trading robot must pass before publication in the Market":
 - Handle hedging vs netting.
 - Log retcodes.
 
-The bot does those on both paper and live paths.
+The bot does those on both paper and live paths **except the
+`SYMBOL_TRADE_FREEZE_LEVEL` one**, which it does not check before sending a
+modify; see Stops (10016) above. This list is quoted from MQL5's publication
+requirements, so it states what an EA is asked to do, not what this desk has
+implemented, and the two were allowed to read as the same thing (issue #89).
 
 ## What the Python package is not
 
