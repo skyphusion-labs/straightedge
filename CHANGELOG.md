@@ -171,6 +171,23 @@ pins that: it caught a fixture of this change's own, which had seeded a bar an
 hour ahead of the venue's clock and was therefore observing its own refusal
 rather than the defect's.
 
+**The session window is exact only to within the clock's uncertainty, and it
+now says so.** `offset_sec` is an int and `measured` is a bool, so nothing
+downstream could know the instant carries an error bar while the gate reading it
+compares exactly. The error is the venue terminal's own drift: bar stamps and
+`TimeCurrent()` carry it identically, so it cancels from the measured
+difference, and the grid snap then removes it from the offset while the bar
+stamp keeps it, which makes the snap the only error source left in the measured
+path. The residual check caps it at the sample's uncertainty, held strictly
+under half a grid step. Measured through a real engine: at the widest legal
+bound a 449s drift is absorbed and a 450s bound measures nothing at all, while
+on the desk's own path, where the bound is the measured poll gap, a 90s drift
+refuses. Under the chosen 180s tolerance this change started with, that same
+90s silently moved a 17:00:00 instant to 16:58:30 and the session gate did not
+fire, leaving the desk armed up to three minutes past its configured close.
+`VenueClock` and `docs/CONTRACT.md` state it, four tests pin it, and the number
+has one home in `VENUE_CLOCK_GRID_SEC`.
+
 **`day_key` is the UTC day, decided and written down** (`docs/CONTRACT.md`, "One
 clock"). It was accidentally both before, which is the actual defect. The
 operator's config is written in UTC, the desk and recap already rolled on it,
