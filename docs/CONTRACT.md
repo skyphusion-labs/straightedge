@@ -137,6 +137,18 @@ source and fails when one has no row here, and also fails on a row naming a word
 the guard can no longer return (#228). The `/sl` row above carries the mechanism
 in depth; this table is the word list.
 
+**WHAT THAT GATE READS, stated because a gate that does not say what it cannot
+see gets read as covering everything.** It reads a return that is a string
+literal, a module constant, a literal-prefixed concatenation, or an f-string
+opening with a literal. It CANNOT read a word returned through a local
+variable, a `join`, a `str(...)` call or a concatenation with a non-literal left
+side; each of those lands in the scanner's `forwarded` set, which the test pins
+EMPTY, so a new spelling fails as unreadable rather than passing as covered. A
+result built with the `OrderResult` constructor instead of a factory would be
+invisible to the same scan, so a separate test requires every result in
+`engine.py` to come from a factory, which is true today at zero direct
+constructions.
+
 **FIVE replies can carry one of these words, not just `/sl`.** `_modify` is
 reached by `/sl`, `/tp`, `/replace`, `/be` and `/trail`, so the same refusal
 arrives behind five labels (`sl failed`, `tp failed`, `replace failed`,

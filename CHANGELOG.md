@@ -550,6 +550,30 @@ reds 3. Restored, 7 passed. Run with `PYTHONDONTWRITEBYTECODE=1` and a fresh
 `PYTHONPYCACHEPREFIX` per run, with the `.pyc` count as corroboration rather
 than as the guard, and each verdict read from `returncode`.
 
+**A review measured six spellings the gate was blind to, and all six now fail
+rather than pass as covered.** The scan reads a return that is a literal, a
+module constant, a literal-prefixed concatenation or a literal-first f-string.
+It cannot read a word returned through a local variable, a `"".join([...])`, a
+`str(...)` call, or a concatenation whose left side is not a literal. The repair
+is not to teach it every spelling: each of those lands in the scanner's
+`forwarded` set rather than being dropped, so `forwarded` is pinned EMPTY for
+the guard and pinned to exactly the one hand-off site for the factory. An
+unreadable return is now a failure that says it could not read, which is the
+honest state for a scanner, where "green" would have been a false claim of
+coverage.
+
+The sixth was a result built with the `OrderResult` constructor instead of a
+factory, invisible to the comment scan by construction. That is closed
+structurally rather than excluded: `engine.py` reaches every result through
+`measured`, `unchanged`, `not_sent` or `invalid_stops`, zero direct
+constructions, and a test keeps it that way.
+
+Each spelling verified by injection, not by argument: a local variable, a
+`join`, a call, a non-literal concatenation, a second forwarded comment, and a
+direct construction, six mutations, each red and none of them green. Both the
+test module and the contract section now state what the gate reads and what it
+cannot, per the ruling on #220's scope note.
+
 ## 1.8.0
 
 ### The worst tick gap this box has seen now outlives the process (issue #153)

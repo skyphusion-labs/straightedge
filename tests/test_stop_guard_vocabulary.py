@@ -20,6 +20,30 @@ concatenation rather than named by a constant, so a grep for known names could
 not have found it, and an enumeration that starts from the names somebody
 already knows is not a denominator. That is the same failure one level up from
 the one this issue was filed about.
+
+SCOPE, because a gate that does not say what it cannot see gets read as
+covering everything (the ruling on #220's own scope note).
+
+WHAT THE SCAN READS, as a RETURN from `_stop_guard`: a string literal, a module
+constant, a literal-prefixed concatenation (`"spec_not_measured:" + ...`), an
+f-string opening with a literal, and the branches of `or` and of a conditional
+expression.
+
+WHAT IT CANNOT READ, measured by injection rather than reasoned about: a word
+returned through a LOCAL variable, a `"".join([...])`, a `str(self._helper())`,
+or a concatenation whose left side is not a literal. **Every one of those lands
+in `scan.forwarded` instead of being silently dropped**, which is what makes
+the gap observable, so `test_the_scanners_could_read_every_site` pins
+`forwarded` EMPTY for the guard and pins the factory's forwarded set to exactly
+the one site that is meant to forward. A new spelling therefore fails there
+rather than passing as covered: the gate cannot read it, and it refuses to
+pretend the read happened.
+
+The remaining hole was a result built WITHOUT the factory
+(`OrderResult(retcode=..., comment="...")`), which `scan_factory_comments`
+cannot see by construction. That is closed structurally rather than excluded:
+`engine.py` builds every result through a factory, zero direct constructions,
+and `test_every_result_is_built_through_a_factory` keeps it that way.
 """
 
 from __future__ import annotations
@@ -228,6 +252,58 @@ def test_the_scanners_could_read_every_site() -> None:
             f"the scanner could not read these sites in {where}, so the "
             f"vocabulary below is not a denominator: {list(scan.unresolved)!r}"
         )
+
+    # AND NOTHING MAY BE FORWARDED OUT OF THE GUARD. A word returned through a
+    # local variable, a `"".join([...])`, a `str(...)` call or a concatenation
+    # with a non-literal left side cannot be read as a word; each lands here
+    # rather than being dropped, so pinning this EMPTY turns every one of those
+    # spellings into a failure instead of a silent gap. Measured by injection:
+    # all four leave the rest of this file green and show up only here.
+    guard = _scans()["engine.py (Engine._stop_guard returns)"]
+    assert guard.forwarded == (), (
+        "the guard now returns a word the scan cannot read as a word: "
+        f"{guard.forwarded!r}. Either return a literal or a module constant, "
+        "or teach `refusal_scan` that spelling; it cannot be documented as "
+        "vocabulary while it is unreadable."
+    )
+
+    # The factory forwards from EXACTLY one site, the `_modify` hand-off. A
+    # second forwarded name means a new comment is being passed in from
+    # somewhere the scan cannot name, which is the same gap one call over.
+    factory = _scans()["engine.py (OrderResult.invalid_stops comments)"]
+    assert factory.forwarded == ("reason",), (
+        "the set of sites passing a non-literal comment to invalid_stops "
+        f"changed: {factory.forwarded!r}. Exactly one is expected, the guard "
+        "verdict `_modify` forwards; anything else needs reading."
+    )
+
+
+def test_every_result_is_built_through_a_factory() -> None:
+    """The one hole the comment scan cannot see, closed by structure.
+
+    `scan_factory_comments` reads `OrderResult.invalid_stops(...)`. A result
+    built with the constructor directly, `OrderResult(retcode=10016,
+    comment="zz")`, would carry a word to the operator through the same render
+    and be invisible to it. Measured on the tree this was written against:
+    `engine.py` contains ZERO direct constructions and reaches every result
+    through `measured`, `unchanged`, `not_sent` or `invalid_stops`, so the hole
+    is closed by keeping that true rather than by writing an exclusion that
+    nothing enforces.
+    """
+    tree = ast.parse(_source())
+    direct = [
+        node.lineno
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "OrderResult"
+    ]
+    assert not direct, (
+        f"engine.py builds an OrderResult directly at line(s) {direct!r}. Its "
+        "`comment` reaches the operator through the same `<verb> failed "
+        "retcode=` render as a guard word and is invisible to the comment "
+        "scan, so use a factory or extend the scan."
+    )
 
 
 def test_the_denominator_is_not_empty_and_the_channel_is_still_wired() -> None:
