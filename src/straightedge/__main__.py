@@ -357,10 +357,26 @@ def venue_clock_check(cfg: BotConfig, broker: object) -> int:
         )
         return 0
     if clock.unmeasured == frozenset({"freshness"}):
+        # Two readings share this branch and the exit code, because both are
+        # the same fact about freshness and neither is a run-affecting fault.
+        # `implied_offset_sec` absent means the stamp is so far from our clock
+        # that it implies no timezone at all; printing the arithmetic there
+        # (UTC-17:00 at 20h stale, UTC-45:00 at 48h) stated a number that is
+        # not an offset and lost the stale-versus-absurd distinction the
+        # pre-straightedge#182 gate used to give (straightedge#193).
         implied = clock.implied_offset_sec
+        if implied is None:
+            print(
+                "venue clock: the stamp implies NO offset, freshness NOT "
+                f"established ({clock.source}; {clock.detail}). The venue is "
+                "almost certainly closed or its clock has stopped. Check the "
+                "terminal is connected; the desk itself measures this per poll "
+                "and refuses when it cannot."
+            )
+            return 0
         print(
             "venue clock: stamp implies "
-            f"{_hhmm_offset(implied or 0)}, freshness NOT established "
+            f"{_hhmm_offset(implied)}, freshness NOT established "
             f"({clock.source}; the venue stamps its LAST TICK and doctor has no "
             "previous poll to bound how old that is, so a stale stamp on a "
             "closed market is indistinguishable from a different offset). "
