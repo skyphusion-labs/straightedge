@@ -55,8 +55,14 @@ const MARKER_RESERVE_BYTES = 256;
 /** Lines `clampEntry`'s notice adds (its four newlines). */
 const NOTICE_LINES = 4;
 
+// Two shapes, and the first is the one every log written before #179 carries,
+// so it must keep matching or the running totals reset (straightedge#179).
 const MARKER_RE =
   /^<!-- straightedge log trimmed: (\d+) earlier entries \((\d+) bytes\) dropped[^>]*-->\n/;
+// Written once an entry has been truncated in place: bytes were lost from an
+// entry that is still there, which "N earlier entries dropped" cannot say.
+const TRUNCATED_MARKER_RE =
+  /^<!-- straightedge log trimmed: (?:(\d+) earlier entries dropped and )?an entry truncated \((\d+) bytes\) removed[^>]*-->\n/;
 
 const encoder = new TextEncoder();
 
@@ -76,26 +82,39 @@ export type TrimResult = {
   totalDroppedBytes: number;
 };
 
-function marker(entries: number, bytes: number): string {
+function marker(entries: number, bytes: number, truncated: boolean): string {
+  const lead = truncated
+    ? `${entries > 0 ? `${entries} earlier entries dropped and ` : ""}an entry truncated ` +
+      `(${bytes} bytes) removed`
+    : `${entries} earlier entries (${bytes} bytes) dropped`;
   return (
-    `<!-- straightedge log trimmed: ${entries} earlier entries (${bytes} bytes) ` +
-    `dropped; keeping the most recent ${LOG_KEEP_ENTRIES} entries within ` +
+    `<!-- straightedge log trimmed: ${lead}; keeping the most recent ${LOG_KEEP_ENTRIES} entries within ` +
     `${LOG_READ_MAX_BYTES} bytes and ${LOG_READ_MAX_LINES} lines, so one read ` +
     `sees the whole log. straightedge#131 -->\n`
   );
 }
 
 /** Split a previously written log into its marker totals and the entries after it. */
-function splitMarker(log: string): { entries: number; bytes: number; body: string } {
+function splitMarker(log: string): {
+  entries: number;
+  bytes: number;
+  truncated: boolean;
+  body: string;
+} {
   const m = MARKER_RE.exec(log);
-  if (!m) {
-    return { entries: 0, bytes: 0, body: log };
+  if (m) {
+    return { entries: Number(m[1]), bytes: Number(m[2]), truncated: false, body: log.slice(m[0].length) };
   }
-  return {
-    entries: Number(m[1]),
-    bytes: Number(m[2]),
-    body: log.slice(m[0].length),
-  };
+  const t = TRUNCATED_MARKER_RE.exec(log);
+  if (t) {
+    return {
+      entries: Number(t[1] ?? 0),
+      bytes: Number(t[2]),
+      truncated: true,
+      body: log.slice(t[0].length),
+    };
+  }
+  return { entries: 0, bytes: 0, truncated: false, body: log };
 }
 
 /**
@@ -191,6 +210,7 @@ export function trimLog(log: string): TrimResult {
   let totalBytes = prior.bytes;
   let droppedEntries = 0;
   let droppedBytes = 0;
+  let truncated = prior.truncated;
 
   let kept = splitEntries(prior.body);
 
@@ -215,13 +235,14 @@ export function trimLog(log: string): TrimResult {
     const clamped = clampEntry(kept[0], budget);
     kept = [clamped.text];
     droppedBytes += clamped.dropped;
+    truncated = true;
   }
 
   totalEntries += droppedEntries;
   totalBytes += droppedBytes;
 
   const body = kept.join("");
-  const text = totalEntries > 0 || totalBytes > 0 ? marker(totalEntries, totalBytes) + body : body;
+  const text = totalEntries > 0 || totalBytes > 0 ? marker(totalEntries, totalBytes, truncated) + body : body;
   return {
     text,
     droppedEntries,
