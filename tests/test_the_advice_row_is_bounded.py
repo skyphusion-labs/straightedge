@@ -35,6 +35,7 @@ is driven large by these tests without anyone remembering to add it.
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 from straightedge.broker.paper import PaperBroker
@@ -95,6 +96,81 @@ def _turn(engine: Engine) -> dict:
     return rows[-1]
 
 
+#: Rows that DO exceed the bound and carry no model-chosen content, each with
+#: what it scales with, so the exemption is a decision on the record rather
+#: than a hole. Measured on this fixture's four-symbol book:
+#: `history_preflight` 876 bytes, `history_unavailable` 1108. Both are our own
+#: diagnostics, both grow with the OPERATOR's symbol book rather than with
+#: anything a model can say, and neither is reachable by a reply. Whether they
+#: should be bounded or summarised is a separate question about operator
+#: diagnostics, filed rather than decided here (straightedge#236).
+#:
+#: A row that exceeds the bound and is NOT in this map fails, so a new row on
+#: the advice path has to be classified by a person.
+ROWS_EXEMPT_FROM_THE_BOUND = {
+    "history_preflight": "one entry per configured symbol",
+    "history_unavailable": "our own prose, a paragraph per unusable symbol",
+}
+
+
+def _assert_every_row_in_bound(engine: Engine) -> None:
+    """EVERY row the turn wrote, not only `advice_turn`.
+
+    One model reply writes several rows. The same large-symbol reply that
+    produced the headline 5838 byte `advice_turn` row ALSO writes a `reject`
+    row carrying the symbol, and a review measured that removing the clip from
+    the reject site alone left a 5753 byte row with the whole suite green,
+    because every test here read one event name. A bound asserted on the row
+    the author was thinking about is the fixture-shaped assertion this issue is
+    about, one event over.
+
+    So the assertion is over the journal rather than over a chosen row: a new
+    row added to the advice path tomorrow is covered without anyone editing
+    this file, exactly as a new schema field is.
+    """
+    rows = list(engine.journal.tail(5000))
+    oversized = [
+        (row.get("event"), len(json.dumps(row, sort_keys=True)))
+        for row in rows
+        if len(json.dumps(row, sort_keys=True)) > ROW_BOUND
+        and row.get("event") not in ROWS_EXEMPT_FROM_THE_BOUND
+    ]
+    assert not oversized, (
+        f"{len(oversized)} journal row(s) exceed the {ROW_BOUND} byte bound and "
+        f"are not classified in ROWS_EXEMPT_FROM_THE_BOUND: {oversized!r}. "
+        "Either the row carries model-chosen content and must be clipped, or "
+        "it is a diagnostic that scales with something the operator set and "
+        "needs a line in that map saying so."
+    )
+
+    # AND THE EXEMPTION IS NOT A BLANK CHEQUE. An exempt row that starts
+    # carrying model text is the exact defect this file exists for, so the
+    # marker strings the fixture drives are looked for in those rows too.
+    for row in rows:
+        if row.get("event") not in ROWS_EXEMPT_FROM_THE_BOUND:
+            continue
+        blob = json.dumps(row, sort_keys=True)
+        for marker in ("E" * 50, "Z" * 50, "9" * 50):
+            assert marker not in blob, (
+                f"the exempt row {row.get('event')!r} is carrying model-chosen "
+                "text, so its exemption no longer holds"
+            )
+
+    # And a name in the map that no longer appears is a stale exemption, which
+    # would quietly widen the hole as rows are renamed.
+    seen = {row.get("event") for row in rows}
+    stale = sorted(set(ROWS_EXEMPT_FROM_THE_BOUND) - seen)
+    assert not stale, (
+        f"ROWS_EXEMPT_FROM_THE_BOUND names {stale!r}, which this turn did not "
+        "write; a stale exemption widens the bound for nothing"
+    )
+
+
+def _rows_named(engine: Engine, event: str) -> list[dict]:
+    """Every row of one event name, so a test can prove it reached a path."""
+    return [r for r in engine.journal.tail(5000) if r.get("event") == event]
+
+
 def _everything_large() -> dict:
     """A reply with EVERY schema field driven large, derived from the code.
 
@@ -145,6 +221,7 @@ def test_every_model_reachable_field_driven_large_at_once_stays_in_bound(
         "a model string reached the row whole"
     )
     assert "ZZZZ" not in blob
+    _assert_every_row_in_bound(engine)
     engine.stop()
 
 
@@ -167,6 +244,7 @@ def test_the_same_reply_through_the_bare_parser_is_also_in_bound(
     engine.handle_command(TgCommand("1", 1, "/ask take a view", 1))
     blob = json.dumps(_turn(engine), sort_keys=True)
     assert len(blob) <= ROW_BOUND, f"{len(blob)} bytes: {blob[:200]}"
+    _assert_every_row_in_bound(engine)
     engine.stop()
 
 
@@ -194,6 +272,21 @@ def test_a_long_symbol_is_clipped_and_the_row_says_so(tmp_path: Path) -> None:
     assert "[+5552 chars]" in row["symbol"], (
         "the row does not say what it dropped: " + row["symbol"][:80]
     )
+
+    # THE SAME REPLY WROTE A REJECT ROW. `E` * 5600 is not an allowed symbol,
+    # so the desk also journals `symbol_not_allowed` with the symbol on it, and
+    # that row was unpinned: measured at 5753 bytes with the reject clip
+    # removed while this test still passed, because it read `advice_turn` only.
+    rejects = _rows_named(engine, "reject")
+    assert rejects, "the reply did not reach the reject path, so this proves nothing"
+    assert rejects[-1].get("reason") == "symbol_not_allowed", (
+        f"not the reject this case is about: {rejects[-1]!r}"
+    )
+    assert "[+5552 chars]" in rejects[-1]["symbol"], (
+        "the reject row does not say what it dropped: "
+        + str(rejects[-1]["symbol"])[:80]
+    )
+    _assert_every_row_in_bound(engine)
     engine.stop()
 
 
@@ -245,6 +338,34 @@ def test_a_real_symbol_is_never_reshaped() -> None:
                  "EURUSDmicro", "US30", "MATICUSD"):
         assert clip_for_record(name) == name, name
     assert len("EURUSDmicro") < RECORD_STRING_CHARS
+
+
+def test_the_documented_bound_is_the_asserted_bound(tmp_path: Path) -> None:
+    """The figure in `docs/CONTRACT.md` is read, not trusted.
+
+    The constant and the tests already agreed, because the tests import it.
+    The DOCUMENT carried its own literal and nothing read it, so a review
+    measured raising `RECORD_ROW_BOUND` to 1024 with the whole suite green
+    while the contract still said 512. A bound stated in prose that nothing
+    reads is the magic number this issue set out to remove, one file over.
+
+    Anchored to the `Journal row size` ROW rather than to the file, for the
+    reason #220 measured: a number mentioned anywhere would satisfy a
+    file-wide search.
+    """
+    del tmp_path
+    text = (Path(__file__).resolve().parents[1] / "docs" / "CONTRACT.md").read_text(
+        encoding="utf-8"
+    )
+    rows = [ln for ln in text.splitlines() if ln.startswith("| Journal row size |")]
+    assert len(rows) == 1, f"expected one `Journal row size` row, found {len(rows)}"
+    found = re.findall(r"\((\d+) bytes\)", rows[0])
+    assert found, "the row no longer states a byte figure: " + rows[0][:120]
+    assert [int(n) for n in found] == [RECORD_ROW_BOUND] * len(found), (
+        f"docs/CONTRACT.md states {found!r} bytes and journal.RECORD_ROW_BOUND "
+        f"is {RECORD_ROW_BOUND}; the documented bound and the asserted bound "
+        "have drifted"
+    )
 
 
 def test_an_ordinary_turn_is_byte_for_byte_what_it_was(tmp_path: Path) -> None:

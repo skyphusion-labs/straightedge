@@ -449,7 +449,15 @@ def _int(v: Any) -> int | None:
     its exponent: `1e308` gave a 309 digit ticket and a 501 byte journal row on
     its own. A ticket is a venue handle, so a value no venue could have issued
     is not a ticket; refusing it is the same rule as `_num` returning None for
-    a non-number, and the `except` stays as the backstop.
+    a non-number.
+
+    THE `except OverflowError` BELOW IS UNREACHABLE WHILE THE GUARD STANDS, and
+    no test pins it: a review measured dropping it with the guard kept and the
+    whole suite stayed green. That is the correct state for a backstop rather
+    than a gap to close with a test, because a test that could only pass by
+    removing the guard first would be pinning the guard twice. It is kept for
+    the case the guard is ever narrowed, and it is named here so the next reader
+    does not mistake an untested line for an untested behaviour.
     """
     n = _num(v)
     if n is None or not math.isfinite(n) or abs(n) > _TICKET_CEILING:

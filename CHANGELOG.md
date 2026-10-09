@@ -514,6 +514,37 @@ so that case is pinned only by restoring `_int`'s pre-fix body exactly, which
 reds 4. An equivalent mutant hiding inside a guard I had just written is the
 same trap as the two tests this issue is about.
 
+**Two gaps the review found, both of them the PR's own subject one step over.**
+The first: `advice_turn` was pinned and the `reject` row the SAME reply writes
+was not, so removing the clip from the reject site alone left a 5753 byte row
+with the whole suite green. The assertion is now over every row the turn
+writes, not over a chosen event name, so a row added to the advice path is
+covered without anyone editing the file. The second: the constant and the tests
+agreed because the tests import it, but `docs/CONTRACT.md` carried its own
+literal `512` and nothing read it, so the constant could be raised to 1024 with
+the suite green while the document said 512. A test now reads the figure out of
+that row and requires it to equal `RECORD_ROW_BOUND`, and it fails from either
+side.
+
+**Asserting over every row immediately found a false claim in the contract,
+which is the point of asserting over a population rather than a sample.** The
+row said "a single row stays under 512 bytes" and two rows do not:
+`history_preflight` at 876 and `history_unavailable` at 1108 on a four-symbol
+book, both written on a cold start with short H1 history. Neither carries
+model-chosen content and both scale with the OPERATOR's symbol book, so they
+are classified as exempt with what they scale with, the claim is narrowed to
+what is measured, and whether they should be bounded or summarised is #236. The
+exemption is not a blank cheque: an exempt row that starts carrying the
+fixture's model text fails, a stale name in the map fails, and a THIRD
+oversized row fails until a person classifies it.
+
+**And the `except OverflowError` in `_int` is named as unreachable rather than
+claimed as tested.** The review measured dropping it with the `isfinite` guard
+kept: green, because the guard makes it unreachable. That is the right state
+for a backstop, so the docstring says so instead of implying a test stands
+behind it; a test that could only fail by removing the guard first would be
+pinning the guard twice.
+
 ## 1.8.0
 
 ### The worst tick gap this box has seen now outlives the process (issue #153)
