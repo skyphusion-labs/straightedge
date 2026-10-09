@@ -6,6 +6,7 @@ import sys
 import time
 from dataclasses import dataclass
 
+from straightedge.currencies import normalize_model_symbol
 from straightedge.inflight import new_key
 from straightedge.journal import redact_text
 from straightedge.llm import Advice, Advisor
@@ -764,15 +765,21 @@ class Desk:
                 # The MODEL chose this instrument, not the operator. A human
                 # typing /buy on an unlisted symbol chose it themselves and is
                 # not gated here.
+                # `normalize_model_symbol`, never `.upper()`: a refusal that
+                # renames the symbol is a refusal about a lie. On
+                # `EURU\u017fD` the old form journalled and displayed
+                # `EURUSD`, which is an instrument the whitelist ALLOWS, so the
+                # record read as a bug in the gate rather than as a rejected
+                # reply (straightedge#197).
+                shown = normalize_model_symbol(advice.symbol)
                 self._reject(
                     "advice_symbol",
                     "symbol_not_allowed",
                     source="advice",
-                    symbol=advice.symbol.upper(),
+                    symbol=shown,
                 )
                 lines.append(
-                    f"not staging {advice.action} {advice.symbol.upper()}: "
-                    "symbol_not_allowed"
+                    f"not staging {advice.action} {shown}: symbol_not_allowed"
                 )
                 advice_blocked = True
             reason = "" if advice_blocked else self.engine.advice_circuit_reason()
