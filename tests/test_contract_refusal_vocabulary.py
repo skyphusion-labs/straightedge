@@ -22,6 +22,7 @@ needed (`sizing.py`'s authority functions, and words written straight after
 from __future__ import annotations
 
 import pathlib
+import re
 
 from refusal_scan import (
     scan_decision_reasons,
@@ -75,13 +76,50 @@ def reason_words() -> dict[str, str]:
     return out
 
 
-def undocumented(contract_text: str) -> list[str]:
-    """Which reason words do not appear in the given contract text.
+#: Heading of the section whose table IS the enumeration.
+TABLE_HEADING = "### Refusal reasons"
 
-    Takes the text rather than reading the file, so the control below can run
+#: A table row naming one reason: `| `word` |` or `| `word:` |` for a prefix.
+TABLE_ROW = re.compile(r"^\| `([a-z][a-z0-9_]*):?` \|", re.M)
+
+
+def table_words(contract_text: str) -> frozenset[str]:
+    """The words the refusal-reason TABLE documents, trailing `:` stripped.
+
+    ANCHORED TO THE TABLE, NOT TO THE FILE, and that distinction is the whole
+    gate. An earlier version asked `word not in contract_text`, which passes on
+    any mention anywhere: 15 of the 28 words are also named in the prose rows
+    above, so deleting a table row left the suite green while the section
+    claimed the table was kept complete. A check that cannot see the row it
+    describes is decoration.
+    """
+    start = contract_text.find(TABLE_HEADING)
+    if start < 0:
+        return frozenset()
+    rest = contract_text[start + len(TABLE_HEADING) :]
+    end = rest.find("\n## ")
+    section = rest if end < 0 else rest[:end]
+    return frozenset(m.group(1) for m in TABLE_ROW.finditer(section))
+
+
+def undocumented(contract_text: str) -> list[str]:
+    """Reason words the code can emit that the TABLE does not document.
+
+    Takes the text rather than reading the file, so the controls below can run
     the real checker against a damaged copy.
     """
-    return sorted(w for w in reason_words() if w not in contract_text)
+    return sorted(set(reason_words()) - table_words(contract_text))
+
+
+def stale_rows(contract_text: str) -> list[str]:
+    """Table rows naming a word the code can no longer emit.
+
+    THE OTHER DIRECTION, which the first version of this file did not check at
+    all. A table that only ever grows rots exactly as silently as one that is
+    short: a reason renamed or removed leaves a row telling the operator to
+    expect a refusal they can never receive, and nothing failed.
+    """
+    return sorted(table_words(contract_text) - set(reason_words()))
 
 
 def test_the_scanners_could_read_every_site() -> None:
@@ -130,9 +168,17 @@ def test_every_refusal_reason_is_documented_in_the_contract() -> None:
     text = CONTRACT.read_text(encoding="utf-8")
     missing = undocumented(text)
     assert not missing, (
-        f"{len(missing)} refusal reason(s) the desk can emit are not in "
-        f"docs/CONTRACT.md: {missing!r}. The operator sees these verbatim, so "
-        "each needs a line saying what was measured and what they should do."
+        f"{len(missing)} refusal reason(s) the desk can emit have no row in "
+        f"the {TABLE_HEADING!r} table: {missing!r}. The operator sees these "
+        "verbatim, so each needs a row saying what was measured and what they "
+        "should do."
+    )
+    stale = stale_rows(text)
+    assert not stale, (
+        f"{len(stale)} row(s) name a reason the code can no longer emit: "
+        f"{stale!r}. A row for a refusal that cannot happen tells the operator "
+        "to expect a reply they will never receive, so a removal has to delete "
+        "its row in the same change."
     )
 
 
@@ -145,17 +191,36 @@ def test_the_coverage_check_can_see_an_undocumented_reason() -> None:
     green.
     """
     text = CONTRACT.read_text(encoding="utf-8")
-    victim = "stops_level"
-    assert victim in text, "fixture stale: pick a word the contract documents"
-    damaged = text.replace(victim, "REMOVED_FOR_THE_CONTROL")
-    missing = undocumented(damaged)
-    assert victim in missing, (
-        "the coverage check did not notice a documented reason being removed, "
-        "so its clean result on the real contract means nothing"
+    # DERIVED, NEVER NAMED. An earlier version hard-coded `stops_level` as the
+    # victim, which coupled this control to one word: legitimately removing
+    # that reason from the code would red the CONTROL rather than the closure,
+    # and removing any other word would red nothing here at all.
+    victim = sorted(reason_words())[0]
+    assert victim in table_words(text), "the table does not document " + victim
+
+    # Remove the ROW, which is what the gate now reads, rather than every
+    # mention of the word in the file.
+    damaged = re.sub(
+        r"^\| `%s:?` \|.*$\n?" % re.escape(victim), "", text, count=1, flags=re.M
+    )
+    assert table_words(damaged) != table_words(text), "the row was not removed"
+    assert victim in undocumented(damaged), (
+        "the coverage check did not notice a table row being deleted, so its "
+        "clean result on the real contract means nothing"
     )
     # And the undamaged text must still come back clean, so the control is
     # measuring the removal rather than a checker that always finds something.
     assert not undocumented(text)
+
+    # The reverse gate too: a row for a word the code cannot emit is reported.
+    invented = text.replace(
+        "| `" + victim + "`",
+        "| `a_reason_the_code_never_emits` | x | y |\n| `" + victim + "`",
+        1,
+    )
+    assert "a_reason_the_code_never_emits" in stale_rows(invented), (
+        "the stale-row check cannot see a row with no code behind it"
+    )
 
 
 def test_prose_refusals_are_pinned_rather_than_ignored() -> None:
