@@ -70,6 +70,29 @@ def unusable_stop(sl: float) -> str | None:
     return None
 
 
+def unusable_price(value: float) -> str | None:
+    """Why this quote cannot be used, or None if it can.
+
+    `"unreadable"` means the venue sent something that cannot be a price, a
+    non-finite float. `"absent"` means it sent nothing usable, a zero or a
+    negative. They are separated because they call for different operator
+    actions: an absent quote is a quiet feed and you wait or reconnect, while an
+    unreadable one is a corrupt field and you go and look at the wire.
+
+    FINITENESS IS TESTED FIRST, and that order is the whole point rather than a
+    style choice. `nan <= 0` is False, so a non-finite value sails straight
+    through a magnitude test; a guard written only as `value <= 0` cannot see
+    the most broken quote there is. That is the same one-value-short shape as
+    #187 and #208, which is why this lives beside `unusable_stop` rather than
+    being written inline a third time.
+    """
+    if not math.isfinite(value):
+        return "unreadable"
+    if value <= 0:
+        return "absent"
+    return None
+
+
 def money_per_lot_at_stop(entry: float, sl: float, spec: SymbolSpec) -> float:
     """Money lost per lot if price travels from `entry` to `sl`.
 
