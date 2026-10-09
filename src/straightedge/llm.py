@@ -46,6 +46,13 @@ _JSON_TAIL = re.compile(r"\{[^{}]*\}\s*$", re.DOTALL)
 @dataclass
 class Advice:
     text: str
+    #: Why the schema gate degraded this turn, empty when it did not.
+    #:
+    #: Set by `Advisor.ask` from its own measurement, never parsed out of
+    #: the reply, so no model can write it (straightedge#185). The desk
+    #: journals it on the `advice_turn` row, which is what makes a model
+    #: HOLD distinguishable from a reply we could not read.
+    degraded: str = ""
     action: str = "hold"
     symbol: str | None = None
     sl: float | None = None
@@ -197,7 +204,9 @@ def _schema_violations(obj: dict[str, Any]) -> list[str]:
     return out
 
 
-def structured_to_parseable(raw: str) -> str:
+def structured_to_parseable(
+    raw: str, *, violations: list[str] | None = None
+) -> str:
     """Re-shape a schema-constrained reply into prose + trailing JSON object.
 
     `parse_advice` STAYS THE ONE GATE that produces an `Advice`. Structured
@@ -228,6 +237,16 @@ def structured_to_parseable(raw: str) -> str:
     if not isinstance(obj, dict) or "action" not in obj:
         return raw
     bad = _schema_violations(obj)
+    if violations is not None:
+        # OUT OF BAND, and that is the whole point (straightedge#185). The
+        # reason has to reach the journal, and both ways it could travel
+        # INSIDE the reply are defects: parsing it back out of the prose is
+        # string-matching our own sentence, and adding a key to the trailing
+        # JSON would be a field `parse_advice` cannot tell WE wrote, because
+        # the `grok` and `computer` paths have no schema and a model could
+        # put that key in its own tail. A list the caller owns cannot be
+        # written by a model.
+        violations.extend(bad)
     prose = obj.get("text")
     prose = prose if isinstance(prose, str) else ""
     tail: dict[str, Any] = {k: obj.get(k) for k in _TAIL_KEYS}
@@ -348,6 +367,11 @@ class Advisor:
         self.transport = transport or UrlLibTransport()
         self.persist_path = Path(persist_path) if persist_path else None
         self._memory: list[dict[str, str]] = []
+        #: What the schema gate found on the LAST turn, owned by this object
+        #: so no model can write it. `ask` clears it before every provider
+        #: call; declared here so a caller reaching a provider method
+        #: directly cannot hit an unset attribute (straightedge#185).
+        self._last_violations: list[str] = []
         self.load()
 
     def ask(
@@ -365,6 +389,11 @@ class Advisor:
                 )
             )
         user = f"{context}\n\nUser: {question}"
+        # CLEARED on every turn, before the provider is called. A reason
+        # that outlived its own turn would attach to the next clean one,
+        # which is the stale-marker shape straightedge#119 was: the only
+        # writer sets it from scratch each time rather than updating it.
+        self._last_violations = []
         if self.cfg.provider == "computer":
             raw = self._computer(question, context, session, history or [])
         elif self.cfg.provider == "claude":
@@ -372,6 +401,11 @@ class Advisor:
         else:
             raw = self._grok(user)
         advice = parse_advice(raw)
+        # The schema gate's reason, attached to the Advice the desk
+        # journals (straightedge#185). Carried on the object rather than
+        # left in the prose, because `journal.jsonl` is the surface anyone
+        # reconstructing a demo week reads and the prose never reaches it.
+        advice.degraded = "; ".join(self._last_violations)
         self._remember("user", question)
         self._remember("assistant", advice.text or raw)
         return advice
@@ -528,4 +562,4 @@ class Advisor:
             if stop == "refusal":
                 raise RuntimeError("claude refused")
             raise RuntimeError(f"claude empty (stop_reason={stop or 'unknown'})")
-        return structured_to_parseable(text)
+        return structured_to_parseable(text, violations=self._last_violations)
