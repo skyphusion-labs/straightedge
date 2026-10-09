@@ -669,8 +669,30 @@ def test_size_exceeds_risk_has_exactly_one_live_site() -> None:
     sites, one of them pinned dead above, and a third appearance fails here.
     """
     src = Path(__file__).resolve().parents[1] / "src" / "straightedge"
+
+    def _sites(text: str) -> int:
+        """Occurrences that are SITES, not mentions.
+
+        Full-line comments are excluded (#187). A comment explaining why a
+        reason is the WRONG one to report is a mention, not a second place the
+        desk can emit it, and counting it forced a choice between spelling the
+        reason wrong in prose and tripping this guard. A mention is not a
+        relationship.
+
+        Docstrings still count on purpose: a docstring asserting that a reason
+        is emitted here IS a claim about this file, and this sprint measured
+        four comments that asserted properties their code did not have (see
+        `docs/TESTING.md`). A claim is exactly what should force
+        re-attribution.
+        """
+        return sum(
+            line.count("size_exceeds_risk")
+            for line in text.splitlines()
+            if not line.lstrip().startswith("#")
+        )
+
     sites = {
-        p.name: (p.read_text(encoding="utf-8").count("size_exceeds_risk"))
+        p.name: _sites(p.read_text(encoding="utf-8"))
         for p in sorted(src.glob("*.py"))
     }
     live = {name: n for name, n in sites.items() if n}

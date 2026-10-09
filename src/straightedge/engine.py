@@ -38,7 +38,7 @@ from straightedge.risk import (
     currency_exposure,
     day_key,
 )
-from straightedge.sizing import money_per_lot_at_stop, normalize_volume
+from straightedge.sizing import MissingStop, money_per_lot_at_stop, normalize_volume
 from straightedge.state import snapshot_path_for
 from straightedge.strategy import TrendStrategy
 from straightedge.telegram import TelegramClient, TgCommand
@@ -1800,10 +1800,27 @@ class Engine:
         not_measured = spec.unmeasured_for_sizing()
         if not_measured:
             return "refused: spec_not_measured:" + ",".join(sorted(not_measured))
-        worst = money_per_lot_at_stop(px, sl, spec) * order.volume
-        # WHAT IS ALREADY RESTING, measured the same way, because the question the
-        # cap should ask is whether this replacement ADDS risk (#164).
-        worst_resting = money_per_lot_at_stop(order.price, order.sl, spec) * order.volume
+        # A MISSING STOP IS NAMED, NOT PRICED (#187). `sl` here is the resting
+        # order's own stop, which `/replace` does not change, so a venue-supplied
+        # `sl = 0` reaches both of these. It is the one call site that can:
+        # `_stop_guard` returns early on `sl <= 0` and `risk.evaluate` refuses
+        # `sl_required` before its own call and before `lots_for_risk`.
+        #
+        # Measured before this refusal existed, on a 0.1 lot order resting with
+        # no stop: `worst_resting` was 11,506.70 against a 50.00 cap, so moving
+        # the entry DOWN entered #164's reduction carve-out and the cap was never
+        # consulted, while moving it UP refused with `size_exceeds_risk`, which
+        # blames the size for a missing stop. Neither sent anything, because
+        # `_modify_pending` refuses `sl <= 0` on the way out, so this was a defect
+        # in what the desk SAYS rather than what it does. Being told the wrong
+        # thing about your own book is the whole reason the vocabulary exists.
+        try:
+            worst = money_per_lot_at_stop(px, sl, spec) * order.volume
+            # WHAT IS ALREADY RESTING, measured the same way, because the question
+            # the cap should ask is whether this replacement ADDS risk (#164).
+            worst_resting = money_per_lot_at_stop(order.price, order.sl, spec) * order.volume
+        except MissingStop:
+            return "refused: sl_required"
         account = self.broker.account()
         r = self.cfg.risk
         per_trade = account.equity * r.risk_pct * r.max_risk_multiple
