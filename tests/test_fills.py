@@ -858,13 +858,55 @@ def test_a_non_finite_stop_is_distinguished_from_an_absent_one(tmp_path) -> None
     assert "nan" in nonfinite, "the offending value is the distinguishing detail"
 
 
-def test_unusable_stop_is_the_one_authority(tmp_path) -> None:
-    """One function answers the question; two places consult it (#208).
+def test_money_per_lot_at_stop_refuses_an_unusable_stop() -> None:
+    """BEHAVIOUR, and it imports nothing that postdates the fix (#215).
 
-    `money_per_lot_at_stop` raises on it and `replace_pending` reads it before
-    the geometry check. That is ONE source of truth consulted twice, not two
-    comparisons that can drift, which is the #187 argument applied to its own
-    fix.
+    The split exists because the original single test reded on the pre-#213
+    tree by **ImportError** only: it imported `unusable_stop`, which did not
+    exist yet, so the red proved a symbol had been added rather than that
+    behaviour had changed. An existence check wearing behavioural credibility
+    is the easiest thing in a suite to mistake for coverage, and it was worst
+    here, on a test whose own subject is what the suite can and cannot observe.
+
+    So this half imports ONLY `money_per_lot_at_stop` and `MissingStop`, both
+    of which predate #213 (they arrived with #187). Revert the guard and this
+    reds on an AssertionError about what the function RETURNED, with no import
+    involved, which is the stronger kind of red.
+    """
+    import math
+
+    from straightedge.sizing import MissingStop, money_per_lot_at_stop
+
+    spec = default_spec("EURUSD")
+    assert money_per_lot_at_stop(1.1000, 1.0950, spec) > 0, "a usable stop must measure"
+
+    for bad in (0.0, -1.0, math.nan, math.inf, -math.inf):
+        try:
+            money_per_lot_at_stop(1.1000, bad, spec)
+        except MissingStop:
+            continue
+        raise AssertionError(f"sl={bad!r} produced a number instead of refusing")
+
+
+def test_unusable_stop_is_the_one_authority() -> None:
+    """EXISTENCE AND AGREEMENT, and that is labelled rather than engineered away.
+
+    This half cannot be made to red on behaviour, and pretending otherwise
+    would be the defect #215 is about. "There is exactly ONE place that decides
+    what an unusable stop is" is not observable from outside the module: what
+    is observable is that the sizer and the engine give the same answer, and
+    that is already pinned on behaviour by
+    `test_a_non_finite_stop_is_distinguished_from_an_absent_one` and by the
+    test above.
+
+    What this adds is a tripwire on the SHAPE: remove or rename
+    `unusable_stop` and it reds by ImportError, which is the correct and
+    intended signal for a shared authority disappearing. It is kept for that,
+    and it is labelled so nobody reads its red as behavioural evidence.
+
+    The agreement assertion at the end is the one part that is genuinely
+    load-bearing here: it pins that the reason the exception carries is the
+    reason the authority assigns, so the name cannot be decided in two places.
     """
     import math
 
@@ -878,14 +920,13 @@ def test_unusable_stop_is_the_one_authority(tmp_path) -> None:
         assert reason is not None and reason.startswith("sl_not_measured:"), (bad, reason)
 
     spec = default_spec("EURUSD")
-    assert money_per_lot_at_stop(1.1000, 1.0950, spec) > 0
-    for bad in (0.0, math.nan, math.inf):
+    for bad in (0.0, math.nan, math.inf, -math.inf):
         try:
             money_per_lot_at_stop(1.1000, bad, spec)
         except MissingStop as exc:
             assert exc.reason == unusable_stop(bad), (bad, exc.reason)
             continue
-        raise AssertionError(f"sl={bad} produced a number instead of refusing")
+        raise AssertionError(f"sl={bad!r} produced a number instead of refusing")
 
 
 def test_an_ordinary_replacement_still_succeeds(tmp_path) -> None:
