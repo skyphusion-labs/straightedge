@@ -97,8 +97,18 @@ that word where it is set; a site whose payload is free text nobody defines
 to document at all. Those sites are not counted and not ignored: the scanner
 returns each one and the test PINS the set, so a new one of either kind fails
 until a person decides which it is. The pin is the part that forces the look,
-and an earlier version of it covered only the prose kind, so a new free-text
-site changed nothing anywhere.
+and two earlier versions of it did not: the first saw no f-string site, the
+second saw no CONCATENATED one, which is how most people would spell it.
+
+What the pin sees is stated rather than implied, because this paragraph has
+twice claimed more than the mechanism did. A refusal reply must carry the
+literal `refused: ` prefix somewhere in the source, so every string constant
+carrying it is a site whatever assembles the rest, and the forms are measured
+one per test: f-string, concatenation with and without the space, `str.join`,
+an f-string with a leading expression, `%` and `.format`. **The one thing not
+seen is a prefix computed at runtime** (`"ref" + "used: "`), which leaves no
+literal to find; that limit is pinned by its own test so it cannot quietly
+become wrong in either direction.
 
 **SCOPE, stated because the table cannot close over what it does not scan.**
 A refusal that does not take the `refused: <word>` shape is NOT in this table

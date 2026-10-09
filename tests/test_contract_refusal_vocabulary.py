@@ -24,6 +24,8 @@ from __future__ import annotations
 import pathlib
 import re
 
+import pytest
+
 from refusal_scan import (
     scan_decision_reasons,
     scan_reason_authorities,
@@ -349,4 +351,80 @@ def test_every_refusal_authority_is_classified() -> None:
     assert not missing, (
         f"REASON_AUTHORITIES names {missing!r}, which sizing.py does not "
         "define; the vocabulary scan is reading nothing for those"
+    )
+
+
+#: Every spelling of a refusal reply the scanner is claimed to SEE, with the
+#: kind it is reported as. Driven as a test per form because the previous two
+#: versions of `scan_refusal_literals` each closed one shape and left the next
+#: most natural one invisible, while the comment claimed closure.
+SEEN_SPELLINGS = (
+    ('return f"refused: {x.comment}"', "interpolated: "),
+    ('return "refused: " + x.comment', "composed: "),
+    ('return "refused:" + x.comment', "composed: "),
+    ('return "".join(["refused: ", x.comment])', "composed: "),
+    ('return f"{x.p}refused: {x.comment}"', "composed: "),
+    ('return "refused: %s" % x.comment', "prose: "),
+    ('return "refused: {}".format(x.comment)', "prose: "),
+)
+
+#: THE ONE RESIDUAL BLIND SPOT, pinned as a test rather than left in prose.
+#: A COMPUTED prefix leaves no literal to find, so no literal scan can see it.
+#: Pinned so that closing it later reds this test and forces the docstring and
+#: the contract paragraph to be updated with it, instead of the claim quietly
+#: becoming true and nobody noticing, or quietly staying false.
+UNSEEN_SPELLING = 'return "ref" + "used: " + x.comment'
+
+
+def _probe(line: str):
+    """`scan_refusal_literals` over desk.py plus one added refusal site."""
+    from refusal_scan import scan_refusal_literals
+
+    base = (SRC / "desk.py").read_text(encoding="utf-8")
+    before = scan_refusal_literals(base)
+    after = scan_refusal_literals(
+        base + "\n\ndef _probe_site(x) -> str:\n    " + line + "\n"
+    )
+    return (
+        sorted(set(after.forwarded) - set(before.forwarded)),
+        sorted(set(after.names) - set(before.names)),
+    )
+
+
+@pytest.mark.parametrize("line,kind", SEEN_SPELLINGS, ids=[s[0][:34] for s in SEEN_SPELLINGS])
+def test_the_scanner_sees_each_refusal_spelling(line: str, kind: str) -> None:
+    """One form per case, so a regression names the spelling it lost.
+
+    The invariant being tested is NOT a list of blessed shapes: it is that a
+    refusal reply must contain the literal prefix somewhere in the source, so
+    every string constant carrying it is a site whatever assembles the rest.
+    These cases are the evidence for that invariant, not its definition.
+    """
+    sites, names = _probe(line)
+    assert sites or names, (
+        f"the scanner did not see {line!r} at all, so a refusal written that "
+        "way would be invisible to the pin and to the table"
+    )
+    assert any(s.startswith(kind) for s in sites) or names, (
+        f"{line!r} was seen but not as {kind!r}: got {sites!r} / {names!r}"
+    )
+
+
+def test_a_computed_prefix_is_the_known_blind_spot() -> None:
+    """PINNED LIMIT, not an oversight.
+
+    A prefix assembled at runtime leaves no literal for an AST scan to find.
+    Nobody writes it, and the docstring and `docs/CONTRACT.md` both say so, so
+    the claim made there is the true one.
+
+    This test exists so the claim and the code cannot drift apart in either
+    direction: if someone closes this hole, this test reds and the two places
+    stating the limit have to be updated in the same change.
+    """
+    sites, names = _probe(UNSEEN_SPELLING)
+    assert not sites and not names, (
+        "a computed prefix is now visible to the scanner, which is an "
+        f"improvement: got {sites!r} / {names!r}. Update the docstring of "
+        "scan_refusal_literals and the CONTRACT.md paragraph that both name "
+        "this as the residual blind spot, then delete this test."
     )

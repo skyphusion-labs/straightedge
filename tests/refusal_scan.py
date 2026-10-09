@@ -303,24 +303,81 @@ def scan_refusal_literals(source: str) -> ReasonScan:
 
     Both are RETURNED rather than counted or ignored. Counting them would
     corrupt the denominator with text that can never be documented as a word;
-    dropping them is the defect this module was written against, and an
-    earlier version of this function did exactly that to the interpolated
-    kind.
+    dropping them is the defect this module was written against, and TWO
+    earlier versions of this function did exactly that: the first to every
+    f-string site, the second to every CONCATENATED one, which is how most
+    people would spell it.
+
+    WHAT IS SEEN, AND THE ONE THING THAT IS NOT. The rule is not a list of
+    blessed shapes: a refusal reply has to carry the literal prefix somewhere
+    in the source, so every string constant carrying it is a site whatever
+    expression assembles the rest. Measured per form in
+    `tests/test_contract_refusal_vocabulary.py`: f-string, concatenation with
+    and without the space, `str.join`, an f-string with a LEADING expression,
+    `%` and `.format` are all seen. A docstring mentioning the prefix is not a
+    site and is skipped.
+
+    **The residual blind spot is a COMPUTED prefix** (`"ref" + "used: "`),
+    which leaves no literal to find and which no scan of this kind can see.
+    That limit is pinned by a test, so closing it later reds and forces this
+    paragraph to be updated rather than letting the claim drift.
     """
     tree = ast.parse(source)
     collector = _Collector(_module_string_constants(tree))
+
+    # THE INVARIANT, stated because the previous two versions of this function
+    # each claimed closure they did not have. A refusal reply has to contain
+    # the literal prefix SOMEWHERE in the source, so every string Constant
+    # carrying it is a site, whatever expression assembles the rest. That is
+    # spelling-agnostic by construction: f-string, concatenation, `join`, `%`
+    # and `.format` all reach here, because all of them leave the prefix as a
+    # literal. The one residual blind spot is a COMPUTED prefix
+    # (`"ref" + "used: "`), which no literal scan can see and which nobody
+    # writes.
+    #
+    # The earlier versions enumerated shapes instead. The first returned on an
+    # f-string head and lost that whole kind; the second fixed the f-string
+    # and left `"refused: " + x.comment` invisible, which is how most people
+    # would spell it, while the comment claimed the hole was closed.
+    docstrings = set()
+    for holder in ast.walk(tree):
+        if isinstance(holder, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            body = getattr(holder, "body", None)
+            if (
+                body
+                and isinstance(body[0], ast.Expr)
+                and isinstance(body[0].value, ast.Constant)
+                and isinstance(body[0].value.value, str)
+            ):
+                docstrings.add(id(body[0].value))
+
+    fstring_heads = set()
+    for holder in ast.walk(tree):
+        if isinstance(holder, ast.JoinedStr) and holder.values:
+            head_node = holder.values[0]
+            if isinstance(head_node, ast.Constant) and isinstance(head_node.value, str):
+                fstring_heads.add(id(head_node))
+
+    parent: dict[int, ast.AST] = {}
+    for holder in ast.walk(tree):
+        for child in ast.iter_child_nodes(holder):
+            parent[id(child)] = holder
+
+    def enclosing_statement(node: ast.AST) -> str:
+        cur: ast.AST | None = node
+        while cur is not None and not isinstance(cur, ast.stmt):
+            cur = parent.get(id(cur))
+        if cur is None:
+            return ast.unparse(node)
+        text = " ".join(ast.unparse(cur).split())
+        return text if len(text) <= 90 else text[:87] + "..."
 
     def take(text: str) -> None:
         if not text.startswith("refused: "):
             return
         tail = text[len("refused: ") :]
         if not tail:
-            # A bare `"refused: "` literal is an f-string HEAD, which
-            # `ast.walk` also visits as a Constant in its own right. The
-            # JoinedStr branch below records that site as `interpolated:`, so
-            # recording it here as well would report one site twice under two
-            # different kinds. It names nothing on its own either way.
-            return
+            return  # handled by the caller, which knows how it is composed
         if REASON_WORD.match(tail):
             collector._record(tail, prefix=True)
         else:
@@ -328,6 +385,16 @@ def scan_refusal_literals(source: str) -> ReasonScan:
 
     for node in ast.walk(tree):
         if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            if id(node) in docstrings or id(node) in fstring_heads:
+                continue  # prose about refusals, or handled below as the f-string
+            if node.value in ("refused: ", "refused:"):
+                # A BARE PREFIX WITH NOTHING LITERAL AFTER IT, and not an
+                # f-string head, so the rest is composed some other way:
+                # `"refused: " + x.comment`, a `join`, a `%`. The site is real
+                # and names no word here, so it is surfaced with the statement
+                # that builds it rather than dropped.
+                collector.forwarded.add("composed: " + enclosing_statement(node))
+                continue
             take(node.value)
         elif isinstance(node, ast.JoinedStr):
             head = node.values[0] if node.values else None
