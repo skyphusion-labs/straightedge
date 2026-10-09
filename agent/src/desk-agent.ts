@@ -4,6 +4,11 @@ import { createAITools } from "@cloudflare/computer/tools";
 import { generateText, stepCountIs } from "ai";
 import { DurableObject } from "cloudflare:workers";
 import type { Env } from "./env";
+import {
+  LOG_READ_MAX_BYTES,
+  LOG_READ_MAX_LINES,
+  trimLog,
+} from "./log-retention";
 
 export const SYSTEM = [
   "You are a risk desk, not a tipster. One account. One book.",
@@ -81,10 +86,7 @@ export class DeskAgent extends DurableObject<Env> {
     );
     const prev = await readUtf8(this.workspace, "/workspace/log.md");
     const stamp = new Date().toISOString();
-    await this.workspace.fs.writeFile(
-      "/workspace/log.md",
-      `${prev}## ${stamp} user\n\n${question}\n\n`,
-    );
+    await this.appendToLog(prev, `## ${stamp} user\n\n${question}\n\n`);
 
     // Docs: REST API at api.cloudflare.com, Authorization + cf-aig-gateway-id.
     // Unified Billing: do not send a provider key. Model ids are author/model (xai/grok-4.6).
@@ -104,7 +106,10 @@ export class DeskAgent extends DurableObject<Env> {
     const model = openai.chat(modelId || this.env.ADVICE_MODEL || "xai/grok-4.6");
     const tools = createAITools({
       workspace: this.workspace,
-      read: { maxBytes: 32 * 1024, maxLines: 800 },
+      // Declared in log-retention.ts, not here: the retention bound is
+      // DERIVED from these two, so a second literal could drift and silently
+      // stop the log fitting in one read (straightedge#131).
+      read: { maxBytes: LOG_READ_MAX_BYTES, maxLines: LOG_READ_MAX_LINES },
     });
     const result = await generateText({
       model,
@@ -121,11 +126,39 @@ export class DeskAgent extends DurableObject<Env> {
     });
     const text = result.text || "";
     const after = await readUtf8(this.workspace, "/workspace/log.md");
-    await this.workspace.fs.writeFile(
-      "/workspace/log.md",
-      `${after}## ${stamp} assistant\n\n${text}\n\n`,
-    );
+    await this.appendToLog(after, `## ${stamp} assistant\n\n${text}\n\n`);
     return text;
+  }
+
+  /**
+   * Append one entry and apply retention. straightedge#131.
+   *
+   * Every write to `log.md` goes through here. The file was appended to with
+   * no cap, no rotation and no delete route, and the Worker serves only
+   * `/health` and `/ask`, so nothing could trim it from outside either. The
+   * cost was not storage: `ask()` reads and rewrites the WHOLE file twice per
+   * turn, so turn latency and memory grew with every question the session had
+   * ever asked.
+   *
+   * A trim is logged as well as marked in the file. `console.log` reaches
+   * Workers observability and `wrangler tail`, which is the only channel this
+   * Durable Object has: it cannot reach the desk's journal, and putting the
+   * notice in the reply would mean writing it into advice text.
+   */
+  private async appendToLog(previous: string, entry: string): Promise<void> {
+    const trimmed = trimLog(`${previous}${entry}`);
+    if (trimmed.droppedEntries > 0 || trimmed.droppedBytes > 0) {
+      console.log(
+        JSON.stringify({
+          event: "log_trimmed",
+          dropped_entries: trimmed.droppedEntries,
+          dropped_bytes: trimmed.droppedBytes,
+          total_dropped_entries: trimmed.totalDroppedEntries,
+          total_dropped_bytes: trimmed.totalDroppedBytes,
+        }),
+      );
+    }
+    await this.workspace.fs.writeFile("/workspace/log.md", trimmed.text);
   }
 }
 
