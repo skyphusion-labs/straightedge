@@ -315,7 +315,24 @@ re-checker that the instrument could not fire.
 Reviewing prose catches wording. Only running it catches rot. So when a document
 states a command, run the command; when it states a count, reproduce the count.
 
-A shell block in this repo's docs can be lifted and executed directly:
+**But measure whether your documents contain anything a script may safely run,
+before trusting a script to check them.** Surveyed across this repo: 11
+documents, 40 fenced blocks, and the command-shaped lines are `python -m
+straightedge` (which starts a desk), `launchctl` (which mutates the machine),
+`export` (which sets credentials), `powershell`, and desk chat commands such as
+`/trail` that are not shell at all. **Not one is safe to execute
+automatically.** A verifier that ran them would be far worse than none.
+
+So on this repo the automated half checks read-only commands (`git`, `pytest`,
+`ruff`, `mypy`) and legitimately finds none to run, which is a property of the
+documents rather than of the tool. The manual half is the one that applies
+here: when a document states a command you cannot safely automate, run it
+yourself and reproduce its stated output, and when it states a count,
+re-derive the count.
+
+The script below is still worth having, both for the documents that do carry
+read-only commands and because its exit code makes "nothing was checked"
+distinguishable from "nothing was wrong":
 
 ```
 python3 - "$DOC" <<'EOF'
@@ -326,7 +343,7 @@ src = open(sys.argv[1]).read()
 # them. See the note below.
 blocks = re.findall(r"^[ \t]*```[a-zA-Z]*\n(.*?)^[ \t]*```", src, re.S | re.M)
 print(f"fenced blocks: {len(blocks)}")
-ran = 0
+ran = failures = 0
 for i, b in enumerate(blocks, 1):
     for line in (l.strip() for l in textwrap.dedent(b).splitlines()):
         if not line.startswith(("git ", "pytest", "ruff ", "mypy ")):
@@ -336,10 +353,29 @@ for i, b in enumerate(blocks, 1):
             continue
         r = subprocess.run(line, shell=True, capture_output=True, text=True)
         ran += 1
+        failures += r.returncode != 0
         print(f"block {i}: exit={r.returncode}  {line}")
 print(f"command lines executed: {ran}")
+# NOTHING CHECKED IS NOT A CLEAN RESULT. Without these two exits the script
+# prints its own definition of broken and returns 0, which is the defect this
+# section describes, in the tool this section ships.
+if ran == 0:
+    sys.exit("no command was executed: this is a broken check, not a clean document")
+sys.exit(1 if failures else 0)
 EOF
 ```
+
+**A third defect, found by the reviewer EXECUTING it rather than reading it.**
+Run as written on the document it ships in, the first version printed
+`command lines executed: 0` and exited 0, which is this section's own
+definition of a broken check reported as a clean one. The reviewer also ran it
+against every other document in the repo and got zero executions in all of
+them, so the claim that a block "can be lifted and executed directly" was not
+demonstrated for a single document here. Its positive control, a scratch
+document holding three passing commands and one failing one, returned 2 blocks
+and 4 executions with the failure showing `exit=128`: **the instrument can
+fire, and the repo simply has nothing it may safely run.** Hence the exits
+above, and the survey before the script rather than after it.
 
 **Print the denominator, and this script is why.** Its first version anchored
 the fence at the start of a line, so it matched exactly ONE block in this file:
@@ -358,6 +394,20 @@ never runnable. A verifier whose only output on a healthy document is two false
 alarms gets ignored, and an ignored check is a decorative one. Hence the
 placeholder skip, and hence the SKIP lines in the output: what it declines to
 run is as much a part of the reading as what it ran.
+
+**Run as written, with all four controls, which is the standard this section
+sets for itself:**
+
+```
+target=TESTING.md    rc=1   2 blocks, 2 SKIP, 0 executed -> "broken check, not a clean document"
+target=control.md    rc=1   2 blocks, 4 executed, deliberate failure shows exit=128
+target=unsafe.md     rc=1   1 block,  0 executed (launchctl / python -m straightedge)
+target=all_pass.md   rc=0   2 blocks, 2 executed, both exit=0
+```
+
+The last row is the one most easily skipped: **a check that cannot return 0 is a
+gate that can never pass**, which is as useless as one that can never fail, and
+the only way to know is to build a document it should pass on.
 
 Two honest limits that remain, because a verifier overstating its reach is also
 this file's subject. It only runs lines it recognises as commands, so
