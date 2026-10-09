@@ -325,15 +325,22 @@ branch:
 | domain | command naming the domain | files | with fenced blocks | blocks |
 | --- | --- | --- | --- | --- |
 | `docs/*.md` plus `README.md` | `git ls-files 'docs/*.md' README.md` | 11 | 6 | 40 |
-| `**/*.md` across the repo | `git ls-files '*.md'` | 18 | 12 | 56 |
+| `**/*.md` across the repo | `git ls-files '*.md'` | 18 | 12 | 59 |
 
 **Both rows count THIS file, so both move when it does**, which is the same
-self-inclusion the controls table below hit, one domain wider. The row that
-used to sit here read 41 and 19 and was labelled as measured on `main`; it was
-measured on a working tree instead, and re-run on `main` the two commands give
-11 / 5 / 38 and 18 / 11 / 54, so the label matched neither tree. A count in
-this domain is trustworthy only re-derived, which is why the commands are in
-the table and the tree is named.
+self-inclusion the controls table below hit, one domain wider. Measured on this
+branch with `main` merged at `f98984b`; run on `f98984b` itself the same two
+commands give 11 / 5 / 38 and 18 / 11 / 57, and the whole difference is this
+file's own two blocks, which is what makes the self-inclusion checkable rather
+than asserted. The row that used to sit here read 41 and 19, labelled as
+measured on `main`, and matched no tree: it was taken from a working tree.
+
+**And the wider row rots on a markdown commit anywhere in the repo, which
+happened to it while this pull request was open.** It read 56, correctly, until
+`#205` landed three fenced blocks in `agent/README.md` (2 to 5, so 56 to 59)
+with nothing in this file changing. Nothing here was wrong and the number went
+stale anyway, which is the argument for the commands being in the table: a
+corpus count carried as prose is stale by default, so pin the ref or re-derive.
 
 In both, the command-shaped lines inside fences are `python -m straightedge run`
 and its siblings (`backtest`, `watch`, `supervision`), which start or drive a
