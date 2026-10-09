@@ -555,3 +555,150 @@ class TestTheMeasureIsSignedNotAbsolute:
             "a stop dragged from locked profit back to 500 points of risk was "
             "allowed"
         )
+
+
+class TestTheHaltRoomHalfOfTheCapIsLoadBearing:
+    """`min(per_trade, loss_room)` has TWO bounds and only one had a test (#170).
+
+    Measured by mutation, not by reading: change `engine.py` to
+    `if worst > per_trade + 1e-6:`, dropping the halt-room half, and the whole
+    suite stayed green at 1187 passed. The identical mutation on the sibling
+    guard in `replace_pending` reds `test_fills.py::
+    test_replace_pending_refuses_for_lack_of_loss_room` immediately. Same rule,
+    three paths, and this was the one carrying it with nothing underneath.
+
+    ## Both halves of why that was hard to see, because the next reader will
+    ## run the obvious control and get nothing
+
+    For a FRESHLY SIZED position the mutation genuinely IS equivalent, and the
+    obvious control correctly comes back empty. `lots_for_risk` sizes so that
+    `worst` at the opening stop is about `per_trade`, so any widening already
+    breaks the per-trade bound and the `min()` term never binds. Reaching the
+    band needs `loss_room < per_trade` AND `worst <= per_trade` at once, which
+    for the default config means equity below 9849 and at or above 9900. Empty.
+    **An equivalent mutant is not a missing test**, so stopping there would have
+    been sound reasoning on a wrong conclusion.
+
+    What breaks the equivalence is a position whose volume is SMALLER than
+    today's cap would size, and that state is ordinary: a partial close, or a
+    position carried from a day when equity was lower. This class builds it with
+    the desk's own `/close TICKET VOLUME`, so the state is reachable through the
+    product rather than by poking the dataclass.
+
+    The scenario, all three gates clear so only this cap can refuse: equity
+    9824.50, volume 0.05 after scaling 0.55 down, `per_trade` 49.1225,
+    `loss_room` 24.5000. A widening to `worst` 25.00 fits the per-trade cap with
+    24 to spare and does NOT fit what the day has left.
+    """
+
+    @staticmethod
+    def _scaled_out_and_tight_on_room(engine: Engine):
+        """0.05 lots left, circuit clear, and `loss_room` below `per_trade`.
+
+        Returns the detached position, `per_trade` and `loss_room`, so every
+        assertion below reads the numbers the engine itself computed rather
+        than a literal that could drift away from the config.
+        """
+        pos = _open(engine)
+        reply = engine.handle_command(
+            TgCommand("1", 1, f"/close {pos.ticket} 0.50", 3)
+        )
+        assert reply.startswith("closed"), reply
+        live = _live(engine, pos.ticket)
+        assert live.volume == 0.05, live.volume
+
+        # Equity below day_start by more than the per-trade cap but well inside
+        # the 2% daily stop, so `loss_room` is positive and TIGHTER than
+        # `per_trade`: the only state in which the second bound can bind.
+        engine.broker._balance = 9_825.0
+        account = engine.broker.account()
+        engine.risk.observe(account, engine.now_fn())
+        account = engine.broker.account()
+
+        r = engine.cfg.risk
+        per_trade = account.equity * r.risk_pct * r.max_risk_multiple
+        room = engine.risk.loss_room(account)
+        assert not engine.risk.circuit_reason(account, engine.now_fn()), (
+            "the circuit must be CLEAR, or it refuses and this proves nothing"
+        )
+        assert 0 < room < per_trade, (room, per_trade)
+        return replace(live), per_trade, room
+
+    def test_a_widening_inside_the_per_trade_cap_is_refused_for_lack_of_room(
+        self, tmp_path: Path
+    ) -> None:
+        """The per-trade bound ALLOWS this widening. The halt-room bound refuses it.
+
+        That is what makes this the test the mutant cannot survive: assert
+        `worst <= per_trade` explicitly, so a guard measuring only the
+        per-trade half would have to let it through.
+        """
+        engine = _engine(tmp_path)
+        engine.start()
+        pos, per_trade, room = self._scaled_out_and_tight_on_room(engine)
+
+        spec = engine.broker.symbol(pos.symbol)
+        far = round(pos.price_open - spec.point * 500, 5)
+        worst = _worst(engine, pos, far)
+
+        assert worst > room, "the fixture does not exceed the remaining room"
+        assert worst <= per_trade, (
+            "the fixture must fit the PER-TRADE cap, or the halt-room half is "
+            "not what refuses it and the mutant survives"
+        )
+
+        reply = engine.handle_command(TgCommand("1", 1, f"/sl {pos.ticket} {far:.5f}", 4))
+        engine.stop()
+
+        assert "stop_exceeds_risk" in reply, reply
+        assert _live(engine, pos.ticket).sl == pos.sl, (
+            "the stop was widened past what the day has left"
+        )
+
+    def test_a_widening_that_fits_the_remaining_room_is_allowed(
+        self, tmp_path: Path
+    ) -> None:
+        """Positive control. Without it, refusing EVERY widening on a scaled-out
+        position would pass the test above and the suite would be measuring
+        nothing but the scale-out."""
+        engine = _engine(tmp_path)
+        engine.start()
+        pos, per_trade, room = self._scaled_out_and_tight_on_room(engine)
+
+        spec = engine.broker.symbol(pos.symbol)
+        near = round(pos.price_open - spec.point * 400, 5)
+        worst = _worst(engine, pos, near)
+        assert worst < room <= per_trade, (worst, room, per_trade)
+
+        reply = engine.handle_command(TgCommand("1", 1, f"/sl {pos.ticket} {near:.5f}", 4))
+        engine.stop()
+
+        assert "sl #" in reply, reply
+        assert abs(_live(engine, pos.ticket).sl - near) < 1e-5, reply
+
+    def test_the_boundary_is_the_room_exactly_consumed(self, tmp_path: Path) -> None:
+        """Solve the boundary rather than inherit it from the epsilon.
+
+        `worst` exactly equal to the remaining room is ALLOWED: the comparison
+        is `worst > room + 1e-6`, so spending the budget to the cent is not an
+        overdraft. Ten points further is refused. Both arms in one test,
+        because a boundary asserted on one side only does not pin a boundary.
+        """
+        engine = _engine(tmp_path)
+        engine.start()
+        pos, _per_trade, room = self._scaled_out_and_tight_on_room(engine)
+        spec = engine.broker.symbol(pos.symbol)
+
+        exact = round(pos.price_open - spec.point * 490, 5)
+        assert abs(_worst(engine, pos, exact) - room) < 1e-9, _worst(engine, pos, exact)
+        allowed = engine.handle_command(TgCommand("1", 1, f"/sl {pos.ticket} {exact:.5f}", 4))
+        assert "sl #" in allowed, allowed
+
+        over = round(pos.price_open - spec.point * 500, 5)
+        refused = engine.handle_command(TgCommand("1", 1, f"/sl {pos.ticket} {over:.5f}", 5))
+        engine.stop()
+
+        assert "stop_exceeds_risk" in refused, refused
+        assert abs(_live(engine, pos.ticket).sl - exact) < 1e-5, (
+            "the refusal must leave the stop where the allowed move put it"
+        )

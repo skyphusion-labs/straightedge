@@ -52,8 +52,17 @@ export const LOG_KEEP_ENTRIES = 40;
 /** Bytes held back from the budget so the marker line always fits. */
 const MARKER_RESERVE_BYTES = 256;
 
+/** Lines `clampEntry`'s notice adds (its four newlines). */
+const NOTICE_LINES = 4;
+
+// Two shapes, and the first is the one every log written before #179 carries,
+// so it must keep matching or the running totals reset (straightedge#179).
 const MARKER_RE =
   /^<!-- straightedge log trimmed: (\d+) earlier entries \((\d+) bytes\) dropped[^>]*-->\n/;
+// Written once an entry has been truncated in place: bytes were lost from an
+// entry that is still there, which "N earlier entries dropped" cannot say.
+const TRUNCATED_MARKER_RE =
+  /^<!-- straightedge log trimmed: (?:(\d+) earlier entries dropped and )?an entry truncated \((\d+) bytes\) removed[^>]*-->\n/;
 
 const encoder = new TextEncoder();
 
@@ -73,40 +82,62 @@ export type TrimResult = {
   totalDroppedBytes: number;
 };
 
-function marker(entries: number, bytes: number): string {
+function marker(entries: number, bytes: number, truncated: boolean): string {
+  const lead = truncated
+    ? `${entries > 0 ? `${entries} earlier entries dropped and ` : ""}an entry truncated ` +
+      `(${bytes} bytes) removed`
+    : `${entries} earlier entries (${bytes} bytes) dropped`;
   return (
-    `<!-- straightedge log trimmed: ${entries} earlier entries (${bytes} bytes) ` +
-    `dropped; keeping the most recent ${LOG_KEEP_ENTRIES} entries within ` +
+    `<!-- straightedge log trimmed: ${lead}; keeping the most recent ${LOG_KEEP_ENTRIES} entries within ` +
     `${LOG_READ_MAX_BYTES} bytes and ${LOG_READ_MAX_LINES} lines, so one read ` +
     `sees the whole log. straightedge#131 -->\n`
   );
 }
 
 /** Split a previously written log into its marker totals and the entries after it. */
-function splitMarker(log: string): { entries: number; bytes: number; body: string } {
+function splitMarker(log: string): {
+  entries: number;
+  bytes: number;
+  truncated: boolean;
+  body: string;
+} {
   const m = MARKER_RE.exec(log);
-  if (!m) {
-    return { entries: 0, bytes: 0, body: log };
+  if (m) {
+    return { entries: Number(m[1]), bytes: Number(m[2]), truncated: false, body: log.slice(m[0].length) };
   }
-  return {
-    entries: Number(m[1]),
-    bytes: Number(m[2]),
-    body: log.slice(m[0].length),
-  };
+  const t = TRUNCATED_MARKER_RE.exec(log);
+  if (t) {
+    return {
+      entries: Number(t[1] ?? 0),
+      bytes: Number(t[2]),
+      truncated: true,
+      body: log.slice(t[0].length),
+    };
+  }
+  return { entries: 0, bytes: 0, truncated: false, body: log };
 }
 
 /**
- * Split the body on `## ` headings, each entry keeping its own heading.
+ * Split the body on TURN headings, each entry keeping its own heading.
+ *
+ * A turn heading is the exact shape `desk-agent.ts` writes
+ * (`## <UTC timestamp> user|assistant`), not any `## ` line: a model reply
+ * with markdown sections would otherwise be several units, shrinking the
+ * window and letting a trim cut inside a turn (straightedge#166).
  *
  * Anything before the first heading is returned as a leading fragment rather
  * than silently dropped: it should not exist, and a retention routine that
  * quietly deletes something it did not expect is worse than one that carries
  * it. It is counted against the budget like any other text.
  */
+function turnHeadingRe(): RegExp {
+  return /^## \d{4}-\d{2}-\d{2}T[0-9:.]+Z (user|assistant)$/gm;
+}
+
 function splitEntries(body: string): string[] {
   if (!body) return [];
   const out: string[] = [];
-  const re = /^## /gm;
+  const re = turnHeadingRe();
   const starts: number[] = [];
   let m: RegExpExecArray | null;
   while ((m = re.exec(body)) !== null) {
@@ -140,7 +171,11 @@ function lineCount(s: string): number {
  * limit has not solved anything.
  */
 function clampEntry(entry: string, budget: number): { text: string; dropped: number } {
-  const notice = (n: number) => `\n\n[truncated: ${n} more chars, straightedge#131]\n\n`;
+  const notice = (n: number) => `\n\n[truncated: ${n} more bytes, straightedge#131]\n\n`;
+  // The notice adds NOTICE_LINES lines, so the kept text gets what is left of
+  // the read cap. Without this a single entry was only ever byte-clamped.
+  const lineRoom = LOG_READ_MAX_LINES - NOTICE_LINES;
+  let lines = 1;
   const room = budget - byteLength(notice(byteLength(entry)));
   if (room <= 0) {
     return { text: notice(byteLength(entry)), dropped: byteLength(entry) };
@@ -150,6 +185,10 @@ function clampEntry(entry: string, budget: number): { text: string; dropped: num
   for (const ch of entry) {
     const size = byteLength(ch);
     if (used + size > room) break;
+    if (ch === "\n") {
+      if (lines + 1 > lineRoom) break;
+      lines += 1;
+    }
     kept += ch;
     used += size;
   }
@@ -171,6 +210,7 @@ export function trimLog(log: string): TrimResult {
   let totalBytes = prior.bytes;
   let droppedEntries = 0;
   let droppedBytes = 0;
+  let truncated = prior.truncated;
 
   let kept = splitEntries(prior.body);
 
@@ -191,17 +231,18 @@ export function trimLog(log: string): TrimResult {
     droppedBytes += byteLength(gone);
   }
 
-  if (kept.length === 1 && byteLength(kept[0]) > budget) {
+  if (kept.length === 1 && (byteLength(kept[0]) > budget || lineCount(kept[0]) > LOG_READ_MAX_LINES)) {
     const clamped = clampEntry(kept[0], budget);
     kept = [clamped.text];
     droppedBytes += clamped.dropped;
+    truncated = true;
   }
 
   totalEntries += droppedEntries;
   totalBytes += droppedBytes;
 
   const body = kept.join("");
-  const text = totalEntries > 0 || totalBytes > 0 ? marker(totalEntries, totalBytes) + body : body;
+  const text = totalEntries > 0 || totalBytes > 0 ? marker(totalEntries, totalBytes, truncated) + body : body;
   return {
     text,
     droppedEntries,

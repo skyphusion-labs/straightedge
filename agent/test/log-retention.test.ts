@@ -184,3 +184,100 @@ describe("the shipped Durable Object, against its real storage", () => {
     expect(log).toContain("straightedge log trimmed");
   });
 });
+
+describe("trimLog: a `## ` line inside a body is not an entry (straightedge#166)", () => {
+  const sectioned = (n: number) =>
+    Array.from({ length: n }, (_, i) => `## Section ${i}\n\ntext ${i}`).join("\n\n");
+  const TURN = /^## \d{4}-\d{2}-\d{2}T[0-9:.]+Z (user|assistant)$/gm;
+
+  it("a reply carrying markdown headings is still ONE entry, so the window counts turns", () => {
+    // 41 real turns, each carrying three `## ` sections. If any `## ` line
+    // were a unit this would be ~160 units and drop the oldest ~120.
+    let log = "";
+    for (let i = 0; i < LOG_KEEP_ENTRIES + 1; i += 1) {
+      log += entry(i % 2 === 0 ? "user" : "assistant", i, sectioned(3));
+    }
+    const r = trimLog(log);
+    expect(r.droppedEntries).toBe(1);
+    expect((r.text.match(TURN) ?? []).length).toBe(LOG_KEEP_ENTRIES);
+  });
+
+  it("a trim never deletes the question and keeps the reply that answered it", () => {
+    let log = logOf(4);
+    log += entry("user", 4, "the question");
+    log += entry("assistant", 5, sectioned(60));
+    const r = trimLog(log);
+    expect(r.text).toContain("the question");
+    expect(r.text).toContain("Z assistant\n");
+    expect(r.droppedEntries).toBe(0);
+  });
+});
+
+describe("trimLog: a single remaining entry is line-clamped too (straightedge#166)", () => {
+  const reply = Array.from({ length: 900 }, (_, i) => `l${i}`).join("\n");
+
+  it("one turn with a 900-line reply ends within the declared line cap", () => {
+    const r = trimLog(entry("assistant", 1, reply));
+    const nonEmpty = r.text.split("\n").filter((l) => l.trim() !== "").length;
+    expect(nonEmpty).toBeLessThanOrEqual(LOG_READ_MAX_LINES);
+    expect(r.droppedBytes).toBeGreaterThan(0);
+    expect(r.text).toMatch(/^<!-- straightedge log trimmed:/);
+  });
+
+  it("re-trimming a clamped log changes nothing", () => {
+    const once = trimLog(entry("assistant", 1, reply));
+    const twice = trimLog(once.text);
+    expect(twice.text).toBe(once.text);
+    expect(twice.droppedBytes).toBe(0);
+  });
+});
+
+describe("trimLog: the marker wording and its parser (straightedge#179)", () => {
+  // Written by the code that shipped in #131/#166, byte for byte. This is the
+  // compatibility contract: a log already carrying it must keep its totals.
+  const OLD_MARKER =
+    "<!-- straightedge log trimmed: 7 earlier entries (1000 bytes) dropped; keeping the most " +
+    "recent 40 entries within 32768 bytes and 800 lines, so one read sees the whole log. " +
+    "straightedge#131 -->\n";
+  const bigReply = Array.from({ length: 900 }, (_, i) => `l${i}`).join("\n");
+
+  it("carries an old-format marker's totals forward when a later trim drops more", () => {
+    const r = trimLog(OLD_MARKER + logOf(LOG_KEEP_ENTRIES + 2));
+    expect(r.droppedEntries).toBe(2);
+    expect(r.totalDroppedEntries).toBe(7 + 2);
+    expect(r.totalDroppedBytes).toBe(1000 + r.droppedBytes);
+    expect(r.text.startsWith("<!-- straightedge log trimmed: 9 earlier entries (")).toBe(true);
+  });
+
+  it("keeps an old-format marker untouched when nothing new is dropped", () => {
+    const log = OLD_MARKER + logOf(3);
+    const r = trimLog(log);
+    expect(r.text).toBe(log);
+    expect(r.totalDroppedEntries).toBe(7);
+    expect(r.totalDroppedBytes).toBe(1000);
+  });
+
+  it("does not say '0 earlier entries' when it truncated an entry", () => {
+    const r = trimLog(entry("assistant", 1, bigReply));
+    expect(r.text).not.toContain("0 earlier entries");
+    expect(r.text.split("\n")[0]).toContain("an entry truncated");
+    expect(r.totalDroppedEntries).toBe(0);
+    expect(r.totalDroppedBytes).toBeGreaterThan(0);
+  });
+
+  it("re-trimming a truncation marker changes nothing and keeps the wording", () => {
+    const once = trimLog(entry("assistant", 1, bigReply));
+    const twice = trimLog(once.text);
+    expect(twice.text).toBe(once.text);
+    expect(twice.totalDroppedBytes).toBe(once.totalDroppedBytes);
+  });
+
+  it("a truncation marker keeps its totals and its wording across later drops", () => {
+    const once = trimLog(entry("assistant", 1, bigReply));
+    const later = trimLog(once.text + logOf(LOG_KEEP_ENTRIES + 1));
+    expect(later.totalDroppedBytes).toBe(once.totalDroppedBytes + later.droppedBytes);
+    expect(later.totalDroppedEntries).toBeGreaterThan(0);
+    expect(later.text.split("\n")[0]).toContain("an entry truncated");
+    expect(later.text.split("\n")[0]).toContain(`${later.totalDroppedEntries} earlier entries dropped`);
+  });
+});
