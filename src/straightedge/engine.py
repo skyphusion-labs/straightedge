@@ -664,8 +664,8 @@ class Engine:
         # the loss-room term here is what makes a spent daily budget refuse a
         # widening by arithmetic alone rather than by a second circuit check: once
         # the budget is gone `loss_room` is negative, so no wider stop fits.
-        # (`replace_pending` uses only the per-trade half; that gap is filed
-        # separately and is not widened by matching the stricter form here.)
+        # (`replace_pending` measures a working-order replacement against this
+        # same pair as of #104; all three paths now agree.)
         if worst > min(per_trade, self.risk.loss_room(account)) + 1e-6:
             return STOP_EXCEEDS_RISK
         return ""
@@ -1595,8 +1595,24 @@ class Engine:
         if order.side.value == "sell" and not (sl > px and (tp <= 0 or tp < px)):
             return "sell needs tp < entry < sl"
         worst = money_per_lot_at_stop(px, sl, spec) * order.volume
-        cap = self.broker.account().equity * self.cfg.risk.risk_pct * self.cfg.risk.max_risk_multiple
-        if worst > cap + 1e-6:
+        account = self.broker.account()
+        r = self.cfg.risk
+        per_trade = account.equity * r.risk_pct * r.max_risk_multiple
+        # The same pair `risk.evaluate` measures a NEW order against, and the
+        # same pair `_stop_guard` measures a widening against. A WORKING ORDER
+        # IS COMMITTED EXPOSURE: it rests at the broker and becomes a position
+        # without anyone being asked again, so a replacement has to fit in what
+        # the day has LEFT, not merely in the per-trade cap.
+        #
+        # The window this closes is not "the budget is spent": `circuit` trips
+        # `daily_loss` on the same comparison `loss_room` rearranges, so room
+        # hits zero exactly when the circuit trips and the `circuit_reason`
+        # check above already refuses there. It is the band where room is
+        # POSITIVE but TIGHTER than the per-trade cap, which no gate here read.
+        #
+        # `loss_room` wants a current snapshot; `circuit_reason` above ran
+        # `observe`, so it has one.
+        if worst > min(per_trade, self.risk.loss_room(account)) + 1e-6:
             return "refused: size_exceeds_risk"
         result = self._modify_pending(order, sl=sl, tp=tp, price=px)
         if not result.ok:

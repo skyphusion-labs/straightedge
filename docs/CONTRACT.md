@@ -105,7 +105,7 @@ Auto EMA trading is off until `/auto on`.
 | `/live on I-ACCEPT-RISK\|off` | Arm or disarm real-money sends from chat. Phrase required. Same fuse as `--i-accept-risk`. |
 | `/cancel` | Drop the staged confirm. |
 | `/cancel TICKET` | Cancel a working order. |
-| `/replace TICKET PRICE` | Move a working order entry. Uses `TRADE_ACTION_MODIFY`. The circuit and `risk_pct` still refuse. |
+| `/replace TICKET PRICE` | Move a working order entry. Uses `TRADE_ACTION_MODIFY`. The circuit still refuses, and the replacement is measured against the per-trade cap AND the halt room, the same pair a new order is measured against (#104). |
 | `/orders` | List working orders. |
 | `/close TICKET\|SYMBOL\|all [VOL]` | Flatten or partial close. |
 | `/closeby TICKET OTHER` | Hedge-account only. `TRADE_ACTION_CLOSE_BY` offsets two opposite tickets. Same symbol, opposite sides. Remainder 0 or at least `volume_min`. Not a new send. Netting terminals refuse CLOSE_BY. Paper always hedges. |
