@@ -8,6 +8,14 @@ Every instance produced a REASSURING result rather than an error. That is the
 whole problem: the healthy state and the broken state rendered identically, so
 nothing looked wrong at any point.
 
+**SCOPE.** That sentence is also the boundary: everything here is about a check
+that reports the reassuring state. **Nothing in this file covers the opposite
+failure, a gate that REDS on a healthy system**, which is a real and separate
+defect; we shipped one this sprint, a liveness audit that red on two tasks
+installed thirty seconds earlier. A false alarm is found by the person it
+interrupts, which is why it needs no document; a false reassurance is found by
+nobody.
+
 ## The check
 
 **For any fixture, name a reachable state where the right implementation and the
@@ -37,7 +45,14 @@ the agreement is invisible.
 
 ## The four measured instances
 
-**straightedge#170, the freshly-sized position.** `_stop_guard` measures a
+**Each is labelled by how its BLINDNESS claim was established**, because a
+document arguing that a property stated without its measurement is the problem
+cannot itself mix two kinds of evidence silently. MUTATION means a guard was
+removed and the suite observed; ARITHMETIC means the blindness was derived and
+never observed as a red.
+
+**straightedge#170, the freshly-sized position. [MUTATION, plus ARITHMETIC for
+the empty band.]** `_stop_guard` measures a
 widening against `min(per_trade, loss_room)`. Deleting the halt-room half left
 all 1187 tests green. The band needs `loss_room < per_trade` AND
 `worst <= per_trade` at once, which on the default config means equity below
@@ -45,7 +60,7 @@ all 1187 tests green. The band needs `loss_room < per_trade` AND
 than today's cap would size (a scale-out, or one carried from a lower-equity
 day) escapes it.
 
-**straightedge#169 and #176, currency resolution.** Every planted book was
+**straightedge#169 and #176, currency resolution. [MUTATION.]** Every planted book was
 three-plus-three, so one test (`DOGEUSD`) was the SOLE instrument for two
 separate properties: the aggregation inside `exposure_text`, and
 `risk.currency_exposure` resolving rather than splitting. Reverting the shared
@@ -53,7 +68,8 @@ function to a naive split red exactly ONE test. After one fixture leg was
 changed to a non-three-plus-three symbol: four reds for one property, five for
 the other, with different red sets.
 
-**straightedge#157 and #164, the resting order at the cap.** The `#104`
+**straightedge#157 and #164, the resting order at the cap. [ARITHMETIC for the
+empty band, with NO observed red; MEASUREMENT for the direction defect.]** The `#104`
 regression pin proposed `limit - 0.001`, which moves the entry TOWARD the stop:
 worst 50.00 -> 40.00, a REDUCTION. A test named for refusing a risk-INCREASING
 replacement was asserting that a reduction is refused, and the increase
@@ -66,7 +82,7 @@ proposal 26.00) and asserts the direction so a future reduction fixture cannot
 pass through the carve-out unnoticed.
 
 **straightedge#175, one layer out: the INSTRUMENT could not express the
-failure.** The clamp `max(cap - abs(net), 0)` was unobserved by all eighteen
+failure. [MUTATION, with a control.]** The clamp `max(cap - abs(net), 0)` was unobserved by all eighteen
 mutants run against #169. Its test helper matched rows with `room=(\d+)`, which
 cannot represent a negative number at all, so removing the clamp made the row
 stop matching and the test red on a `KeyError`. Measured both ways: both forms
@@ -97,6 +113,25 @@ and the comment there says exactly that rather than claiming more.
 
 Distinguishing the two cases is the skill. "Nothing reds" means either the
 suite is blind or the change does not matter, and those want opposite responses.
+
+**But "equivalent" is a property of the mutation AND the reachable fixture
+space, never of the mutation alone.** This is the trap, and it is the one this
+whole document exists to stop, so it is worth stating twice.
+
+The halt-room mutation in #170 genuinely IS equivalent for a freshly-sized
+position. Sizing puts worst-case loss AT the per-trade cap, so any widening
+breaks the per-trade bound first and the `min()` term can never decide the
+answer. Run the obvious control on the obvious fixture and nothing reds, and
+that nothing is CORRECT. The same mutation is NOT equivalent once the volume is
+smaller than today's cap would size, which a scale-out or a position carried
+from a lower-equity day produces, and there the engine's verdict flips.
+
+So a clean nothing does not license "equivalent, move on". It licenses exactly
+one conclusion: **equivalent OVER THE FIXTURES I TRIED.** Before recording a
+mutation as equivalent, say which states you reached and name the state class
+you did not. #170 was recorded as a real gap only because someone widened the
+fixture space after the first control came back empty; stopping at the clean
+nothing was the near-miss, and it was one step away.
 
 ## A clean textual merge is not a passing merge
 
@@ -140,6 +175,24 @@ AFTER changing it and treating the result as independent.
   confirm landed on the line you meant is not a measurement.** Assert the
   enclosing function, or that the anchor matches exactly once, before writing.
 
+- A correctly-aimed mutation measured through a **mis-specified baseline**.
+  A reviewer established a real 6-to-1 change in a diff and attributed it to the
+  wrong branch, because `git diff A..B` compares two TREES: on a branch that is
+  BEHIND, every commit `main` has and the branch lacks appears INVERTED, as
+  though the branch removed it. `A...B` is the changeset and matches GitHub's
+  files endpoint.
+
+  ```
+  git diff --stat origin/main..<head>    6 files, 148 insertions, 207 deletions
+  git diff --stat origin/main...<head>   2 files, 144 insertions   <- the changeset
+  ```
+
+  The measurement was real; the baseline was not. Its own diagnosis is the
+  transferable part: it verified the MUTATION carefully, with correct aim and
+  reproducible counts, and **inherited the SETUP without checking it.** Verifying
+  the interesting half of a procedure while assuming the boring half is how a
+  careful person gets a confident wrong answer.
+
 A related trap with the same shape but no mutation of your own: **the record
 lags the artifact.** Immediately after a push, a pull request can report the OLD
 head and a stale `reviewDecision`. Poll until the reported head matches the sha
@@ -175,6 +228,15 @@ change and concludes the instrument cannot fire.
 So when a comment states a property, ask what would red if the property stopped
 holding. If the answer is nothing, the comment is a claim rather than a
 guarantee, and it should say which.
+
+**And check the claim at its EDGE, not its middle.** Every instance above holds
+comfortably in the middle of its range and fails at a boundary:
+`VENUE_CLOCK_BAR_DISAGREES` is correct for most of a bar and blind in the
+instant before one closes; the cap comments are right while the book is
+ordinary and silent on a book sized below the cap; the README claim is true of a
+retained use and false of a bare import. A reading taken mid-range cannot
+distinguish "holds" from "holds here", so test the first and last value a bound
+admits, and the value just past it.
 
 ## An assertion over an empty collection passes for free
 
@@ -224,3 +286,81 @@ GitHub computes `mergeStateStatus` against the required contexts. The gate was
 right and the narration was lucky, which is the distinction worth keeping: a
 correct outcome does not retroactively make the reading that accompanied it
 evidence.
+
+## A control beats a second opinion
+
+Two instruments agreeing is CORROBORATION. A control showing the instrument can
+produce the other answer is PROOF. They are not the same strength and it is easy
+to spend effort on the weaker one.
+
+Worked example, from verifying one of the retractions above. Two independent
+instruments said a patch did not touch a fixture: the files endpoint listed only
+the two expected documentation files, and the raw patch contained zero lines
+matching `LINKUSD|GBPUSD`. Both agreeing is consistent with the patch being
+clean, and equally consistent with the grep being wrong. **The control is what
+settled it: the same grep against `main`'s copy of that file finds six matches.**
+So the instrument can fire, and its zero means absence rather than inability.
+
+This is the same argument this file makes for tests, one level up, and it
+applies to verification of any kind. If your evidence is "I checked it two
+ways", ask what either way would have printed had the thing been true.
+
+## Execute the documentation, do not review it
+
+Every procedure in a document rots silently, because reading one cannot tell a
+correct instruction from a stale one. The instances in this file include a
+README whose stated procedure produced zero and would have convinced a
+re-checker that the instrument could not fire.
+
+Reviewing prose catches wording. Only running it catches rot. So when a document
+states a command, run the command; when it states a count, reproduce the count.
+
+A shell block in this repo's docs can be lifted and executed directly:
+
+```
+python3 - "$DOC" <<'EOF'
+import re, subprocess, sys, textwrap
+src = open(sys.argv[1]).read()
+# INDENTED fences count. The first version of this script anchored the fence at
+# column 0 and silently skipped every block nested in a list, which is most of
+# them. See the note below.
+blocks = re.findall(r"^[ \t]*```[a-zA-Z]*\n(.*?)^[ \t]*```", src, re.S | re.M)
+print(f"fenced blocks: {len(blocks)}")
+ran = 0
+for i, b in enumerate(blocks, 1):
+    for line in (l.strip() for l in textwrap.dedent(b).splitlines()):
+        if not line.startswith(("git ", "pytest", "ruff ", "mypy ")):
+            continue
+        if "<" in line:   # illustrative: carries a <placeholder>, not runnable
+            print(f"block {i}: SKIP (placeholder)  {line}")
+            continue
+        r = subprocess.run(line, shell=True, capture_output=True, text=True)
+        ran += 1
+        print(f"block {i}: exit={r.returncode}  {line}")
+print(f"command lines executed: {ran}")
+EOF
+```
+
+**Print the denominator, and this script is why.** Its first version anchored
+the fence at the start of a line, so it matched exactly ONE block in this file:
+every other one is nested in a list item and therefore indented. It executed
+zero commands and reported no problems. A reader would have concluded the
+document was verified; what actually happened is that the instrument could not
+see what it was pointed at. That is this file's own subject, reproduced in the
+tool this file ships, within minutes of writing it. Hence the two counts in the
+output: **a run that executes zero commands is a broken verifier, not a clean
+document.**
+
+**Running it found a second defect in it**, which is the section's argument
+again: with the fence fixed it executed both lines of the `git diff` example and
+reported two failures, because those lines carry a `<head>` placeholder and were
+never runnable. A verifier whose only output on a healthy document is two false
+alarms gets ignored, and an ignored check is a decorative one. Hence the
+placeholder skip, and hence the SKIP lines in the output: what it declines to
+run is as much a part of the reading as what it ran.
+
+Two honest limits that remain, because a verifier overstating its reach is also
+this file's subject. It only runs lines it recognises as commands, so
+prose-with-numbers is untouched; and a non-zero exit is a prompt to look, not
+proof of rot. It catches the command that no longer parses or no longer exists,
+which is the failure mode that actually occurred.
