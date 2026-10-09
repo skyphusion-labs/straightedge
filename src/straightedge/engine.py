@@ -139,6 +139,36 @@ ORDERS_UNMEASURED = "orders_unmeasured"
 #: assuming UTC IS straightedge#172.
 VENUE_CLOCK_UNMEASURED = "venue_clock_unmeasured"
 
+#: The clock was measured and the venue's OWN BARS contradict it.
+#:
+#: A measured offset says what the server's wall clock reads now. The
+#: forming bar's open time is that same clock, from a different reply, and
+#: a server cannot be forming a bar that has not opened yet. So if the
+#: offset implies a server time EARLIER than the bar the venue just served,
+#: the tick stamp the offset came from was stale and the offset is wrong by
+#: that staleness.
+#:
+#: This is the check that closes the one hole `VenueClock.measure` cannot
+#: close on its own: a staleness that is an exact multiple of the offset
+#: grid lands on a grid point and looks perfect, and the civil timezone
+#: band does not see it either (11h is 44 whole grid steps). Measured
+#: through the real adapter during the straightedge#182 review: a stamp
+#: frozen 2h at Friday's close on a UTC+3 server read as UTC+01:00, 5h as
+#: UTC-02:00, 11h as UTC-08:00. Every one of those implies a server time
+#: hours before the bar in hand, so every one of them refuses here.
+#:
+#: It cannot produce a false refusal: a correct offset implies the server's
+#: real `now`, and the forming bar opened at or before that instant by
+#: definition. Both readings come from the same server clock, so our own
+#: clock cancels out of the comparison entirely.
+VENUE_CLOCK_BAR_DISAGREES = "venue_clock_bar_disagrees"
+
+#: Slack on that comparison, for the integer rounding of the paired sample
+#: only. It is NOT a staleness allowance: one second is below the grid by
+#: three orders of magnitude, so it can absorb a rounding edge and nothing
+#: else.
+VENUE_CLOCK_BAR_SLACK_SEC = 1
+
 
 class Engine:
     def __init__(
@@ -165,6 +195,23 @@ class Engine:
         self.strategy = TrendStrategy(cfg.strategy)
         self.now_fn = now_fn or (lambda: datetime.now(timezone.utc))
         self.last_bar_time: dict[str, int] = {}
+        #: When this symbol was last polled, on the MONOTONIC clock.
+        #:
+        #: This is the measured staleness bound for the venue clock, and it
+        #: is the whole reason a bar-derived instant can be trusted. A bar
+        #: advanced between the previous poll and this one, so a tick
+        #: arrived in that interval, so `TimeCurrent()` cannot be older
+        #: than the interval. Monotonic on purpose: a wall-clock step (NTP,
+        #: a DST-confused host) must not be able to widen a safety bound.
+        #:
+        #: It is MEASURED rather than derived from `poll_seconds`, because
+        #: this repo's own tick budget for a live MT4 config is 270s of
+        #: bounded part with an explicitly unbounded tail, and
+        #: `watchdog.py` publishes `tick_gap_max_s` precisely because that
+        #: budget can be exceeded. A number the codebase already
+        #: instruments because it can be false is not a bound
+        #: (straightedge#182 review).
+        self._last_poll_mono: dict[str, float] = {}
         self.halted = False
         #: The `day_key` the daily recap has already been emitted for.
         #:
@@ -967,6 +1014,9 @@ class Engine:
             return
         last_t = bars[-1].time
         prev = self.last_bar_time.get(symbol)
+        polled_at = time.monotonic()
+        since_last_poll = polled_at - self._last_poll_mono.get(symbol, polled_at)
+        self._last_poll_mono[symbol] = polled_at
         if prev is None:
             # First poll: pin the last bar so we do not dump-trade history.
             self.last_bar_time[symbol] = last_t
@@ -974,14 +1024,31 @@ class Engine:
         if last_t <= prev:
             return
         self.last_bar_time[symbol] = last_t
-        self._act(symbol, bars)
+        # The gate above is what makes the bound below true, and the two have
+        # to stay together: a bar advanced since the previous poll, so a tick
+        # arrived inside `since_last_poll`, so the venue's stamp is no older
+        # than that. Remove the advance gate and this bound becomes a guess.
+        self._act(symbol, bars, max_staleness_sec=since_last_poll)
 
     def replay_symbol(self, symbol: str, bars: list[Bar]) -> None:
+        """Act on bars handed in directly. The backtest and test seam.
+
+        `max_staleness_sec=None`, deliberately: there is no previous poll here
+        and no advance gate, so nothing on this path can bound how old a
+        sampled venue stamp is. A venue that SAMPLES a server therefore cannot
+        be measured through this entry point and the leg refuses by name,
+        which is the honest outcome; a venue that DECLARES its offset (paper,
+        and so every backtest) is unaffected. The straightedge#182 review
+        named this caller as the one that would otherwise inherit the engine's
+        bound without owning the gate that justifies it.
+        """
         if self.halted:
             return
-        self._act(symbol, bars)
+        self._act(symbol, bars, max_staleness_sec=None)
 
-    def _bar_instant(self, symbol: str, bars: list[Bar]) -> datetime | None:
+    def _bar_instant(
+        self, symbol: str, bars: list[Bar], max_staleness_sec: float | None
+    ) -> datetime | None:
         """The real UTC instant the auto leg is acting at, or None to refuse.
 
         THE one seam where a venue timestamp becomes a wall-clock instant.
@@ -1014,7 +1081,9 @@ class Engine:
         """
         if not bars:
             return self.now_fn()
-        clock = venue_clock_of(self.broker, symbol)
+        clock = venue_clock_of(
+            self.broker, symbol, max_staleness_sec=max_staleness_sec
+        )
         if not clock.measured:
             # journal.write, never _emit: a refusal is not broadcast to chat.
             # source and stage are what let one reject event name every path
@@ -1030,10 +1099,32 @@ class Engine:
                 detail=clock.detail,
             )
             return None
+        # The venue's own bars, checked against the venue's own clock. See
+        # VENUE_CLOCK_BAR_DISAGREES: this is what makes a stale stamp
+        # unreachable rather than merely unlikely, and it is the only check
+        # here that can see a staleness sitting exactly on the offset grid.
+        implied_server_now = (clock.measured_at or 0) + (clock.offset_sec or 0)
+        if clock.measured_at and (
+            implied_server_now + VENUE_CLOCK_BAR_SLACK_SEC < bars[-1].time
+        ):
+            self.journal.write(
+                "reject",
+                source="auto",
+                stage="signal",
+                symbol=symbol,
+                reason=VENUE_CLOCK_BAR_DISAGREES,
+                offset_sec=clock.offset_sec,
+                venue=clock.source,
+                bar_time=bars[-1].time,
+                implied_server_now=implied_server_now,
+            )
+            return None
         return clock.to_utc(bars[-1].time)
 
-    def _act(self, symbol: str, bars: list[Bar]) -> None:
-        now = self._bar_instant(symbol, bars)
+    def _act(
+        self, symbol: str, bars: list[Bar], *, max_staleness_sec: float | None
+    ) -> None:
+        now = self._bar_instant(symbol, bars, max_staleness_sec)
         if now is None:
             return
         acct = self.broker.account()

@@ -654,9 +654,9 @@ class TestDoctorGate:
             # Zero is this fake stamping UTC, which keeps THIS test's
             # subject unchanged; the clock's own suite is
             # tests/test_venue_clock.py.
-            def venue_clock(self, name):
-                del name
-                return VenueClock(offset_sec=0, source="fake")
+            def venue_clock(self, name, *, max_staleness_sec=None):
+                del name, max_staleness_sec
+                return VenueClock.declared(0, source="fake")
 
         monkeypatch.setattr("straightedge.broker.mt4_live.Mt4Broker", ColdEurusd)
         monkeypatch.setattr("straightedge.history.ATTEMPTS", 2)
@@ -723,9 +723,9 @@ class TestDoctorGate:
             # Zero is this fake stamping UTC, which keeps THIS test's
             # subject unchanged; the clock's own suite is
             # tests/test_venue_clock.py.
-            def venue_clock(self, name):
-                del name
-                return VenueClock(offset_sec=0, source="fake")
+            def venue_clock(self, name, *, max_staleness_sec=None):
+                del name, max_staleness_sec
+                return VenueClock.declared(0, source="fake")
 
         monkeypatch.setattr("straightedge.broker.mt4_live.Mt4Broker", Warm)
         rc = main(["--config", str(cfg_path), "doctor", "--connect"])

@@ -184,7 +184,7 @@ def test_a_daily_loss_halt_is_not_released_by_the_broker_midnight(
     clock[0] = THU_2230
     engine.replay_symbol("EURUSD", bars)
     assert engine.risk.halt_reason == "daily_loss", (
-        "the daily-loss halt was cleared while it is still 2026-01-04 in UTC, "
+        "the daily-loss halt was cleared while it is still 2024-01-04 in UTC, "
         "which is the unit the operator's config is written in"
     )
     engine.stop()

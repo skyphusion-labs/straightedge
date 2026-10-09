@@ -972,20 +972,27 @@ class Mt4Broker:
             volume=int(d.get("volume", 0) or 0),
         )
 
-    def venue_clock(self, name: str) -> VenueClock:
-        """Measure the server's UTC offset from the tick reply's own stamp.
+    def venue_clock(
+        self, name: str, *, max_staleness_sec: float | None
+    ) -> VenueClock:
+        """Read the server's own stamp, and measure the offset only if bounded.
 
         NO EXPERT CHANGE. `tick` has carried `time=TimeCurrent()` since the
-        first version of the ICD (docs/MT4.md, Ops), so this measurement needs
-        nothing recompiled and nothing reattached, which is what lets the
+        first version of the ICD (docs/MT4.md, Ops), so this needs nothing
+        recompiled and nothing reattached, which is what lets the
         straightedge#172 fix reach a live desk as a Python upgrade.
 
-        The desk's own clock is read on BOTH sides of the call and the
-        midpoint is paired with the server's stamp, so the round trip is
-        measured rather than assumed and `VenueClock.measure` can refuse a
-        sample it cannot place. An Expert too old to stamp its reply has `time`
-        absent, which `_reported_int` reports as None and this reports as NOT
-        MEASURED; it is never read as UTC.
+        `TimeCurrent()` is the time of the LAST TICK, not of now, so this
+        sample is `offset - staleness` and the two cannot be separated without
+        a bound on the second. `max_staleness_sec=None` means the caller has
+        no such bound, and then this venue reports the IMPLICATION and refuses
+        to call it a measurement: during the straightedge#182 review a stamp
+        frozen 2h at Friday's close on this UTC+3 server read as a confident
+        UTC+01:00, and at 11h as UTC-08:00.
+
+        The desk's own clock is read on BOTH sides of the call, so the round
+        trip is measured rather than assumed and counts toward the sample's
+        uncertainty.
         """
         before = self._now()
         d = self._require("tick", {"symbol": name.upper()})
@@ -998,10 +1005,15 @@ class Mt4Broker:
                 measured_at=int(after),
                 detail="the Expert does not stamp its tick reply with TimeCurrent()",
             )
+        if max_staleness_sec is None:
+            return VenueClock.implied(
+                server, (before + after) / 2.0, source=MT4_CLOCK_SOURCE
+            )
         return VenueClock.measure(
             server,
             (before + after) / 2.0,
             source=MT4_CLOCK_SOURCE,
+            max_staleness_sec=max_staleness_sec,
             round_trip_sec=max(0.0, after - before),
         )
 

@@ -418,19 +418,22 @@ class Mt5Broker:
             volume=int(d.get("volume", 0) or 0),
         )
 
-    def venue_clock(self, name: str) -> VenueClock:
-        """Measure the server's UTC offset from the tick's own stamp.
+    def venue_clock(
+        self, name: str, *, max_staleness_sec: float | None
+    ) -> VenueClock:
+        """Same reading and the same rule as MT4, because it is the same defect.
 
-        MT5 has the same server-time semantics as MT4 and the same absence of
-        any API that states the offset: `copy_rates_from_pos` returns bar
-        times on the TERMINAL's trade-server clock, and
-        `symbol_info_tick().time` is that same clock at the last tick. So this
-        adapter was affected by straightedge#172 identically and is fixed
-        identically, through the one seam the engine reads.
+        MT5 has the same server-time semantics and the same absence of any API
+        that states the offset: `copy_rates_from_pos` returns bar times on the
+        TERMINAL's trade-server clock, and `symbol_info_tick().time` is that
+        same clock at the last tick. So this adapter was affected by
+        straightedge#172 identically and is fixed identically, through the one
+        seam the engine reads.
 
-        `symbol_info_tick` returning None (symbol not selected, terminal gone)
-        is NOT MEASURED, which refuses; `_with_reconnect` has already had its
-        go at the IPC by then.
+        `max_staleness_sec=None` reports the implication and refuses to call it
+        a measurement; see `Mt4Broker.venue_clock`. `symbol_info_tick`
+        returning None is NOT MEASURED either way, and `_with_reconnect` has
+        already had its go at the IPC by then.
         """
         before = self._now()
         t = self._with_reconnect(
@@ -447,10 +450,15 @@ class Mt5Broker:
                 measured_at=int(after),
                 detail=f"symbol_info_tick({name}) carried no server time",
             )
+        if max_staleness_sec is None:
+            return VenueClock.implied(
+                server, (before + after) / 2.0, source=MT5_CLOCK_SOURCE
+            )
         return VenueClock.measure(
             server,
             (before + after) / 2.0,
             source=MT5_CLOCK_SOURCE,
+            max_staleness_sec=max_staleness_sec,
             round_trip_sec=max(0.0, after - before),
         )
 

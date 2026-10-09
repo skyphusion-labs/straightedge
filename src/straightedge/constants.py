@@ -358,26 +358,30 @@ MAILBOX_SEND_OPS = frozenset(
 
 # --- venue clock measurement (straightedge#172) -----------------------------
 
-#: Real broker server offsets from UTC sit on a QUARTER HOUR grid. A measured
-#: sample is snapped to this grid, and a sample that does not land on one is
-#: not a measurement at all.
+#: Real broker server offsets from UTC sit on a QUARTER HOUR grid, so a sample
+#: is read as the grid point it is nearest to.
+#:
+#: This grid is what turns a bounded uncertainty into a measurement: two grid
+#: points are 900s apart, so a sample whose total uncertainty `u` satisfies
+#: `2u < 900` can be consistent with exactly ONE of them, and a sample with a
+#: wider uncertainty is consistent with several and is therefore not a
+#: measurement of anything.
+#:
+#: That rule replaced a chosen tolerance constant (the straightedge#182
+#: review). A fixed 180s was a number nobody derived, in a repo whose
+#: `watchdog.py` states in as many words that a threshold is derived and never
+#: chosen. The uncertainty now comes from the CALLER, which is the only party
+#: that can measure it, and this grid is the only constant left.
 VENUE_CLOCK_GRID_SEC = 900
-#: How far off a grid point a sample may land and still be the measurement.
-#:
-#: The sample is paired with the venue's own `TimeCurrent()` / tick time, which
-#: is the time of the LAST TICK rather than of now, so the raw difference is
-#: the offset minus however stale that tick is. Inside a trading session that
-#: staleness is seconds; over a market close the venue clock FREEZES and the
-#: raw difference grows without bound, which is exactly the case that must not
-#: be rounded to a plausible answer.
-#:
-#: Twice this is 360s, well inside `VENUE_CLOCK_GRID_SEC`, so no sample can be
-#: within tolerance of two grid points and the snap is unambiguous.
-VENUE_CLOCK_TOLERANCE_SEC = 180
 #: The band a REAL venue offset can sit in: the civil timezone range, UTC-12
 #: to UTC+14. A snapped sample outside it is not a timezone, it is a frozen or
-#: wildly stale venue clock, and the weekend case lands here: a server clock
-#: that stopped at Friday's close is tens of hours out by Saturday, which is a
-#: round number of grid steps and would otherwise pass the grid check cleanly.
+#: wildly stale venue clock.
+#:
+#: It is NOT a freshness check and must never be read as one. Measured through
+#: the real adapter during the straightedge#182 review, with `TimeCurrent()`
+#: frozen at Friday's close on a genuinely UTC+3 server: 2h stale read
+#: UTC+01:00, 5h read UTC-02:00, 11h read UTC-08:00, and nothing was rejected
+#: until past 15h. The band catches an absurd clock. Only a BOUNDED sample
+#: makes a measurement.
 VENUE_CLOCK_MIN_OFFSET_SEC = -12 * 3600
 VENUE_CLOCK_MAX_OFFSET_SEC = 14 * 3600

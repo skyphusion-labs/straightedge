@@ -64,16 +64,43 @@ sends, pairing it with the desk's own clock read either side of the round trip.
 The fix reaches the live desk as a Python upgrade. An Expert that does not send
 `time` reads as NOT MEASURED and refuses, never as UTC.
 
-**The measurement refuses three ways, and the third was found by running it.**
-`TimeCurrent()` is the time of the LAST TICK, not of now, so a sample is snapped
-to a quarter-hour grid and accepted only within 180s of a grid point; a sample
-whose round trip is too wide to pair is rejected as a PAIRING failure. Neither
-check can see a market close: a venue clock frozen at Friday's close is tens of
-hours out by Saturday, and tens of hours is a whole number of grid steps, so it
-lands exactly on a grid point and reads as a measurement. A two-day-stale sample
-returning `offset_sec=-172800` with an empty `unmeasured` is what added the
-third check, the civil timezone band. What the instrument still cannot see is
-stated in `VenueClock.measure` rather than implied.
+**The staleness bound is an ARGUMENT with no default, and that is the whole
+safety property.** `TimeCurrent()` is the time of the LAST TICK, not of now, so
+a sample reads `offset - staleness` and the two cannot be separated without a
+bound on the second. The bound is therefore supplied by the caller and REQUIRED:
+`Engine.step_symbol` measures it as the elapsed time since its own previous poll
+of that symbol, which is sound because a bar advanced between those two polls,
+so a tick arrived inside that interval, so the stamp cannot be older than it.
+`replay_symbol` and `doctor` own no such gate, pass `None`, and are therefore
+structurally unable to obtain a measurement from a venue that samples a server.
+
+It is not derived from a config value, and that is deliberate: this repo's own
+tick budget for a live MT4 config is 270s of bounded part with an explicitly
+unbounded tail, and `watchdog.py` publishes `tick_gap_max_s` precisely because
+that budget can be exceeded. A number the codebase already instruments because
+it can be false is not a bound.
+
+A sample is read as the nearest quarter-hour grid point only when twice its
+uncertainty (the bound plus the measured round trip) stays under one grid step,
+because otherwise more than one offset fits it. A chosen 180s tolerance in the
+first version of this change is gone: it was a number nobody derived, in a repo
+whose `watchdog.py` says in as many words that a threshold is derived and never
+chosen.
+
+**The one case the grid cannot see is closed by a second reading.** A stamp
+stale by an exact multiple of 900s lands on a grid point and looks perfect, and
+the civil timezone band does not see it either (11h is 44 whole grid steps).
+`VenueClock.measure` says so, and the limit of the type is pinned by a test. The
+ENGINE then catches it with a reading the type does not have:
+`Engine._bar_instant` compares the measured offset against the venue's own
+forming bar and refuses with `venue_clock_bar_disagrees`, because a server
+cannot be forming a bar its own clock says has not opened yet. The review's
+whole frozen-Friday sweep (2h, 5h, 11h, 15h) is driven through the engine and
+refuses there; both readings come from the same server clock, so our clock
+cancels out and a correct offset cannot be refused by it. A positive control
+pins that: it caught a fixture of this change's own, which had seeded a bar an
+hour ahead of the venue's clock and was therefore observing its own refusal
+rather than the defect's.
 
 **`day_key` is the UTC day, decided and written down** (`docs/CONTRACT.md`, "One
 clock"). It was accidentally both before, which is the actual defect. The
@@ -89,14 +116,39 @@ Verified by reading the adapter and by a unit test against a fake binding; NOT
 verified against a live MT5 terminal, which this repo has never claimed for the
 MT5 path.
 
-**What an operator sees.** `doctor --connect` prints
-`venue clock: server UTC+03:00 measured (...)` and exits non-zero when it is NOT
-MEASURED, because an auto leg that cannot measure when it is refuses every
-signal, and that belongs before a run rather than during one. The auto refusal
-is journaled as `reject` with `reason=venue_clock_unmeasured` plus the
-`unmeasured` field and a `detail`; `docs/RUNBOOK.md` says what to do about it.
-Manual `/buy` and `/sell` are unaffected throughout: they time themselves off
-the bot's clock and never off a bar.
+**Breaking for a third-party venue adapter.** `Broker` gains
+`venue_clock(name, *, max_staleness_sec)`. An adapter that does not implement it
+reads as NOT MEASURED, which refuses rather than trading on a guessed clock, so
+an out-of-tree adapter keeps working for every manual command and stops the auto
+leg until it answers. Paper, MT4 and MT5 in this repo implement it.
+
+**What an operator sees, and what `doctor` deliberately does NOT claim.**
+`doctor` has no previous poll and no bar advance, so it cannot bound staleness
+and never prints a measurement for a venue that samples a server. It prints the
+two facts separately:
+
+```
+venue clock: stamp implies UTC+03:00, freshness NOT established (...)
+```
+
+and exits ZERO on that, because it is the normal state of a closed market and
+an operator who sees a red `doctor` every weekend learns to ignore `doctor`. It
+exits non-zero only when the clock cannot be READ at all (no stamp, or a venue
+that cannot answer), and, from config alone with no terminal involved, when
+`engine.poll_seconds` is too slow for any sample to be bounded.
+
+The first version of this gate printed `server UTC+03:00 measured` and was
+wrong about it: the straightedge#182 review froze `TimeCurrent()` at Friday's
+close on a genuinely UTC+3 server and the gate reported `UTC+01:00 measured` at
+2h stale, `UTC-02:00` at 5h and `UTC-08:00` at 11h, each with exit 0, to a
+human deciding whether to start a live loop. The civil band rejected nothing
+until past 15h. That whole sweep is now a test.
+
+The auto refusal is journaled as `reject` with
+`reason=venue_clock_unmeasured` plus the `unmeasured` field and a `detail`;
+`docs/RUNBOOK.md` says what to do about it. Manual `/buy` and `/sell` are
+unaffected throughout: they time themselves off the bot's clock and never off a
+bar.
 
 **The test had to go red first, and 1222 green tests could not see this.** Every
 existing fixture seeds bars whose timestamps ARE UTC, so the suite agreed with

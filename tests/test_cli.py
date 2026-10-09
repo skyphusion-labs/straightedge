@@ -73,9 +73,9 @@ class _FakeConnectBroker:
     # Zero is this fake stamping UTC, which keeps THIS test's
     # subject unchanged; the clock's own suite is
     # tests/test_venue_clock.py.
-    def venue_clock(self, name):
-        del name
-        return VenueClock(offset_sec=0, source="fake")
+    def venue_clock(self, name, *, max_staleness_sec=None):
+        del name, max_staleness_sec
+        return VenueClock.declared(0, source="fake")
 
 
 def test_doctor(capsys, monkeypatch) -> None:
@@ -142,9 +142,9 @@ def test_doctor_connect_mt4(capsys, monkeypatch, tmp_path) -> None:
         # Zero is this fake stamping UTC, which keeps THIS test's
         # subject unchanged; the clock's own suite is
         # tests/test_venue_clock.py.
-        def venue_clock(self, name):
-            del name
-            return VenueClock(offset_sec=0, source="fake")
+        def venue_clock(self, name, *, max_staleness_sec=None):
+            del name, max_staleness_sec
+            return VenueClock.declared(0, source="fake")
 
     monkeypatch.setattr("straightedge.broker.mt4_live.Mt4Broker", FakeMt4Broker)
     assert main(["doctor", "--connect"]) == 0
@@ -310,9 +310,9 @@ def test_doctor_connect_falls_back_to_connect(capsys, monkeypatch) -> None:
         # Zero is this fake stamping UTC, which keeps THIS test's
         # subject unchanged; the clock's own suite is
         # tests/test_venue_clock.py.
-        def venue_clock(self, name):
-            del name
-            return VenueClock(offset_sec=0, source="fake")
+        def venue_clock(self, name, *, max_staleness_sec=None):
+            del name, max_staleness_sec
+            return VenueClock.declared(0, source="fake")
 
     monkeypatch.setattr("straightedge.broker.mt5_live.load_mt5_module", lambda: object())
     monkeypatch.setattr("straightedge.broker.mt5_live.Mt5Broker", NoEnsure)
@@ -361,9 +361,9 @@ def test_doctor_connect_disconnect_error_still_ok(capsys, monkeypatch) -> None:
         # Zero is this fake stamping UTC, which keeps THIS test's
         # subject unchanged; the clock's own suite is
         # tests/test_venue_clock.py.
-        def venue_clock(self, name):
-            del name
-            return VenueClock(offset_sec=0, source="fake")
+        def venue_clock(self, name, *, max_staleness_sec=None):
+            del name, max_staleness_sec
+            return VenueClock.declared(0, source="fake")
 
         def disconnect(self) -> None:
             raise RuntimeError("shutdown")

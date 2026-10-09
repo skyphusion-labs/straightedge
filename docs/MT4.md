@@ -258,11 +258,21 @@ a Python upgrade. An Expert that does not send `time` reads as NOT MEASURED
 and the auto leg refuses, exactly as an absent `ladder_ms` is reported
 rather than assumed.
 
-`TimeCurrent()` is the time of the LAST TICK, so a sample is accepted only
-when it lands on the quarter-hour grid within tolerance AND inside the civil
-timezone band. Over a market close the server clock freezes and the sample
-is refused rather than rounded; the auto leg does not run then anyway,
-because no new bar has arrived.
+`TimeCurrent()` is the time of the LAST TICK and NOT of now, so the sample
+reads `offset - staleness` and the two cannot be separated without a bound on
+the staleness. The caller supplies that bound and it is required:
+`Engine.step_symbol` measures it as the time since its own previous poll of
+that symbol, which holds because a bar advanced in between, so a tick arrived
+in between. A caller with no such gate passes `None` and gets an IMPLICATION
+that refuses every conversion, which is what `doctor` does.
+
+Over a market close the server clock freezes, and the civil timezone band is
+NOT what saves you there: measured during the straightedge#182 review on a
+UTC+3 server, a stamp frozen 2h at Friday's close read as a confident UTC+1
+and at 11h as UTC-8, both inside the band. What makes the auto leg safe is
+that no new bar arrives on a closed market, so it never asks, and that its
+bound is measured when it does. See `VenueClock.measure` for what no check
+here can detect.
 
 `ping` also declares the Expert to the desk:
 

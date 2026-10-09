@@ -118,9 +118,41 @@ A venue with no `venue_clock` method at all reads as UNMEASURED, not as UTC
 (`venue_clock_of` in `broker/base.py`). The Protocol declares the method, so a
 real adapter that omits it is a typecheck failure as well.
 
-`doctor --connect` prints the measured offset and exits non-zero when it is not
-measured, because an auto leg that cannot measure when it is refuses every
-signal, and that is a condition to catch before a run rather than during one.
+**The staleness bound is the caller's, and it is required.** The venue stamp
+is the LAST TICK (`TimeCurrent()`, `symbol_info_tick().time`), so a sample reads
+`offset - staleness` and nothing can separate the two without a bound on the
+second. `venue_clock(name, *, max_staleness_sec)` therefore has no default, and
+`None` is a real value meaning "this caller cannot bound it":
+
+| caller | bound | what it can get |
+| --- | --- | --- |
+| `Engine.step_symbol` | MEASURED: elapsed time since its own previous poll of that symbol | a measurement, because a bar advanced inside that interval, so a tick arrived inside it |
+| `Engine.replay_symbol` | `None`: no previous poll, no advance gate | an implication from a sampling venue, which refuses; a DECLARED clock (paper, every backtest) is unaffected |
+| `doctor` | `None`: same | the same implication, printed as an implication |
+
+The bound is never derived from a config value. This repo's own tick budget for
+a live MT4 config is 270s of bounded part with an explicitly unbounded tail, and
+`watchdog.py` publishes `tick_gap_max_s` because that budget can be exceeded: a
+number the codebase already instruments because it can be false is not a bound.
+
+A sample is read as the nearest quarter-hour grid point only while twice its
+uncertainty (bound plus measured round trip) stays under one grid step.
+`VenueClock.measure` states what IT cannot detect: a staleness that is an
+exact multiple of the grid lands on a grid point and the civil band does not see
+it either.
+
+**The engine closes that with a second reading, not with an argument.**
+`Engine._bar_instant` compares the measured offset against the venue's OWN
+forming bar: a server cannot be forming a bar that its own clock says has not
+opened yet, so an offset implying a server time earlier than the bar in hand
+came from a stale stamp. It refuses with `venue_clock_bar_disagrees`, naming the
+offset, the bar time and the implied server instant. Both readings come from the
+same server clock, so our clock cancels out and a correct offset cannot be
+refused by it.
+
+`doctor --connect` prints what the stamp IMPLIES plus the fact that freshness is
+not established, and exits non-zero only when the clock cannot be read at all.
+It cannot print a measurement for a sampling venue, by construction.
 
 ## Two optional things a venue may declare about history
 

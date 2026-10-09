@@ -186,14 +186,23 @@ class PaperBroker:
         t = bar.time if bar else self._clock
         return Tick(time=t, bid=mid - half, ask=mid + half, last=mid)
 
-    def venue_clock(self, name: str) -> VenueClock:
-        """What this simulated venue stamps its bars with. See `utc_offset_sec`."""
-        del name
-        return VenueClock(
-            offset_sec=self.utc_offset_sec,
-            measured_at=self._clock,
-            source="paper",
-        )
+    def venue_clock(
+        self, name: str, *, max_staleness_sec: float | None = None
+    ) -> VenueClock:
+        """What this simulated venue stamps its bars with.
+
+        DECLARED, not sampled, so the staleness bound is accepted and
+        ignored: there is no server here whose last tick could be old. The
+        bars carry whatever the simulator or `run_backtest` stamped them
+        with, which is this offset by construction. See `utc_offset_sec`.
+        """
+        del name, max_staleness_sec
+        # `measured_at` is left at zero, which the field documents as "answered
+        # from its own construction rather than from a reading". It matters:
+        # `Engine._bar_instant` cross-checks a SAMPLED offset against the
+        # venue's own forming bar, and a declared clock has no sample to check,
+        # so it must not present a bar time as the instant a sample was paired.
+        return VenueClock.declared(self.utc_offset_sec, source="paper")
 
     def rates(self, name: str, timeframe: str | int, count: int) -> list[Bar]:
         del timeframe
