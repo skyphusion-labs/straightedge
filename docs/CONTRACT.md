@@ -206,6 +206,18 @@ symbol, and since the desk gates a model-chosen symbol on `advice.symbols`, `EUR
 gate loudly while `EURUSD` passes it. Repairing it would turn a named `symbol_not_allowed` refusal
 into a staged order on an instrument the model never named, so a braced symbol forces the hold and
 is reported as `null`.
+
+**A model-chosen symbol is checked BEFORE it is transformed, and a non-ASCII one is refused.** Same
+rule as the brace, one character further: `"EURU\u017fD".upper()` is `"EURUSD"`, because Unicode
+uppercasing maps U+017F LATIN SMALL LETTER LONG S onto ASCII `S`, so uppercasing a model-chosen name
+can MANUFACTURE a tradeable instrument the model never named. The ligatures `ff`, `fi`, `st`, the
+dotless `i` and `ss` (which expands to `SS`) do the same. So the name must already be ASCII:
+`advice_allows` refuses anything else, `parse_advice` leaves it exactly as sent rather than
+uppercasing it, the structured path reports `symbol ... is not ASCII` as a violation and holds, and
+the refusal NAMES the string the model sent rather than the one it uppercases to. `eurusd` still
+works, because an ASCII case fold is the same instrument. The operator's own whitelist is held to
+the same rule: a non-ASCII entry matches nothing rather than widening the list to a symbol nobody
+typed (straightedge#197).
 Default send is `/confirm`. `/approve always` sends after risk preview.
 `/approve always` is available in paper and demo without a live fuse.
 On `trade_mode=2`, arm live first (`--i-accept-risk` or `/live on I-ACCEPT-RISK`).

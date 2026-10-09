@@ -1,7 +1,7 @@
 from dataclasses import replace
 from datetime import datetime, timezone
 
-from straightedge.broker.paper import PaperBroker
+from straightedge.broker.paper import PaperBroker, default_spec
 from straightedge.config import BotConfig
 from straightedge.engine import Engine
 from straightedge.models import Bar
@@ -653,3 +653,118 @@ def test_replace_pending_refuses_an_unmeasured_spec(tmp_path) -> None:
     assert "refused: spec_not_measured" in reply, reply
     assert "point" in reply and "tick_size" in reply, reply
     engine.stop()
+
+
+def _rest_then_strip_the_stop(engine):
+    """A resting order with `sl = 0`, which our OWN commands cannot produce.
+
+    That is the reachability finding, not a shortcut. Measured on main:
+
+    * `risk.py`'s `sl_required` refuses to STAGE one (`signal.sl <= 0`).
+    * `_modify_pending` refuses to MODIFY one to zero (`sl required`).
+
+    So the state only arrives from the venue side, and both live adapters pass
+    it straight through: `mt4_live._ord` and `mt5_live.orders` each build
+    `sl=float(d.get("sl", 0) or 0)` with no filter and no coercion. An order
+    carrying our magic that we did not stage, or an operator removing the stop
+    at the terminal, therefore reaches `replace_pending` as `order.sl == 0.0`.
+    The fixture injects what only the venue can.
+    """
+    tick = engine.broker.tick("EURUSD")
+    spec = engine.broker.symbol("EURUSD")
+    limit = spec.normalize_price(tick.ask - 0.002)
+    sl = spec.normalize_price(limit - 0.005)
+    tp = spec.normalize_price(limit + 0.010)
+    engine.handle_command(TgCommand("1", 1, f"/buy EURUSD limit={limit} sl={sl} tp={tp}", 1))
+    engine.handle_command(TgCommand("1", 1, "/confirm", 2))
+    order = engine.broker.orders()[0]
+    # `PendingOrder` is frozen, so the venue-side state is injected by replacing
+    # the stored object rather than mutating the one handed out.
+    engine.broker._orders[order.ticket] = replace(order, sl=0.0)
+    order = engine.broker.orders()[0]
+    assert order.sl == 0.0
+    return order, spec, limit
+
+
+def test_our_own_commands_cannot_rest_an_order_without_a_stop(tmp_path) -> None:
+    """The first half of #187's reachability question, so the answer is measured.
+
+    If the desk could stage or modify one of these, the defect would be ours
+    rather than the venue's, and the priority would be different.
+    """
+    engine = _engine(tmp_path)
+    engine.start()
+    tick = engine.broker.tick("EURUSD")
+    spec = engine.broker.symbol("EURUSD")
+    limit = spec.normalize_price(tick.ask - 0.002)
+
+    staged = engine.handle_command(
+        TgCommand("1", 1, f"/buy EURUSD limit={limit} sl=0 tp={limit + 0.01}", 1)
+    )
+    assert "refused" in staged or "needs sl" in staged, staged
+
+    order, _spec, _limit = _rest_then_strip_the_stop(engine)
+    restored = engine._modify_pending(order, sl=0.0, tp=order.tp, price=order.price)
+    assert not restored.ok
+    assert "sl required" in restored.comment, restored.comment
+    engine.stop()
+
+
+def test_replace_on_an_unstopped_order_refuses_by_name(tmp_path) -> None:
+    """#187. A missing stop is NOT a very large number.
+
+    `money_per_lot_at_stop` computed `ticks_between(price, 0, spec)`, which is
+    `price / tick_size` and astronomically large, and then arithmetic proceeded
+    on it as though it were a measurement. `Position.risk_distance` already
+    treats `sl <= 0` as not-measurable, so two functions disagreed about what a
+    missing stop MEANS. That is the #161 and #172 family: a degenerate input
+    producing a confident number instead of a refusal.
+
+    Before the fix, moving the entry DOWN made `worst < worst_resting`, so
+    #184's reduction carve-out was entered and THE CAP WAS NEVER CONSULTED;
+    moving it UP refused with `size_exceeds_risk`, which blames the size for a
+    missing stop. Neither sent an order, because `_modify_pending` refuses
+    `sl <= 0` on the way out, so this is a defect in what the desk SAYS rather
+    than in what it does. The operator is told the wrong thing about their own
+    book, which is the whole reason the refusal vocabulary exists.
+    """
+    engine = _engine(tmp_path)
+    engine.start()
+    order, spec, limit = _rest_then_strip_the_stop(engine)
+
+    for label, px in (
+        ("entry down", spec.normalize_price(limit - 0.001)),
+        ("entry up", spec.normalize_price(limit + 0.001)),
+    ):
+        reply = engine.handle_command(TgCommand("1", 1, f"/replace {order.ticket} {px}", 3))
+        assert "refused: sl_required" in reply, f"{label}: {reply}"
+        assert "size_exceeds_risk" not in reply, (
+            f"{label}: a missing stop is not a size problem"
+        )
+    assert engine.broker.orders()[0].price == order.price, "the order must not move"
+    engine.stop()
+
+
+def test_money_per_lot_at_stop_refuses_a_missing_stop() -> None:
+    """The fix lives in the shared function, not at the call site (#187).
+
+    A third opinion about what a missing stop means is how this family spreads:
+    the next caller inherits whichever of the three it happens to reach. So the
+    disagreement is resolved where the number is produced.
+
+    It RAISES rather than returning 0.0, and the difference matters: a 0.0 would
+    make `worst` zero and pass every cap trivially, which is exactly the #161
+    fail-open this repo has already paid for once. The two functions agree that
+    a missing stop is not a measurement; they differ in mechanism because only
+    one of them has a safe sentinel available.
+    """
+    from straightedge.sizing import MissingStop, money_per_lot_at_stop
+
+    spec = default_spec("EURUSD")
+    assert money_per_lot_at_stop(1.1000, 1.0950, spec) > 0
+    for bad in (0.0, -1.0):
+        try:
+            money_per_lot_at_stop(1.1000, bad, spec)
+        except MissingStop:
+            continue
+        raise AssertionError(f"sl={bad} produced a number instead of refusing")
