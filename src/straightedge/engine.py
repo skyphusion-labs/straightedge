@@ -232,10 +232,20 @@ class Engine:
         #: (straightedge#182 review).
         self._last_poll_mono: dict[str, float] = {}
         #: The venue clock state this process has already RECORDED, as the
-        #: comparable part of it (offset, unmeasured fields, source). Set to
-        #: a sentinel rather than to None so the first reading is always a
-        #: change: `None` is a legitimate `offset_sec`, so an empty marker
-        #: that happened to match it would swallow the opening record.
+        #: comparable part of it (offset, unmeasured fields, source). A
+        #: sentinel rather than None, so the first reading is always a change.
+        #:
+        #: IT GUARDS A FUTURE SHAPE, NOT A PRESENT COLLISION, and the
+        #: distinction is the point: a comment asserting a hazard the code
+        #: cannot reach is what `docs/TESTING.md` just shipped a section about.
+        #: Today the state tuple has three elements and this has one, so
+        #: equality is impossible by arity alone, and
+        #: `VenueClock.__post_init__` refuses `offset_sec=None` beside an empty
+        #: `unmeasured` while `not_measured` always names a field and
+        #: `declared` always sets an offset, so no constructor can build the
+        #: colliding state either. A new constructor, or a narrower state
+        #: tuple, could: `None` is a legitimate `offset_sec` and an empty
+        #: marker matching it would swallow the opening record.
         #:
         #: In memory on purpose (straightedge#186). A restart re-records at
         #: `start()`, which is the boundary an operator reads anyway, so a
