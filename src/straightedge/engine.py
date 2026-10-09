@@ -29,7 +29,15 @@ from straightedge.models import (
     SignalKind,
     WorkingOrder,
 )
-from straightedge.risk import RiskDecision, RiskManager, day_key
+from straightedge.risk import (
+    SYMBOL_FX,
+    RiskDecision,
+    RiskManager,
+    UnclassifiedSymbol,
+    classify_symbol,
+    currency_exposure,
+    day_key,
+)
 from straightedge.sizing import money_per_lot_at_stop, normalize_volume
 from straightedge.state import snapshot_path_for
 from straightedge.strategy import TrendStrategy
@@ -664,8 +672,8 @@ class Engine:
         # the loss-room term here is what makes a spent daily budget refuse a
         # widening by arithmetic alone rather than by a second circuit check: once
         # the budget is gone `loss_room` is negative, so no wider stop fits.
-        # (`replace_pending` uses only the per-trade half; that gap is filed
-        # separately and is not widened by matching the stricter form here.)
+        # (`replace_pending` measures a working-order replacement against this
+        # same pair as of #104; all three paths now agree.)
         if worst > min(per_trade, self.risk.loss_room(account)) + 1e-6:
             return STOP_EXCEEDS_RISK
         return ""
@@ -1595,8 +1603,24 @@ class Engine:
         if order.side.value == "sell" and not (sl > px and (tp <= 0 or tp < px)):
             return "sell needs tp < entry < sl"
         worst = money_per_lot_at_stop(px, sl, spec) * order.volume
-        cap = self.broker.account().equity * self.cfg.risk.risk_pct * self.cfg.risk.max_risk_multiple
-        if worst > cap + 1e-6:
+        account = self.broker.account()
+        r = self.cfg.risk
+        per_trade = account.equity * r.risk_pct * r.max_risk_multiple
+        # The same pair `risk.evaluate` measures a NEW order against, and the
+        # same pair `_stop_guard` measures a widening against. A WORKING ORDER
+        # IS COMMITTED EXPOSURE: it rests at the broker and becomes a position
+        # without anyone being asked again, so a replacement has to fit in what
+        # the day has LEFT, not merely in the per-trade cap.
+        #
+        # The window this closes is not "the budget is spent": `circuit` trips
+        # `daily_loss` on the same comparison `loss_room` rearranges, so room
+        # hits zero exactly when the circuit trips and the `circuit_reason`
+        # check above already refuses there. It is the band where room is
+        # POSITIVE but TIGHTER than the per-trade cap, which no gate here read.
+        #
+        # `loss_room` wants a current snapshot; `circuit_reason` above ran
+        # `observe`, so it has one.
+        if worst > min(per_trade, self.risk.loss_room(account)) + 1e-6:
             return "refused: size_exceeds_risk"
         result = self._modify_pending(order, sl=sl, tp=tp, price=px)
         if not result.ok:
@@ -1701,8 +1725,15 @@ class Engine:
         return (
             f"risk_pct={r.risk_pct:.2%}  "
             f"committed={total}/{r.max_positions}{breakdown}\n"
-            f"daily_loss={daily_loss:.2f}/{daily_cap:.2f}  "
-            f"drawdown={dd:.2f}/{dd_cap:.2f}\n"
+            # ROOM, not just used/cap. `llm.SYSTEM` tells the model it has
+            # "daily_loss room" and "drawdown room"; this line gave it two
+            # numbers to subtract instead, which is the same arithmetic-by-eye
+            # that `exposure_text` exists to stop. Reporting only: no gate
+            # reads this text.
+            f"daily_loss={daily_loss:.2f}/{daily_cap:.2f} "
+            f"room={max(daily_cap - daily_loss, 0.0):.2f}  "
+            f"drawdown={dd:.2f}/{dd_cap:.2f} "
+            f"room={max(dd_cap - dd, 0.0):.2f}\n"
             f"equity={acct.equity:.2f} peak={snap.peak_equity:.2f} "
             f"day_start={snap.day_start_equity:.2f}"
             + (
@@ -1746,12 +1777,74 @@ class Engine:
     def advice_history(self, n: int = 40) -> list[dict[str, Any]]:
         return self.journal.tail(n)
 
+    def exposure_text(self) -> str:
+        """Net currency exposure per code, the configured cap, and the room left.
+
+        READ-ONLY. It calls the SAME function the gate calls
+        (`risk.currency_exposure`) over the SAME committed set
+        `RiskManager.evaluate` builds: our open positions plus our working
+        orders, FX-classified only. Nothing here decides anything.
+
+        It is deliberately not a second calculation. `llm.SYSTEM` asks the
+        model to cover allocation, correlation and unused risk room, and the
+        snapshot used to hand it raw positions only, so it had to net the book
+        by eye. A separate aggregation written for the report would answer that
+        and could then disagree with the gate that refuses the trade, which is
+        the version-skew defect recorded in #142.
+
+        `room` is how many further commitments that currency can absorb in the
+        same direction before `evaluate` refuses with `currency_exposure`. The
+        gate refuses at `abs(net) > cap`, so the room is `cap - abs(net)`, and
+        `tests/test_advice_exposure.py` asserts that against the desk's actual
+        refusal rather than against the string.
+        """
+        r = self.cfg.risk
+        cap = r.max_currency_exposure
+        held = self.broker.positions(magic=r.magic)
+        working, measured = self._read_working(r.magic)
+        committed: list[Position | PendingOrder] = [*held, *working]
+        fx = [x for x in committed if classify_symbol(x.symbol) == SYMBOL_FX]
+        excluded = sorted(
+            {x.symbol for x in committed if classify_symbol(x.symbol) != SYMBOL_FX}
+        )
+        head = f"currency_exposure cap={cap}"
+        if not measured:
+            # A resting order is committed exposure, so a total computed
+            # without the working orders UNDERSTATES the book. Understating
+            # exposure to a model asked about unused room is the dangerous
+            # direction to be wrong in, so it is declared rather than printed
+            # as a confident number (same obligation as `risk_text`'s `held+?`).
+            head += " INCOMPLETE: working orders unreadable"
+        try:
+            exposure = currency_exposure(fx)
+        except UnclassifiedSymbol as exc:
+            # TRIPWIRE, same as the gate's: `fx` is pre-filtered by
+            # `classify_symbol`, so no broker symbol reaches this. Reported
+            # loudly instead of raising, because a reporting path must not take
+            # /ask down, and instead of being swallowed, because a silently
+            # dropped leg is the issue #10 defect.
+            return f"{head}\ncurrency_exposure=unmeasured symbol={exc}"
+        lines = [head]
+        for code in sorted(exposure):
+            net = exposure[code]
+            lines.append(f"{code} net={net:+d} room={max(cap - abs(net), 0)}")
+        if len(lines) == 1:
+            lines.append("no currency commitments")
+        if excluded:
+            # Not applicable is never silence (issue #10). These symbols
+            # contribute nothing to the aggregate, which is correct rather than
+            # an underestimate, but the model has to be told the number covers
+            # less of the book than the position list does.
+            lines.append("excluded_from_currency_limit=" + ",".join(excluded))
+        return "\n".join(lines)
+
     def advice_context(self) -> str:
         lines = [
             self.status_text(),
             self.risk_text(),
             self.positions_text(),
             self.orders_text(),
+            self.exposure_text(),
             f"symbols={','.join(self.cfg.symbols)} risk_pct={self.cfg.risk.risk_pct}",
             f"auto={self.cfg.strategy.auto} trail={self.cfg.strategy.trail} "
             f"provider={self.cfg.advice.provider}",

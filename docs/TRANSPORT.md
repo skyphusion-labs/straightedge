@@ -250,14 +250,28 @@ one response. `BridgeTimeout` now carries both as attributes,
 `cause_transport` and `cause_phase`, and `docs/MT4.md` ("A timeout says WHICH
 transport and WHERE on it") is where an operator reads what to do about each.
 
-**One thing this still cannot tell you, and it is named rather than papered
-over.** On a `504` the shim's own `FileBridge` HAS withdrawn the request and
-knows the answer (`withdrawn`, `claimed` or `locked`), but that answer goes only
-to the shim's local log: the refusal body carries `ok=0` and a reason, and no
-`withdrawal`. `HttpBridge._from_status` therefore reports `claimed`, which is the
-unsafe reading, on purpose, because not knowing must never render as a clean bill
-of health. Putting the real answer on the wire is a change to the shim's refusal
-body and is tracked separately; it is not folded into #127.
+**The far end's withdrawal crosses the wire (#135).** On a `504` the shim's own
+`FileBridge` has withdrawn the request and knows the answer, and it now SAYS so:
+the refusal body carries one more `key=value` line, `withdrawal=withdrawn` /
+`claimed` / `locked`, and `HttpBridge._from_status` reads it. Before this the
+fact reached the shim's local log and stopped there, so the desk hardcoded
+`claimed` and every provably-withdrawn send off-box was reconciled by hand for an
+outcome the shim had one process away.
+
+Three properties hold it honest, and each is pinned by a test that was watched
+going red:
+
+- **Absent or unrecognised falls back to `claimed`, always.** An old shim sends
+  no key; a confused one sends a word this desk does not know. Neither is a
+  measurement, and not knowing must never render as a clean bill of health.
+- **It is one more line, never a second format.** `docs/MT4.md` specifies the
+  `key=value` body and `decode` parses it, so an old desk clips the extra key
+  into its message text and ignores it. Both halves therefore deploy in either
+  order, which matters because the shim runs on the customer's host.
+- **It does NOT widen to `503`.** On a `503` the mailbox was never usable and
+  nothing was written, so there is no withdrawal to report; reading a key there
+  would invent a measurement. The desk ignores the key on a `503` even if one
+  arrives.
 
 **The shim times out before the desk does, on purpose.** `HttpBridge` allows the
 op's own budget plus `NET_GRACE_SEC` (2 seconds), so the desk normally receives a
