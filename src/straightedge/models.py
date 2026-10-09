@@ -146,6 +146,21 @@ class VenueClock:
     wearing a measurement's clothes. That is the `SymbolSpec.unmeasured` rule
     applied to the clock, and the two are kept in the same shape on purpose.
 
+    AN EXACT OFFSET WITH AN ERROR BAR IT DOES NOT CARRY. `offset_sec` is an
+    int and `measured` is a bool, so nothing downstream can know that the
+    instant derived from them is approximate, and the gates it feeds compare
+    exactly. The error is the venue terminal's own drift from its timezone:
+    bar stamps and `TimeCurrent()` carry that drift identically, so it cancels
+    out of a raw difference, and the grid snap then removes it from the OFFSET
+    while the bar stamp still carries it. The snap is therefore the only error
+    source in the measured path, and the residual check caps the surviving
+    error at the sample's uncertainty, which `2u < VENUE_CLOCK_GRID_SEC` holds
+    strictly under half a grid step. Measured through a real engine: at the
+    widest legal bound a 449s drift is absorbed and a 450s bound measures
+    nothing at all, while on the desk's own path, where the bound is the
+    measured poll gap, a 90s drift already refuses. A gate reading an instant
+    from this is exact to within that, never more. See `docs/CONTRACT.md`.
+
     THREE WAYS TO GET ONE, and which one a caller may use is decided by what
     that caller can measure, not by what it would like to report:
 
