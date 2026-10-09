@@ -77,15 +77,31 @@ Auto EMA trading is off until `/auto on`.
 | Unmeasured is not refused | An advice action that could not be turned into an order at all writes `advice_stage_failed` with `measured=false`, never `reject`. COULD NOT MEASURE stays distinct from REFUSED. |
 | Auto arming | `/auto on` and `/auto off` write `auto_on` and `auto_off`, the audit trail `/live` and `/approve` already had. |
 
-### Refusal reasons, in full
+### Refusal reasons: every `refused:` reply
 
 `refused: <reason>` reaches the operator verbatim, so the reason word is part of
-the contract and not an implementation detail. **This table is the ENUMERATION;
-the rows above carry the mechanism in depth.** It is kept complete by
+the contract and not an implementation detail. **This table is the ENUMERATION
+for that one reply shape; the rows above carry the mechanism in depth.** It is
+kept complete in BOTH directions by
 `tests/test_contract_refusal_vocabulary.py`, which scans the source for every
-word the desk can emit and fails when one is not documented here, so a reason
-added to the code without a line here reds a PR rather than arriving silently
-(#220).
+word the desk can put after `refused: ` and fails when one has no row here, and
+also fails on a row naming a word the code can no longer emit (#220).
+
+**SCOPE, stated because the table cannot close over what it does not scan.**
+A refusal that does not take the `refused: <word>` shape is NOT in this table
+and is NOT gated by that test:
+
+* `_stop_guard` refuses a `/sl` with `stop_removal_refused` or
+  `stop_exceeds_risk`, which surface as `sl failed retcode=<n> <word>` and
+  journal as `modify_refused`. Both words are documented, in the `/sl` row
+  above, and neither is scanned; widening the gate to cover that channel is
+  filed separately rather than grown into this change.
+* A quote that cannot be read is refused by raising, with operator PROSE rather
+  than a word (`unreadable tick for <symbol>`, `no tick for <symbol>`), so
+  there is no vocabulary entry to make.
+
+So read this table as closed over `refused:` replies, which is what it is, and
+not over everything the operator can be refused with.
 
 A `:` suffix means the word is a PREFIX and a measured payload follows it, which
 is what makes the refusal actionable rather than merely named.
