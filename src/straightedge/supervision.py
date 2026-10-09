@@ -79,6 +79,18 @@ refuses the duplicate. Flagging non-zero would report the live desk broken
 every five minutes forever; ignoring the field would miss a task erroring every
 cycle. See `REFUSED_DUPLICATE_LAUNCH`.
 
+That field carries TWO vocabularies and only one of them is about failure. Task
+Scheduler reports its own status through it using the `SCHED_S_*` family, whose
+HRESULT severity bit is CLEAR: a task that has never run reports `0x00041303`,
+not an error. The first version of this check read every non-zero result as a
+failed launch, and `supervision-xml` red on a task that had been installed
+thirty seconds earlier. `_is_error_hresult` judges the severity BIT rather than
+an allow-list of codes to forgive, because an allow-list would encode which
+members of the family this author had happened to see and the next unseen one
+would read as a failure. The one informational code that IS a failure is
+`0x00041307 SCHED_S_TASK_NO_VALID_TRIGGERS`, which is #151's defect reported by
+the scheduler itself.
+
 A dump of a real task with no sidecar is `liveness_unmeasured`, a FAIL, by the
 same rule `task_unreadable` follows. A shipped TEMPLATE is exempt, because it
 is registered with nothing and has no `NextRunTime` to have: the artifact says
@@ -140,6 +152,35 @@ INDEFINITE_LIMITS = frozenset({"PT0S", "PT0M", "PT0H"})
 #: So nothing here judges one field. The reading is the TUPLE: live state, last
 #: result, next run time, instances policy.
 REFUSED_DUPLICATE_LAUNCH = 0x800710E0
+
+#: `SCHED_S_TASK_HAS_NOT_RUN`. A task that has never run once reports this, and
+#: it is NOT a failed launch. Measured on a GitHub-hosted `windows-latest`
+#: runner: a task registered thirty seconds earlier reports it, and the first
+#: version of the liveness check called it `last_run_failed` and red the job.
+SCHED_S_TASK_HAS_NOT_RUN = 0x00041303
+
+#: `SCHED_S_TASK_NO_VALID_TRIGGERS`. Task Scheduler's own verdict that the task
+#: cannot fire, which is #151's defect reported by the scheduler itself. Also an
+#: informational code, and the one informational code that is a FAIL.
+SCHED_S_TASK_NO_VALID_TRIGGERS = 0x00041307
+
+
+def _is_error_hresult(result: int) -> bool:
+    """Is this `LastTaskResult` an ERROR, as opposed to a status.
+
+    Task Scheduler reports its own state through the same field it reports
+    failures through, using the `SCHED_S_*` family whose HRESULT severity bit is
+    CLEAR. `0x00041303` (has not run) and `0x00041307` (no valid triggers) are
+    members; `0x800710E0` (duplicate launch refused) and `0x80070002` (file not
+    found) are errors.
+
+    Judged on the severity BIT rather than on a list of codes to forgive. An
+    allow-list would encode which members of the family this author happened to
+    have seen, and the next unseen one would read as a failed launch; the
+    severity bit is the documented property that separates the whole family.
+    """
+    return bool(result & 0x80000000)
+
 
 #: Missed repetition windows tolerated before the audit says so. One is a
 #: reboot or a busy moment. A climbing count is the scheduler failing to start
@@ -973,7 +1014,74 @@ def _check_liveness(spec: TaskSpec, view: TaskView) -> list[Finding]:
         )
     result = info.last_task_result
     if result is not None and result != 0:
-        if result == REFUSED_DUPLICATE_LAUNCH:
+        if not _is_error_hresult(result):
+            # An INFORMATIONAL result, not an error. Task Scheduler reports its
+            # own status through this field using the SCHED_S_* family, whose
+            # HRESULT severity bit is CLEAR, and those are not failed launches.
+            #
+            # Measured, and it is why this branch exists: a freshly registered
+            # task reports 0x00041303 SCHED_S_TASK_HAS_NOT_RUN, and the first
+            # version of this check called that `last_run_failed`. It red the
+            # supervision-xml job on a task that had been installed thirty
+            # seconds earlier and had nothing wrong with it, which is exactly
+            # the "a gate that reds on a healthy box is a gate that gets
+            # ignored" failure `interval_unjudged` exists to avoid.
+            #
+            # Judged on the SEVERITY BIT rather than on a list of codes to
+            # forgive. An allow-list would be a guess about which members of a
+            # family I had happened to see; the severity bit is the documented
+            # property that distinguishes the whole family.
+            if result == SCHED_S_TASK_NO_VALID_TRIGGERS:
+                out.append(
+                    Finding(
+                        task=view.name,
+                        severity=FAIL,
+                        code="no_valid_triggers",
+                        detail=(
+                            "LastTaskResult is 0x00041307 "
+                            "SCHED_S_TASK_NO_VALID_TRIGGERS, which is Task "
+                            "Scheduler's OWN verdict that this task cannot "
+                            "fire. It is an informational code, not an error "
+                            "code, and it is the strongest evidence this audit "
+                            f"can get. This task {spec.purpose}"
+                        ),
+                    )
+                )
+            elif result == SCHED_S_TASK_HAS_NOT_RUN:
+                out.append(
+                    Finding(
+                        task=view.name,
+                        severity=WARN,
+                        code="never_run",
+                        detail=(
+                            "LastTaskResult is 0x00041303 "
+                            "SCHED_S_TASK_HAS_NOT_RUN: this task has never run "
+                            "once. Expected on a box where supervision was just "
+                            "installed, and the finding itself on a box where it "
+                            "was not. `last_run_stale` cannot see this state "
+                            "because there is no LastRunTime to be stale, so it "
+                            "is reported here rather than being silent"
+                        ),
+                    )
+                )
+            else:
+                out.append(
+                    Finding(
+                        task=view.name,
+                        severity=WARN,
+                        code="informational_result",
+                        detail=(
+                            f"LastTaskResult is {result} "
+                            f"(0x{result & 0xFFFFFFFF:08X}), an informational "
+                            "SCHED_S_* status rather than an error. Named rather "
+                            "than passed over in silence: this audit has no "
+                            "reading for this particular code, and an "
+                            "unrecognised status is a thing to look up, not a "
+                            "thing to drop"
+                        ),
+                    )
+                )
+        elif result == REFUSED_DUPLICATE_LAUNCH:
             # The healthy steady state for a supervision task, so this is a
             # finding ONLY in the combination that contradicts it: a refused
             # duplicate launch means an instance WAS running, and if nothing is
@@ -1003,10 +1111,11 @@ def _check_liveness(spec: TaskSpec, view: TaskView) -> list[Finding]:
                     code="last_run_failed",
                     detail=(
                         f"LastTaskResult is {result} "
-                        f"(0x{result & 0xFFFFFFFF:08X}) and that is NOT the "
-                        "benign already-running refusal 0x800710E0, so the last "
-                        "launch of this task errored. A declaration cannot show "
-                        "this: the task fires, fails, and the XML stays perfect"
+                        f"(0x{result & 0xFFFFFFFF:08X}), an ERROR-severity "
+                        "HRESULT and not the benign already-running refusal "
+                        "0x800710E0, so the last launch of this task errored. A "
+                        "declaration cannot show this: the task fires, fails, "
+                        "and the XML stays perfect"
                     ),
                 )
             )

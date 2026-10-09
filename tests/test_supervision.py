@@ -1310,3 +1310,166 @@ def test_a_utf16_sidecar_is_read_like_the_xml_is(tmp_path: Path) -> None:
     info = views["straightedge-desk"].info
     assert info is not None and info.present and not info.unreadable
     assert info.state == "Running"
+
+
+# --- the SCHED_S_* family, which CI caught and the fixtures had not -----------------
+
+
+def test_a_task_that_has_never_run_is_not_a_failed_launch(tmp_path: Path) -> None:
+    """MEASURED ON A REAL RUNNER, which is how this was found.
+
+    `supervision-xml` registers both declarations and audits the dump. A task
+    registered thirty seconds earlier reports `LastTaskResult = 267011`
+    (`0x00041303 SCHED_S_TASK_HAS_NOT_RUN`), and the first version of this
+    check called that `last_run_failed` and red the job on a task with nothing
+    wrong with it.
+
+    That is the "a gate that reds on a healthy box is a gate that gets ignored"
+    failure, and no offline fixture was going to produce the value: only a real
+    Task Scheduler had it.
+    """
+    findings = _audit_one(
+        _task_xml(triggers=LOGON_AND_REPEAT),
+        _cfg(tmp_path),
+        info=_healthy_info(
+            last_task_result=supervision.SCHED_S_TASK_HAS_NOT_RUN,
+            state="Ready",
+            last_run_time_utc="",
+        ),
+    )
+    assert _codes(findings, supervision.FAIL) == set(), [f.line() for f in findings]
+    assert "never_run" in _codes(findings, supervision.WARN)
+    assert supervision.exit_code(findings) == 0
+    text = supervision.report(findings, max_interval_s=float(MT4_STALE))
+    assert "never run" in text, "a fresh install must be told what it is looking at"
+
+
+def test_the_scheduler_saying_no_valid_triggers_is_a_failure(tmp_path: Path) -> None:
+    """The one informational code that IS a failure.
+
+    `0x00041307 SCHED_S_TASK_NO_VALID_TRIGGERS` is #151's defect reported by
+    Task Scheduler itself, which is the strongest evidence this audit can get.
+    It must not be swept up by the rule that forgives the rest of the family.
+    """
+    findings = _audit_one(
+        _task_xml(triggers=LOGON_AND_REPEAT),
+        _cfg(tmp_path),
+        info=_healthy_info(
+            last_task_result=supervision.SCHED_S_TASK_NO_VALID_TRIGGERS,
+            state="Ready",
+        ),
+    )
+    assert "no_valid_triggers" in _codes(findings, supervision.FAIL)
+    assert supervision.exit_code(findings) == 1
+
+
+def test_an_unrecognised_informational_result_is_named_not_dropped(
+    tmp_path: Path,
+) -> None:
+    """A code this audit has no reading for is a thing to look up.
+
+    Silence would be the family's whole hazard repeated: the severity bit says
+    it is not an error, which is not the same as saying it is uninteresting.
+    """
+    findings = _audit_one(
+        _task_xml(triggers=LOGON_AND_REPEAT),
+        _cfg(tmp_path),
+        info=_healthy_info(last_task_result=0x00041304, state="Ready"),
+    )
+    assert "informational_result" in _codes(findings, supervision.WARN)
+    assert _codes(findings, supervision.FAIL) == set()
+    text = supervision.report(findings, max_interval_s=float(MT4_STALE))
+    assert "0x00041304" in text
+
+
+def test_an_error_severity_result_still_fails(tmp_path: Path) -> None:
+    """The control on the rule above, or it is just ignoring the field.
+
+    Without this, "forgive the informational family" and "never read
+    LastTaskResult" are indistinguishable, and a task erroring every cycle
+    would be silent. 0x80070002 is ERROR_FILE_NOT_FOUND, which is what a task
+    pointed at a moved interpreter reports.
+    """
+    findings = _audit_one(
+        _task_xml(triggers=LOGON_AND_REPEAT),
+        _cfg(tmp_path),
+        info=_healthy_info(last_task_result=0x80070002, state="Ready"),
+    )
+    assert "last_run_failed" in _codes(findings, supervision.FAIL)
+    assert supervision.exit_code(findings) == 1
+
+
+def test_the_severity_bit_is_what_separates_them() -> None:
+    """The rule itself, stated once so it cannot drift into an allow-list.
+
+    An allow-list would encode which members of the family this author happened
+    to have seen, and the next unseen one would read as a failed launch.
+    """
+    assert not supervision._is_error_hresult(0)
+    assert not supervision._is_error_hresult(supervision.SCHED_S_TASK_HAS_NOT_RUN)
+    assert not supervision._is_error_hresult(supervision.SCHED_S_TASK_NO_VALID_TRIGGERS)
+    assert not supervision._is_error_hresult(0x00041300)
+    assert supervision._is_error_hresult(supervision.REFUSED_DUPLICATE_LAUNCH)
+    assert supervision._is_error_hresult(0x80070002)
+
+
+#: CAPTURED VERBATIM from `Export-Tasks.ps1` running on a GitHub-hosted
+#: `windows-latest` runner, 2026-10-09T18:15:13Z, against a `straightedge-desk`
+#: task registered by `Install-Supervision.ps1` about thirty seconds earlier.
+#:
+#: Not hand-built. Everything else in this file is a fixture this author wrote,
+#: and a fixture encodes its author's assumptions: the hand-built healthy
+#: sidecar had `last_task_result` 0x800710E0 and a populated `last_run_time`,
+#: because that is what the LIVE DESK reports, and a freshly installed task
+#: reports neither. Only the real runner produced this shape, and the first
+#: version of the liveness check red on it.
+RUNNER_SIDECAR = """{
+  "task_name": "straightedge-desk",
+  "measured_utc": "2026-10-09T18:15:13.7863469Z",
+  "state": "Ready",
+  "multiple_instances": "IgnoreNew",
+  "last_task_result": 267011,
+  "number_of_missed_runs": 0,
+  "next_run_time_utc": "2026-10-09T18:20:00.0000000Z",
+  "last_run_time_utc": null
+}"""
+
+
+def test_the_sidecar_a_real_runner_produced_audits_clean(tmp_path: Path) -> None:
+    """The exact bytes a real Task Scheduler produced, end to end.
+
+    This is the regression test for the defect `supervision-xml` caught: the
+    audit red on a correctly installed task because 267011 is
+    `SCHED_S_TASK_HAS_NOT_RUN` and the check read every non-zero result as an
+    error. A fixture proves the decision path; this proves the reading, and it
+    is the only test in this file whose input was not written by hand.
+    """
+    info = supervision.parse_task_info("straightedge-desk", RUNNER_SIDECAR)
+    assert info.present and not info.unreadable
+    assert info.last_task_result == supervision.SCHED_S_TASK_HAS_NOT_RUN
+    assert info.last_run_time_utc == "", (
+        "the exporter maps Task Scheduler's never-ran sentinel to null, so a "
+        "1899 timestamp cannot become a 1.1 million hour staleness finding"
+    )
+
+    findings = _audit_one(
+        _task_xml(triggers=LOGON_AND_REPEAT), _cfg(tmp_path), info=info
+    )
+    assert _codes(findings, supervision.FAIL) == set(), [f.line() for f in findings]
+    assert _codes(findings, supervision.WARN) == {"never_run"}
+    assert supervision.exit_code(findings) == 0
+
+
+def test_the_captured_sidecar_still_lets_the_real_defect_red(tmp_path: Path) -> None:
+    """The control on the test above, which is the one that matters.
+
+    Making a fresh install pass must not have made the #151 shape pass with it.
+    Same freshly-installed liveness reading, pre-fix triggers, and the static
+    half must still fail.
+    """
+    info = supervision.parse_task_info("straightedge-desk", RUNNER_SIDECAR)
+    findings = _audit_one(
+        _task_xml(triggers=LOGON_CARRYING_THE_REPETITION), _cfg(tmp_path), info=info
+    )
+    assert "repetition_not_on_a_clock" in _codes(findings, supervision.FAIL)
+    assert supervision.exit_code(findings) == 1

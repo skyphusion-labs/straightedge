@@ -87,8 +87,24 @@ state**, and a zero would mean it had just started a fresh instance.
 short probe that exits cleanly, so it is never the already-running case. Same
 family of task, opposite healthy value. So the audit judges the TUPLE
 (`State`, `LastTaskResult`, `NextRunTime`, `MultipleInstances`) and never one
-field: `Running` plus `0x800710E0` plus a populated `NextRunTime` is healthy,
-and any other non-zero result is a real failure.
+field: `Running` plus `0x800710E0` plus a populated `NextRunTime` is healthy.
+
+And "non-zero" is not the same as "error". That field carries two vocabularies:
+Task Scheduler reports its own STATUS through it with the `SCHED_S_*` family,
+whose HRESULT severity bit is clear.
+
+| result | severity | reading |
+| --- | --- | --- |
+| `0` | success | the last launch ran and exited cleanly |
+| `0x00041303` | informational | has never run. Expected right after install, the finding later |
+| `0x00041307` | informational | Task Scheduler says the task cannot fire: a FAILURE |
+| any other `SCHED_S_*` | informational | named in the report, never dropped |
+| `0x800710E0` | error | duplicate launch refused. Healthy with `State=Running` |
+| any other error | error | the last launch failed: a FAILURE |
+
+**So a freshly installed box reports `0x00041303` and audits clean**, with a
+`never_run` warning saying so. The first version of this check called that a
+failed launch and red the CI job on a correctly installed task.
 
 ## Install
 
