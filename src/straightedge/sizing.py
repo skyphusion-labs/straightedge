@@ -17,12 +17,57 @@ def ticks_between(a: float, b: float, spec: SymbolSpec) -> float:
 
 
 class MissingStop(ValueError):
-    """Raised when a worst-case loss is asked for without a stop to measure to.
+    """Raised when a worst-case loss is asked for without a usable stop.
 
     A ValueError so the desk's existing command handling reports it instead of
     dying: `poll_telegram` already catches ValueError and replies with the
     message.
+
+    Carries `.reason` so the NAME is decided where the condition is recognised
+    rather than at each call site. That is the #187 argument applied to its own
+    fix: a caller that mapped the exception to a reason itself would be the
+    third opinion #187 exists to prevent.
     """
+
+    def __init__(self, message: str, *, reason: str) -> None:
+        super().__init__(message)
+        self.reason = reason
+
+
+def unusable_stop(sl: float) -> str | None:
+    """The refusal reason this stop earns, or None if it can be measured to.
+
+    ONE AUTHORITY, CONSULTED TWICE (#208). `money_per_lot_at_stop` raises on it,
+    and `Engine.replace_pending` reads it before its geometry check. Two
+    comparisons in two files would be the disagreement #187 was filed about,
+    reintroduced by the fix for it.
+
+    Two reasons, because they call for two different operator actions:
+
+    * `sl_required` means no stop was set. The operator sets one.
+    * `sl_not_measured:<value>` means the VENUE reported something that cannot
+      be a price. The operator looks at the venue; it is not their omission.
+      This parallels `spec_not_measured`, whose docstring already covers the
+      case: the venue "either did not send the field or sent a value that
+      cannot be a measurement".
+
+    `nan` and `inf` share the reason WORD and are distinguished by the value,
+    decided rather than defaulted. An unreadable stop and an infinitely distant
+    one are different mistakes, but they call for the identical action, so a
+    second reason word would grow the vocabulary without changing what anyone
+    does; the value keeps the diagnosis.
+
+    THE ORDER MATTERS AND IS NOT AN ACCIDENT. `not math.isfinite(sl)` is tested
+    FIRST because `nan <= 0` is False: a non-finite stop sails through the
+    `sl <= 0` test, which is precisely how #187 shipped one value short. The
+    finiteness test cannot be reached past the magnitude test, so it precedes
+    it.
+    """
+    if not math.isfinite(sl):
+        return f"sl_not_measured:{sl}"
+    if sl <= 0:
+        return "sl_required"
+    return None
 
 
 def money_per_lot_at_stop(entry: float, sl: float, spec: SymbolSpec) -> float:
@@ -54,10 +99,13 @@ def money_per_lot_at_stop(entry: float, sl: float, spec: SymbolSpec) -> float:
     that reaches this gets a loud failure rather than a confident number, which
     is the correct direction for an unaudited path on a real-money desk.
     """
-    if sl <= 0:
+    bad = unusable_stop(sl)
+    if bad is not None:
         raise MissingStop(
-            f"no stop to measure to: sl={sl!r}. A missing stop is not a distance, "
-            "and a worst case cannot be computed without one."
+            f"no usable stop to measure to: sl={sl!r}. A missing or non-finite "
+            "stop is not a distance, and a worst case cannot be computed "
+            "without one.",
+            reason=bad,
         )
     ticks = ticks_between(entry, sl, spec)
     return ticks * spec.trade_tick_value
