@@ -324,23 +324,28 @@ branch:
 
 | domain | command naming the domain | files | with fenced blocks | blocks |
 | --- | --- | --- | --- | --- |
-| `docs/*.md` plus `README.md` | `git ls-files 'docs/*.md' README.md` | 11 | 6 | 40 |
-| `**/*.md` across the repo | `git ls-files '*.md'` | 18 | 12 | 59 |
+| `docs/*.md` plus `README.md` | `git ls-files 'docs/*.md' README.md` | 11 | 5 | 38 |
+| `**/*.md` across the repo | `git ls-files '*.md'` | 18 | 11 | 57 |
 
-**Both rows count THIS file, so both move when it does**, which is the same
-self-inclusion the controls table below hit, one domain wider. Measured on this
-branch with `main` merged at `f98984b`; run on `f98984b` itself the same two
-commands give 11 / 5 / 38 and 18 / 11 / 57, and the whole difference is this
-file's own two blocks, which is what makes the self-inclusion checkable rather
-than asserted. The row that used to sit here read 41 and 19, labelled as
-measured on `main`, and matched no tree: it was taken from a working tree.
+**Those figures are pinned to `main` at `f98984b`, and the pin is the only
+reason they are quotable.** This file is not in them yet: it carries 2 fenced
+blocks and changes no other document, so merging it adds 2 to both `blocks`
+columns (38 to 40, 57 to 59) and one to both `with fenced blocks` columns (5 to
+6, 11 to 12), since on `main` this file holds none. Past that, do
+not read the number, run the command, because **both rows count THIS file, so
+both move when it does.** That is the controls table's self-inclusion one
+domain wider.
 
-**And the wider row rots on a markdown commit anywhere in the repo, which
-happened to it while this pull request was open.** It read 56, correctly, until
-`#205` landed three fenced blocks in `agent/README.md` (2 to 5, so 56 to 59)
-with nothing in this file changing. Nothing here was wrong and the number went
-stale anyway, which is the argument for the commands being in the table: a
-corpus count carried as prose is stale by default, so pin the ref or re-derive.
+**An unpinned corpus count is stale by default, and this one went stale twice
+while the pull request was open.** An earlier version of this row read 56,
+correctly, until `#205` landed three fenced blocks in `agent/README.md` (2 to
+5, so 56 to 59) with nothing in this file changing. Then `#206` touched
+`docs/DEPLOY.md`, which is in both domains, and moved nothing at all: that file
+holds 0 blocks at both refs. So a markdown commit MAY move the count and may
+not, which means you cannot infer staleness from the fact that documentation
+changed, nor freshness from the fact that this file did not. Re-derive, or
+quote a ref. The row that used to sit here read 41 and 19 labelled as measured
+on `main`, and matched no tree, because it was taken from a working tree.
 
 In both, the command-shaped lines inside fences are `python -m straightedge run`
 and its siblings (`backtest`, `watch`, `supervision`), which start or drive a
