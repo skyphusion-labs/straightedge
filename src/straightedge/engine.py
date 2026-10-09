@@ -34,7 +34,8 @@ from straightedge.sizing import money_per_lot_at_stop, normalize_volume
 from straightedge.state import snapshot_path_for
 from straightedge.strategy import TrendStrategy
 from straightedge.telegram import TelegramClient, TgCommand
-from straightedge import watchdog
+from straightedge import deployed, watchdog
+from straightedge import __version__
 
 #: Nothing longer than this reaches the journal from a fault message. It is the
 #: clip `_reconnect_broker` already applied to its own `error`, now applied to
@@ -1778,8 +1779,14 @@ class Engine:
         acct = self.broker.account()
         reason = self.risk.halt_reason or ("halt_file" if self.risk.halt_path().exists() else "")
         halt = "HALTED " + reason if (self.halted or reason) else "running"
+        # WHAT IS RUNNING, first line after the state. The live box sat 25
+        # commits behind main for twelve days and no reading in this chat
+        # distinguished it from a current one; `__version__` was printed by
+        # `doctor` and by nothing an operator sees day to day. `unstamped` is a
+        # real answer here, not a blank: see `straightedge.deployed`.
         return (
             f"straightedge {halt}\n"
+            f"deployed={deployed.describe(self.journal.path)} pkg={__version__}\n"
             f"mode={self.cfg.mode} server={acct.server}\n"
             f"equity={acct.equity:.2f} {acct.currency}  "
             f"balance={acct.balance:.2f}  peak={self.risk.snapshot.peak_equity:.2f}\n"
@@ -2009,6 +2016,12 @@ class Engine:
                 tick_gap_max_s=self._hb_gap_max_s,
                 run_id=self._hb_run_id,
                 started_at=self._hb_started_at.isoformat(),
+                # Read on every write rather than cached at construction. A
+                # deploy rewrites this file while the desk is DOWN, so a cached
+                # value could only ever be right; but an operator who repairs a
+                # stamp by hand on a running desk should see the repair, and a
+                # file read next to a file write costs nothing.
+                deployed=deployed.describe(self.journal.path),
             ),
             encoding="utf-8",
         )

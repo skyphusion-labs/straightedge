@@ -91,6 +91,54 @@ jobs:
           # identical to the control failing, which is the shape of defect this
           # whole job exists to catch.
           exit 0
+      # Deploy-Desk.ps1 is PowerShell that cannot run on a Mac at all, so
+      # without this its first execution would be against a live real-money
+      # box. A dry run proves it parses, that the preflight reads a real git
+      # checkout, and that it records a rollback point; it does not prove the
+      # task disable/enable or the checkout, which need a desk to stop.
+      - name: the deploy script's dry run, against a real checkout
+        shell: pwsh
+        run: |
+          $python = (Get-Command python).Source
+          New-Item -ItemType Directory -Force -Path "$PWD\..\se-state" | Out-Null
+          $state = (Resolve-Path "$PWD\..\se-state").Path
+          Copy-Item config.example.toml (Join-Path $state "config.toml")
+          # No -BookIsFlat: the script must STOP at the judgement gate and exit
+          # 0, because stopping a live autonomous desk is not its decision.
+          .\deploy\windows\Deploy-Desk.ps1 -Ref HEAD -Repo "$PWD" -StateDir $state `
+            -ConfigPath (Join-Path $state "config.toml") -PythonExe $python `
+            -RecordDir (Join-Path $state "deploys")
+          if ($LASTEXITCODE -ne 0) { throw "the dry run without -BookIsFlat should exit 0 at the judgement gate, got $LASTEXITCODE" }
+          # With the gate passed it must traverse the rest without changing
+          # anything, because -Apply is still absent.
+          .\deploy\windows\Deploy-Desk.ps1 -Ref HEAD -Repo "$PWD" -StateDir $state `
+            -ConfigPath (Join-Path $state "config.toml") -PythonExe $python `
+            -RecordDir (Join-Path $state "deploys") -BookIsFlat
+          if ($LASTEXITCODE -ne 0) { throw "the full dry run failed: $LASTEXITCODE" }
+          if (Test-Path (Join-Path $state "journal.deployed.json")) { throw "a DRY RUN wrote the deploy stamp; -Apply is not gating writes" }
+          if (Test-Path (Join-Path $state "deploys")) { throw "a DRY RUN created the rollback record directory" }
+          Write-Host "dry run changed nothing, as it must"
+      - name: the deploy script REFUSES a state dir inside the checkout
+        shell: pwsh
+        run: |
+          # The negative control for the single most destructive mistake this
+          # procedure could make: a hard checkout with the live journal inside
+          # the tree would delete the audit log of every trade the desk has
+          # ever made. A refusal nobody has watched fire is not a refusal.
+          $python = (Get-Command python).Source
+          $inside = "$PWD\se-state-inside"
+          New-Item -ItemType Directory -Force -Path $inside | Out-Null
+          Copy-Item config.example.toml (Join-Path $inside "config.toml")
+          $ok = $false
+          try {
+            .\deploy\windows\Deploy-Desk.ps1 -Ref HEAD -Repo "$PWD" -StateDir $inside `
+              -ConfigPath (Join-Path $inside "config.toml") -PythonExe $python 2>&1 | Write-Host
+          } catch {
+            $ok = $true
+            Write-Host "refused as designed: $($_.Exception.Message)"
+          }
+          if (-not $ok) { throw "the script ACCEPTED a state dir inside the checkout, so the guard that protects the live journal cannot fire" }
+          Remove-Item -Recurse -Force $inside
       - name: unregister
         if: always()
         shell: pwsh

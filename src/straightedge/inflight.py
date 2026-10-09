@@ -23,8 +23,19 @@ the case it exists for.
 
 Durability is the point, not a nicety. The observed failure on the live box was a
 SILENT PROCESS RESTART (2026-09-26T01:56:49Z, no traceback in `desk.err`, picked
-back up by the 5 minute scheduled task), and the staged order survives a restart
-by design via the journal's `confirm_stage` record. An in-memory set would be
+back up by the `straightedge-desk` scheduled task), and the staged order
+survives a restart by design via the journal's `confirm_stage` record.
+
+That parenthesis read "the 5 minute scheduled task" until 2026-10-08, and the
+correction is worth keeping because the part it got wrong is the part that
+mattered. The task does declare a five-minute repetition and it has fired ZERO
+times: the repetition hangs on a LogonTrigger with `StopAtDurationEnd=true` and
+no `Duration`, so its window shuts at logon, and the box shows an empty
+`NextRunTime`, a `LastRunTime` twelve days old, and 8 `start` records in the
+whole journal where a five-minute cadence would be thousands. What restarted the
+desk at 01:56 was that task firing on LOGON, which is the one event that is not
+available when a desk dies unattended. The intent recorded here was real and the
+mechanism behind it was not, which is what `straightedge#133` is about. An in-memory set would be
 empty in precisely the process that most needs to know. So each write is
 `flush` + `fsync` + atomic `replace`.
 
