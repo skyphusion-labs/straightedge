@@ -4,6 +4,7 @@ from straightedge.broker.paper import PaperBroker
 from straightedge.config import BotConfig
 from straightedge.engine import Engine
 from straightedge.models import Bar
+from straightedge.sizing import money_per_lot_at_stop
 from straightedge.synthetic import generate_bars
 from straightedge.telegram import TelegramClient, TgCommand
 
@@ -359,4 +360,115 @@ def test_utc_day_roll_sends_recap_not_a_trade(tmp_path) -> None:
     texts2 = [payload.get("text", "") for _, payload in tr.sent]
     recaps2 = [t for t in texts2 if t.startswith("RECAP")]
     assert len(recaps2) == 1
+    engine.stop()
+
+
+def test_replace_pending_refuses_for_lack_of_loss_room(tmp_path) -> None:
+    """A replacement must not re-risk money the day no longer has (issue #104).
+
+    `risk.evaluate` measures a NEW order against `min(per_trade, loss_room)`,
+    and `_stop_guard` measures a widening on an OPEN position against the same
+    pair. `replace_pending` measured a WORKING order against the per-trade half
+    only, so a replacement could commit risk the daily-loss and drawdown
+    budgets no longer had room for.
+
+    THE WINDOW IS NOT THE ONE THE ISSUE DESCRIBES, and the difference is why
+    this test sets the state it does. #104 reasoned that "once the day's budget
+    is spent, loss_room is negative and replace_pending still allows a
+    replacement". That state is unreachable: `circuit` trips `daily_loss` at
+    `daily_loss >= day_start_equity * daily_loss_pct` and `loss_room` is that
+    same comparison rearranged, so room reaches zero exactly when the circuit
+    trips, and `replace_pending`'s own `circuit_reason` check already refuses
+    there. `loss_room`'s docstring says so: "Positive whenever the circuit is
+    clear".
+
+    The reachable window is room POSITIVE but SMALLER than the per-trade cap:
+    the day has spent most of its budget, no halt gate has tripped, and a
+    replacement sized inside the per-trade cap still does not fit in what is
+    left. Measured here: $13.80 of room, a $50 per-trade cap, and a
+    replacement risking $40 that this guard accepted before the fix.
+    """
+    engine = _engine(tmp_path)
+    engine.start()
+    tick = engine.broker.tick("EURUSD")
+    spec = engine.broker.symbol("EURUSD")
+    limit = spec.normalize_price(tick.ask - 0.002)
+    sl = spec.normalize_price(limit - 0.005)
+    tp = spec.normalize_price(limit + 0.010)
+    engine.handle_command(
+        TgCommand("1", 1, f"/buy EURUSD limit={limit} sl={sl} tp={tp}", 1)
+    )
+    engine.handle_command(TgCommand("1", 1, "/confirm", 2))
+    order = engine.broker.orders()[0]
+
+    account = engine.broker.account()
+    r = engine.cfg.risk
+    per_trade = account.equity * r.risk_pct * r.max_risk_multiple
+
+    # The day opened higher than the account now stands, so most of the
+    # daily-loss budget is spent. Written on the PERSISTED snapshot, which is
+    # the state the sizer never sees and the only thing moved here; `observe`
+    # rewrites day_start_equity only when the UTC day_key changes, so this
+    # survives the `circuit_reason` call inside replace_pending.
+    engine.risk.snapshot.day_start_equity = 10_190.0
+    room = engine.risk.loss_room(account)
+
+    # The window has to BE a window, or this test proves nothing: the circuit
+    # must be clear (otherwise the existing circuit_reason check is what
+    # refuses, not the cap) and the room must be positive but tighter than the
+    # per-trade cap (otherwise min() picks per_trade and the two forms agree).
+    assert engine.risk.circuit_reason(account, engine.now_fn()) == ""
+    assert 0 < room < per_trade, f"no window: room={room} per_trade={per_trade}"
+
+    new_px = spec.normalize_price(limit - 0.001)
+    worst = money_per_lot_at_stop(new_px, order.sl, spec) * order.volume
+    # The refusal must come from the loss-room term ALONE. If `worst` also
+    # breached the per-trade cap, the old arithmetic would refuse too and this
+    # test could not tell the fixed guard from the broken one.
+    assert worst <= per_trade + 1e-6, f"worst={worst} already breaches per_trade={per_trade}"
+    assert worst > room, f"worst={worst} fits in room={room}; nothing to refuse"
+
+    reply = engine.handle_command(
+        TgCommand("1", 1, f"/replace {order.ticket} {new_px}", 3)
+    )
+    assert "refused: size_exceeds_risk" in reply, reply
+    # And the order is untouched, because a refusal that still moved the order
+    # would be a refusal in name only.
+    assert abs(engine.broker.orders()[0].price - order.price) < 1e-12
+    engine.stop()
+
+
+def test_replace_pending_still_allows_a_replacement_that_fits(tmp_path) -> None:
+    """The loss-room term must not refuse everything (issue #104).
+
+    The control for the test above. Same replacement, same arithmetic, with the
+    day's budget untouched: it must still be ACCEPTED. A guard that refuses
+    every replacement would pass the test above for the wrong reason.
+    """
+    engine = _engine(tmp_path)
+    engine.start()
+    tick = engine.broker.tick("EURUSD")
+    spec = engine.broker.symbol("EURUSD")
+    limit = spec.normalize_price(tick.ask - 0.002)
+    sl = spec.normalize_price(limit - 0.005)
+    tp = spec.normalize_price(limit + 0.010)
+    engine.handle_command(
+        TgCommand("1", 1, f"/buy EURUSD limit={limit} sl={sl} tp={tp}", 1)
+    )
+    engine.handle_command(TgCommand("1", 1, "/confirm", 2))
+    order = engine.broker.orders()[0]
+
+    account = engine.broker.account()
+    r = engine.cfg.risk
+    per_trade = account.equity * r.risk_pct * r.max_risk_multiple
+    # A full day's budget: 2% of equity against a 0.5% per-trade cap, so
+    # min(per_trade, loss_room) is the per-trade half and nothing changes.
+    assert engine.risk.loss_room(account) > per_trade
+
+    new_px = spec.normalize_price(limit - 0.001)
+    reply = engine.handle_command(
+        TgCommand("1", 1, f"/replace {order.ticket} {new_px}", 3)
+    )
+    assert f"replace #{order.ticket}" in reply, reply
+    assert abs(engine.broker.orders()[0].price - new_px) < spec.point
     engine.stop()
