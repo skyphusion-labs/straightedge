@@ -1201,6 +1201,16 @@ A refusal is journaled and is never sent back to the chat that triggered it.
 The chat gets its one-line reply, and nothing else.
 With no journal configured the refusal still prints to stderr, so a control
 that fired can never look unexercised.
+`advice_turn` carries `degraded` when the schema gate forced the hold: the
+reason that reply could not be read, as the gate's own violation names
+(`unknown field x`, `symbol is not ASCII`, `tp is neither a number nor null`).
+Empty means nothing degraded, and the field is always present, so an empty one
+cannot be confused with a desk too old to emit it.
+**Read it before reading `action=hold` as a view.** A hold with a non-empty
+`degraded` is the desk refusing to act on a reply it could not parse, not the
+model standing aside, and those two were indistinguishable in this file before
+straightedge#185. The prose reason still goes to the chat as well, so an
+operator watching at the time sees both.
 `advice_turn` closes one advice turn: `provider`, `session`, `action`,
 `symbol`, `sl`, `tp`, `limit`, `stop`, `ticket`, and `staged` (whether the
 desk tried to turn the suggestion into an order).
