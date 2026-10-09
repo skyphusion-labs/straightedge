@@ -5,6 +5,7 @@ Do not treat older changelog wording as the operator contract.
 See README.md and docs/CONTRACT.md.
 
 ## 1.8.0
+
 ### The worst tick gap this box has seen now outlives the process (issue #153)
 
 `tick_gap_max_s` answered one question while the runbook asked it another, and
@@ -87,7 +88,9 @@ clean, and the breach printed but not journaled.
   `started_at=` nor `deployed=`, all three shipped in 1.6.0. Both lists are now
   complete. A format contract that omits fields the renderer emits is a
   contract a reader cannot reproduce the file from.
+
 ## 1.7.0
+
 ### One clock: a broker bar stamp is not UTC, and the offset is measured (issue #172)
 
 Found while pulling the #37 demo evidence off the live box, 2026-10-09, and
