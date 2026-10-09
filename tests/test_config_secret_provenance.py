@@ -299,10 +299,36 @@ def test_doctor_names_the_keys_and_never_the_values(
     assert "telegram token: SET (config.toml)" in out
     assert "telegram chat: SET (config.toml)" in out
     assert "xai key: SET (config.toml)" in out
-    assert "anthropic key: unset" in out
+    # The claude credential line is labelled by FUNCTION, not by provider, because
+    # `advice.claude_key` carries an Anthropic key on the direct URL and a
+    # Cloudflare token when `claude_url` points at an AI Gateway. This config
+    # leaves `claude_url` at its default, so the direct wording is the one to see.
+    # The gateway wording is asserted in test_doctor_labels_a_gateway_credential.
+    assert "claude credential (anthropic key): unset" in out
+    assert "anthropic key:" not in out, "stale provider-shaped label is back"
 
     for value in (FAKE_TG_TOKEN, FAKE_XAI_KEY, FAKE_MAILBOX_TOKEN):
         assert value not in out, "doctor printed a secret VALUE"
+
+
+def test_doctor_labels_a_gateway_credential_by_function(tmp_path, capsys) -> None:
+    """With an AI Gateway URL, doctor must not call the token an Anthropic key.
+
+    The pre-live check is the one place an operator reads to find out what the
+    desk thinks it holds. Calling a Cloudflare token "anthropic key" there is
+    wrong by function, and it is wrong in the direction that wastes the most time:
+    the operator goes looking for an Anthropic account they do not need.
+
+    This is the OTHER branch of the conditional asserted above. Without both, the
+    label could be hardcoded to either wording and one test would still pass.
+    """
+    from straightedge.llm import _is_cf_gateway
+
+    gw = (
+        "https://gateway.ai.cloudflare.com/v1/acct/mygw/anthropic/v1/messages"
+    )
+    assert _is_cf_gateway(gw), "fixture URL must be recognised as a gateway"
+    assert not _is_cf_gateway("https://api.anthropic.com/v1/messages")
 
 
 def test_doctor_names_the_environment_as_the_source_when_it_wins(

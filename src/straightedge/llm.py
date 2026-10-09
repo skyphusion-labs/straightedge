@@ -16,6 +16,7 @@ from typing import Any
 from straightedge.config import AdviceConfig
 from straightedge.journal import redact_text
 from straightedge.telegram import Transport, UrlLibTransport
+from urllib.parse import urlsplit
 
 KEEP_TURNS = 40
 
@@ -52,6 +53,38 @@ class Advice:
     stop: float | None = None
     ticket: int | None = None
     summary: str = ""
+
+
+CF_GATEWAY_HOST = "gateway.ai.cloudflare.com"
+
+
+def _is_cf_gateway(url: str) -> bool:
+    """Is this URL a Cloudflare AI Gateway endpoint? Decided on the HOST.
+
+    This was a substring test (`CF_GATEWAY_HOST in url`) and CodeQL flagged it
+    high as `py/incomplete-url-substring-sanitization`. It misfired in both
+    directions, and the dangerous direction sends the Cloudflare token to a host
+    that is not Cloudflare:
+
+        https://GATEWAY.AI.CLOUDFLARE.COM/...              -> missed (hosts are
+                                                              case-insensitive, so
+                                                              a valid URL took the
+                                                              BYOK branch)
+        https://evil.example/gateway.ai.cloudflare.com/..  -> matched on the PATH
+        https://evil.example/...?x=gateway.ai.cloudflare.com -> matched on the QUERY
+        https://gateway.ai.cloudflare.com.evil.example/..  -> matched a lookalike
+                                                              anyone can register
+
+    `claude_url` comes from the operator's own config and there is no remote path
+    into it, so this is self-inflicted rather than attacker-reachable. It is still
+    a credential leaving for the wrong host on a typo, which is worth three lines
+    of stdlib.
+
+    An operator who fronts the gateway behind their OWN hostname is deliberately
+    not covered: that needs an explicit opt-in, not a looser match here.
+    """
+    host = (urlsplit(url).hostname or "").lower()
+    return host == CF_GATEWAY_HOST or host.endswith("." + CF_GATEWAY_HOST)
 
 
 def parse_advice(raw: str) -> Advice:
@@ -264,7 +297,7 @@ class Advisor:
         # Pointing `claude_url` straight at api.anthropic.com keeps the original
         # BYOK behaviour for a self-hoster with their own key. The URL decides,
         # so neither operator has to set a mode flag that could disagree with it.
-        if "gateway.ai.cloudflare.com" in self.cfg.claude_url:
+        if _is_cf_gateway(self.cfg.claude_url):
             auth = {"cf-aig-authorization": f"Bearer {self.cfg.claude_key}"}
         else:
             auth = {"x-api-key": self.cfg.claude_key}
@@ -279,4 +312,24 @@ class Advisor:
         for b in blocks:
             if isinstance(b, dict) and b.get("type") == "text":
                 parts.append(str(b.get("text") or ""))
-        return "\n".join(parts)
+        text = "\n".join(parts).strip()
+        # AN EMPTY REPLY MUST RAISE, the way `_grok` already does for an empty
+        # `choices`. Without this, `parse_advice("")` returns a well-formed
+        # Advice(text="", action="hold") and `Desk._ask` renders it as advice, so
+        # the operator is shown an empty answer as though the model had said
+        # nothing of substance rather than told the call failed.
+        #
+        # TWO routes produce it and `max_tokens` only addresses one:
+        #   - budget exhaustion, since thinking is always on and counts against
+        #     the ceiling, which is why that ceiling is 8192 and not 800;
+        #   - a safety refusal, which arrives as HTTP 200 with
+        #     `stop_reason == "refusal"` and no text block at all, and which no
+        #     ceiling can prevent.
+        # The refusal case is named separately because "the model declined" and
+        # "the answer did not fit" want different operator responses.
+        stop = str(data.get("stop_reason") or "")
+        if not text:
+            if stop == "refusal":
+                raise RuntimeError("claude refused")
+            raise RuntimeError(f"claude empty (stop_reason={stop or 'unknown'})")
+        return text
