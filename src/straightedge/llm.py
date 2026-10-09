@@ -168,6 +168,15 @@ def _schema_violations(obj: dict[str, Any]) -> list[str]:
             out.append(f"{key} is not a string")
     if "symbol" in obj and obj["symbol"] is not None and not isinstance(obj["symbol"], str):
         out.append("symbol is neither a string nor null")
+    # A BRACE IN `symbol` IS A VIOLATION, not something to clean up. The property
+    # is typed ["string","null"], so a braced symbol is schema-VALID and would
+    # otherwise pass with nothing forced and nothing said. It has to be caught
+    # HERE, because the desk gates a model-chosen symbol on `cfg.advice_allows`:
+    # "EUR{USD}" fails that gate loudly and "EURUSD" passes it, so repairing the
+    # string converts a NAMED REFUSAL into a staged order on an instrument the
+    # model never named.
+    if isinstance(obj.get("symbol"), str) and ("{" in obj["symbol"] or "}" in obj["symbol"]):
+        out.append(f"symbol {obj['symbol']!r} contains a brace")
     for key in ("sl", "tp", "limit", "stop"):
         if key in obj and obj[key] is not None and not _is_num(obj[key]):
             out.append(f"{key} is neither a number nor null")
@@ -194,8 +203,11 @@ def structured_to_parseable(raw: str) -> str:
     * a structured object that VIOLATES the schema -> action forced to `hold`,
       and the reason written into the prose. Never silently coerced: the parser
       already turns an unknown action into `hold` and says nothing, and a desk
-      that cannot tell "the model held" from "we could not read the model" is
-      the #249/#77 silent-degrade defect on the order path.
+      that cannot tell "the model held" from "we could not read the model" has
+      lost the distinction `docs/CONTRACT.md` requires of every other refusal:
+      its "Refusal record" row says a refusing gate writes a NAMED reason, and
+      "Unmeasured is not refused" says COULD NOT MEASURE stays distinct from
+      REFUSED.
     """
     try:
         obj = json.loads(raw)
@@ -216,18 +228,29 @@ def structured_to_parseable(raw: str) -> str:
         )
         prose = f"{prose}\n\n{note}" if prose else note
     # A BRACE IN A STRING VALUE WOULD DEFEAT `_JSON_TAIL`, whose character class
-    # is `[^{}]*`, and the failure is silent and lossy: the object stops
-    # matching, `parse_advice` falls back to `action="hold"`, and a legitimate
-    # close would be dropped with nothing said. The desk only ever reads
-    # `summary` as a one-line label, so braces there carry no meaning worth that
-    # risk. Pre-existing for a model that emits one today; this re-serialisation
-    # is the one place it can be fixed without touching the parser.
+    # is `[^{}]*`: the object stops matching, `parse_advice` falls back to
+    # `action="hold"`, and a legitimate close is dropped with nothing said.
+    #
+    # THE TWO FIELDS GET OPPOSITE TREATMENT, and the asymmetry is the point.
+    #
+    # `summary` is a one-line LABEL the desk only displays. Nothing is traded on
+    # it, so stripping braces loses no meaning and buys a parseable tail.
+    #
+    # `symbol` NAMES THE INSTRUMENT. Stripping braces there does not clean a
+    # label, it MANUFACTURES A DIFFERENT, TRADEABLE SYMBOL: "EUR{USD}" became
+    # "EURUSD", which passes the `cfg.advice_allows` gate that "EUR{USD}" fails
+    # loudly, turning a named `symbol_not_allowed` refusal into a staged order on
+    # an instrument the model never named. It also made this path LESS
+    # conservative than the parser it gates in front of: on the same reply `grok`
+    # and `computer` yield symbol=None, action=hold. So a braced symbol is a
+    # violation above, which forces the hold and states the reason, and is
+    # emitted as NULL here. Never repaired.
     summary = tail.get("summary")
     if isinstance(summary, str):
         tail["summary"] = summary.replace("{", "").replace("}", "")
     symbol = tail.get("symbol")
-    if isinstance(symbol, str):
-        tail["symbol"] = symbol.replace("{", "").replace("}", "")
+    if isinstance(symbol, str) and ("{" in symbol or "}" in symbol):
+        tail["symbol"] = None
     return f"{prose}\n{json.dumps(tail)}"
 
 
@@ -245,7 +268,11 @@ def parse_advice(raw: str) -> Advice:
             obj = {}
         if isinstance(obj, dict):
             action = str(obj.get("action") or "hold").lower()
-            if action not in {"buy", "sell", "close", "hold"}:
+            # Reads the PINNED vocabulary rather than a second literal. The
+            # comment on ADVICE_ACTIONS claims the two gates cannot drift
+            # apart; with a literal here that claim was unimplemented, and
+            # widening the literal was invisible to every test.
+            if action not in set(ADVICE_ACTIONS):
                 action = "hold"
             sym = obj.get("symbol")
             symbol = str(sym).upper() if sym else None

@@ -167,7 +167,7 @@ def test_computer_keeps_the_parser_and_is_sent_no_schema() -> None:
 
 
 def test_a_prose_reply_on_the_claude_path_still_goes_through_the_parser() -> None:
-    """The gateway-stripped-it case, and the pre-#174 shape.
+    """The gateway-stripped-it case, and the pre-#180 shape.
 
     If `output_config` never reached the model, the reply is prose plus a
     trailing object, exactly as before. That must keep working: the parser is
@@ -193,8 +193,9 @@ def test_an_action_outside_the_enum_is_held_and_SAID(  # noqa: N802
     """Today the parser coerces this to hold and says nothing.
 
     Silence is the defect. A desk that cannot tell "the model held" from "we
-    could not read the model" is the #249/#77 silent-degrade shape on the order
-    path, so the reason is written where the operator reads it.
+    could not read the model" loses the distinction `docs/CONTRACT.md` requires
+    of every other refusal (its "Refusal record" and "Unmeasured is not refused"
+    rows), so the reason is written where the operator reads it.
     """
     raw = json.dumps(_obj(action="scale_in", summary="add to the winner"))
     advice = parse_advice(structured_to_parseable(raw))
@@ -316,3 +317,87 @@ def test_a_reply_that_is_not_an_advice_object_is_left_alone() -> None:
     assert structured_to_parseable('{"unrelated": 1}') == '{"unrelated": 1}'
     assert structured_to_parseable("[1, 2, 3]") == "[1, 2, 3]"
     assert parse_advice(structured_to_parseable("just text, no json")).action == "hold"
+
+
+# --------------------------------------------------------------------------
+# 5. a symbol is NEVER repaired (the blocking finding on #181)
+# --------------------------------------------------------------------------
+
+
+def test_a_braced_symbol_is_held_and_never_repaired() -> None:
+    """The reversal strummer found: repairing a symbol staged an order.
+
+    `symbol` is typed `["string","null"]`, so `"EUR{USD}"` is schema-VALID and
+    nothing was forced and nothing said. Stripping the braces did not clean a
+    label, it MANUFACTURED a different, tradeable instrument.
+
+    What made it a safety defect rather than a cosmetic one: the desk gates a
+    model-chosen symbol on `cfg.advice_allows`. `"EUR{USD}"` fails that gate
+    loudly as `symbol_not_allowed`; `"EURUSD"` passes it. So the repair
+    converted a NAMED REFUSAL into a staged buy on an instrument the model
+    never named, and made this path less conservative than the parser it is
+    supposed to gate in front of.
+    """
+    raw = json.dumps(_obj(action="buy", symbol="EUR{USD}", sl=1.07, tp=1.09))
+    advice = parse_advice(structured_to_parseable(raw))
+
+    assert advice.action == "hold", "a symbol we cannot read must not stage"
+    assert advice.symbol != "EURUSD", "the braces must not be repaired into a real symbol"
+    assert advice.symbol is None
+    assert "contains a brace" in advice.text
+    assert "EUR{USD}" in advice.text, "the reason must quote what the model actually said"
+
+
+def test_a_braced_symbol_is_not_more_permissive_than_the_bare_parser() -> None:
+    """The structured path must never be the LESS conservative of the two.
+
+    Same reply through the parser alone, which is what `grok` and `computer`
+    use: the braces defeat `_JSON_TAIL`, the object does not match, and the
+    action falls back to hold with no symbol. The structured path has to reach
+    at least that, and it now also states why.
+    """
+    raw = json.dumps(_obj(action="buy", symbol="EUR{USD}", sl=1.07, tp=1.09))
+
+    bare = parse_advice("Buy.\n" + raw)
+    structured = parse_advice(structured_to_parseable(raw))
+
+    assert bare.action == "hold" and bare.symbol is None, (bare.action, bare.symbol)
+    assert structured.action == "hold" and structured.symbol is None
+    assert "degraded" in structured.text and "degraded" not in bare.text
+
+
+def test_a_clean_symbol_is_untouched() -> None:
+    """Negative control: the brace rule must not eat ordinary symbols."""
+    raw = json.dumps(_obj(action="buy", symbol="EURUSD", sl=1.07, tp=1.09))
+    advice = parse_advice(structured_to_parseable(raw))
+    assert advice.action == "buy"
+    assert advice.symbol == "EURUSD"
+    assert "degraded" not in advice.text
+
+
+def test_parse_advice_reads_the_pinned_vocabulary(monkeypatch) -> None:
+    """`ADVICE_ACTIONS`'s comment claims both gates read it. Now they do.
+
+    `parse_advice` carried its own literal set, so the documented invariant was
+    unimplemented and widening the literal was invisible to every test. The
+    monkeypatch is what proves the name is READ at call time rather than that
+    two copies happen to agree today.
+    """
+    import straightedge.llm as llm_mod
+
+    assert set(llm_mod.ADVICE_ACTIONS) == {"buy", "sell", "close", "hold"}
+
+    monkeypatch.setattr(llm_mod, "ADVICE_ACTIONS", ("buy", "sell", "close", "hold", "scale_in"))
+    widened = parse_advice('x\n{"action":"scale_in","summary":"s"}')
+    assert widened.action == "scale_in", (
+        "parse_advice did not read ADVICE_ACTIONS; it still carries its own literal"
+    )
+
+
+def test_the_schema_and_the_parser_cannot_disagree_on_the_vocabulary() -> None:
+    """The schema enum and the parser's accepted set are the same object."""
+    import straightedge.llm as llm_mod
+
+    assert ADVICE_FORMAT["schema"]["properties"]["action"]["enum"] == list(
+        llm_mod.ADVICE_ACTIONS
+    )
