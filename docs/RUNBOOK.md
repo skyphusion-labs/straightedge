@@ -1170,7 +1170,7 @@ A pending fill writes `open` with `fill=true`.
 A vanished ticket writes `close` with `fill=true`.
 The venue holds the live book. It is not the fill log.
 
-JSONL, one event per line: `start`, `open`, `close`, `modify`, `reject`, `halt`, `order_check_fail`, `pending`, `recap`, `reconnect`, `loop_error`, `confirm_stage`, `confirm_cancel`, `confirm_sent`, `approve_always`, `approve_off`, `auto_on`, `auto_off`, `live_on`, `live_off`, `live_not_restored`, `risk_state_error`, `advice_turn`, `advice_circuit_block`, `advice_stage_failed`, `flatten`, `flatten_incomplete`, `close_failed`, `close_partial`, `cancel_failed`, `positions_read_failed`, `orders_read_failed`, `account_read_failed`, `send_unresolved`, `send_refused_unresolved`, `confirm_unresolved`, `inflight_unreadable`, `notify_truncated`, `stop`.
+JSONL, one event per line: `start`, `open`, `close`, `modify`, `reject`, `halt`, `order_check_fail`, `pending`, `recap`, `reconnect`, `loop_error`, `confirm_stage`, `confirm_cancel`, `confirm_sent`, `approve_always`, `approve_off`, `auto_on`, `auto_off`, `live_on`, `live_off`, `live_not_restored`, `risk_state_error`, `advice_turn`, `advice_circuit_block`, `advice_stage_failed`, `flatten`, `flatten_incomplete`, `close_failed`, `close_partial`, `cancel_failed`, `positions_read_failed`, `orders_read_failed`, `account_read_failed`, `send_unresolved`, `send_refused_unresolved`, `confirm_unresolved`, `inflight_unreadable`, `notify_truncated`, `venue_clock`, `stop`.
 `reject` is written by every gate that refuses, on every path, and it is the
 record to grep when the bot will not trade.
 It carries the NAMED `reason`, plus `source` (`auto`, `telegram`, or `advice`)
@@ -1204,6 +1204,28 @@ check never ran and the order was NOT sent. `not_measured` with `retcode=-1` is
 an IPC or bridge fault, not a trading decision; check the terminal link.
 Grep `reject` if it never trades.
 `outside_session` and `no_regime` are the usual reasons.
+`venue_clock` records WHICH CLOCK the desk was on, which no other row says.
+It is journal-only and never pings the chat. One row at `start()`, and one more
+whenever the offset CHANGES: a server-side DST roll or a reconnect that lands on
+a different server, both of which happen with nobody editing anything. An offset
+that has not moved writes nothing, so the file carries boundaries rather than a
+per-poll log.
+Fields: `offset_sec` when it is measured, or `unmeasured` naming what was not
+plus a `detail`; `implied_offset_sec` when the venue could only imply it, which
+is what `start()` sees because it has no previous poll to bound the sample with;
+`previous_offset_sec` and `previous_unmeasured` on a transition, so one row
+states what it moved FROM and a DST roll is legible without diffing two rows;
+`sampled`, `venue`, `symbol` and `measured_at`.
+Why it matters after the fact: before this the offset was measured, used to
+convert every bar, and discarded, so `journal.jsonl` could say the desk did not
+know what time it was and never that it thought it was UTC+3. Reconcile an order
+against the clock that converted its bar by reading the last `venue_clock` row
+before it.
+A WESTWARD move is recorded LATE, by about its own size, and that is the auto
+leg's advance gate rather than this record: bar stamps move back with the
+server, and `step_symbol` returns until they climb past their previous high. The
+row states what the desk measured when it next ACTED, which is the only instant
+it has evidence for.
 `venue_clock_unmeasured` means the venue could not state its UTC offset, so
 the auto leg cannot know WHEN it is and refuses every signal. The record
 carries `unmeasured` and `detail`, and `unmeasured` names which of three

@@ -19,6 +19,7 @@ from straightedge.inflight import InflightLedger, new_key, stamped_comment
 from straightedge.journal import Journal, redact_text
 from straightedge.llm import Advisor, advice_path_for
 from straightedge.models import (
+    VenueClock,
     Bar,
     FlattenReport,
     MarketOrder,
@@ -182,6 +183,11 @@ VENUE_CLOCK_BAR_DISAGREES = "venue_clock_bar_disagrees"
 #: else.
 VENUE_CLOCK_BAR_SLACK_SEC = 1
 
+#: No clock has been recorded yet. Distinct from every real state, because
+#: an unmeasured clock legitimately carries `offset_sec=None` and a tuple
+#: built from it must not collide with "nothing recorded".
+_CLOCK_UNRECORDED: tuple[Any, ...] = ("unrecorded",)
+
 
 class Engine:
     def __init__(
@@ -225,6 +231,20 @@ class Engine:
         #: instruments because it can be false is not a bound
         #: (straightedge#182 review).
         self._last_poll_mono: dict[str, float] = {}
+        #: The venue clock state this process has already RECORDED, as the
+        #: comparable part of it (offset, unmeasured fields, source). Set to
+        #: a sentinel rather than to None so the first reading is always a
+        #: change: `None` is a legitimate `offset_sec`, so an empty marker
+        #: that happened to match it would swallow the opening record.
+        #:
+        #: In memory on purpose (straightedge#186). A restart re-records at
+        #: `start()`, which is the boundary an operator reads anyway, so a
+        #: durable marker would guard nothing this does not already state.
+        #: Nothing about the daily-recap marker's reasoning transfers here
+        #: and it is not borrowed: that one had to survive a crash loop
+        #: because its subject was a day that could be lost; this one's
+        #: subject is re-measured on the next bar.
+        self._clock_recorded: tuple[Any, ...] = _CLOCK_UNRECORDED
         self.halted = False
         #: The `day_key` the daily recap has already been emitted for.
         #:
@@ -400,6 +420,24 @@ class Engine:
         # surface as step_symbol() returning on an empty bar list with no record
         # (engine.py:466-468) -- a symbol that never traded and never said why.
         self.history = self.warm_history()
+        # One venue-clock reading at the session boundary (straightedge#186),
+        # AFTER `warm_history`, because that is what selects the symbols: a
+        # tick for a symbol still absent from Market Watch is exactly the
+        # reading that fails, and the #172 history work exists because cold
+        # symbols are the normal startup state rather than the exception.
+        #
+        # `max_staleness_sec=None`: `start()` has no previous poll, so it cannot
+        # bound the sample, and a venue that SAMPLES answers with an implication
+        # that refuses conversion. That is the honest opening record and it is
+        # the same thing `doctor --connect` prints.
+        #
+        # NEVER FATAL. It is an observation, so it must not add a way for the
+        # desk to fail to start: the MT4 adapter raises when the Expert answers
+        # an error, and before this line nothing in `start()` asked the venue
+        # for a tick. A failed reading is recorded as unmeasured with the error
+        # as its detail, which is the same partition every other venue read in
+        # this file uses.
+        self._record_startup_venue_clock()
         self._seen_pos = {
             p.ticket for p in self.broker.positions(magic=self.cfg.risk.magic)
         }
@@ -1059,6 +1097,85 @@ class Engine:
             return
         self._act(symbol, bars, max_staleness_sec=None)
 
+    def _record_startup_venue_clock(self) -> None:
+        """Read and record the venue clock once at start. Never raises."""
+        symbol = self.cfg.symbols[0] if self.cfg.symbols else "EURUSD"
+        try:
+            clock = venue_clock_of(self.broker, symbol, max_staleness_sec=None)
+        except (RuntimeError, OSError, ValueError) as exc:
+            clock = VenueClock.not_measured(
+                "server_time",
+                source=type(self.broker).__name__,
+                detail=(
+                    "the venue could not be read at start: "
+                    + redact_text(str(exc))[:_FAULT_CHARS]
+                ),
+            )
+        self._record_venue_clock(clock, symbol)
+
+    def _record_venue_clock(self, clock: VenueClock, symbol: str) -> None:
+        """Journal the venue clock when it CHANGES, and once at start.
+
+        straightedge#186. #172 journals the FAILURE and nothing on success, so
+        the record can say the desk did not know what time it was and can never
+        say it thought it was UTC+3. The offset is measured, used to convert
+        every bar, and then discarded; the only way to learn it was
+        `doctor --connect` at the moment you asked, which answers for NOW and
+        says nothing about the instant an order was placed. #37's evidence
+        package has to answer that from the journal alone.
+
+        WHAT COUNTS AS A CHANGE, and the two it must catch are the two that
+        happen without anybody editing anything: a server-side DST roll
+        (+10800 to +7200) and a reconnect that lands on a different server
+        (+10800 to 0). The comparable state is the offset, the unmeasured field
+        names, and the source. `detail` and `measured_at` are deliberately NOT
+        in it: `detail` carries a raw figure that moves every sample and
+        `measured_at` moves by construction, so including either would make
+        every poll a change and the record would be noise instead of a
+        boundary. Both are still WRITTEN on the row.
+
+        JOURNAL ONLY, never a chat ping: `_format_event` returns empty for it.
+        An offset that has not moved is not news, and the one an operator needs
+        at 03:00 is in the file next to the orders it converted.
+
+        It cannot alter a gate. It is called after the decision that uses the
+        clock, takes no branch on its own result, and writes one row.
+        """
+        state = (
+            clock.offset_sec,
+            tuple(sorted(clock.unmeasured)),
+            clock.source,
+        )
+        if state == self._clock_recorded:
+            return
+        previous = self._clock_recorded
+        self._clock_recorded = state
+        fields: dict[str, Any] = {
+            "symbol": symbol,
+            "venue": clock.source,
+            "sampled": bool(clock.sampled),
+        }
+        if clock.offset_sec is not None:
+            fields["offset_sec"] = int(clock.offset_sec)
+        if clock.unmeasured:
+            fields["unmeasured"] = sorted(clock.unmeasured)
+        if clock.detail:
+            fields["detail"] = clock.detail
+        if clock.implied_offset_sec is not None:
+            fields["implied_offset_sec"] = int(clock.implied_offset_sec)
+        if clock.measured_at:
+            fields["measured_at"] = int(clock.measured_at)
+        if previous is not _CLOCK_UNRECORDED:
+            # What it moved FROM, so one row states the transition and a reader
+            # does not have to diff two of them. A DST roll is only legible as
+            # a pair of numbers.
+            fields["previous_offset_sec"] = previous[0]
+            if previous[1]:
+                fields["previous_unmeasured"] = list(previous[1])
+        else:
+            fields["first_reading"] = True
+        self._emit("venue_clock", **fields)
+
     def _bar_instant(
         self, symbol: str, bars: list[Bar], max_staleness_sec: float | None
     ) -> datetime | None:
@@ -1097,6 +1214,10 @@ class Engine:
         clock = venue_clock_of(
             self.broker, symbol, max_staleness_sec=max_staleness_sec
         )
+        # Recorded BEFORE the refusal below returns, so a clock that goes
+        # unmeasured is in the record as a state change and not only as a
+        # stream of per-bar refusals (straightedge#186).
+        self._record_venue_clock(clock, symbol)
         if not clock.measured:
             # journal.write, never _emit: a refusal is not broadcast to chat.
             # source and stage are what let one reject event name every path
@@ -2500,6 +2621,13 @@ def _format_event(event: str, fields: dict[str, Any]) -> str:
             f"RECAP {fields.get('day')} equity={fields.get('equity')} "
             f"day_start={fields.get('day_start')} pnl={sign}{pnl}"
         )
+    if event == "venue_clock":
+        # Journal-only. An offset that has not moved is not news, and the one an
+        # operator needs at 03:00 is in the file beside the orders it converted
+        # (straightedge#186). The LOUD clock events already exist: a refusal
+        # journals `venue_clock_unmeasured` and `doctor --connect` prints the
+        # reading on demand.
+        return ""
     if event == "history_preflight":
         # Journal-only. The all-clear is a denominator, not news.
         return ""
