@@ -52,7 +52,7 @@ def _engine(tmp_path, *, symbols=("EURUSD", "GBPUSD", "AUDUSD"), llm=None) -> En
     cfg.symbols = list(symbols)
     broker = PaperBroker(balance=10_000)
     seed = 3
-    for name in ("EURUSD", "GBPUSD", "AUDUSD", "EURJPY", "EURGBP", "US30"):
+    for name in ("EURUSD", "GBPUSD", "AUDUSD", "EURJPY", "EURGBP", "DOGEUSD", "US30"):
         broker.seed_bars(name, generate_bars(120, drift=0.0004, vol=0.0002, seed=seed))
         seed += 1
     advisor = None
@@ -296,4 +296,30 @@ def test_a_resting_order_counts_in_the_reported_exposure(tmp_path) -> None:
     assert net == currency_exposure(_committed(engine))
     assert net["EUR"] == 2, "the resting order's EUR leg is committed exposure"
     assert net["GBP"] == -1
+    engine.stop()
+
+
+def test_a_non_three_letter_code_is_netted_the_way_the_gate_nets_it(tmp_path) -> None:
+    """The discriminating case for "do not write a second aggregation".
+
+    Every other book in this file is built from 3+3 symbols, where a naive
+    `symbol[:3]` / `symbol[3:6]` split agrees with `risk.currency_exposure` by
+    accident. It was measured doing exactly that: an un-fix that replaced the
+    shared function with a 3-and-3 split passed this whole suite until this
+    test existed, which made the suite decoration on the one defect it was
+    written to catch.
+
+    DOGEUSD resolves through the code table to DOGE/USD (#98, commit ca20809
+    made the mt4 adapter stop guessing the same way). A split reads DOG/EUS,
+    so the two implementations cannot both be right here.
+    """
+    engine = _engine(tmp_path, symbols=("DOGEUSD",))
+    engine.start()
+    assert _open(engine, "/buy DOGEUSD", 1).startswith("sent buy")
+
+    expected = currency_exposure(_committed(engine))
+    assert expected == {"DOGE": 1, "USD": -1}, expected
+
+    _cap, net, _room = _parse(engine.exposure_text())
+    assert net == expected, f"reported {net}, gate computes {expected}"
     engine.stop()
