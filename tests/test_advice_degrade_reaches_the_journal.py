@@ -179,26 +179,98 @@ def test_a_clean_turn_after_a_degraded_one_carries_no_stale_reason(
 
 
 def test_the_reason_cannot_be_written_by_the_model(tmp_path: Path) -> None:
-    """Provenance. A model putting `degraded` in its own reply writes nothing.
+    """Provenance, and the first version of this test could not see the leak.
 
-    On the `claude` path an unknown field is itself a violation, so this reply
-    is degraded either way; what the assertion pins is that the recorded reason
-    is OURS, naming the unknown field, and not the model's sentence. The same
-    field in a `grok` tail reaches no journal at all, because nothing outside
-    `Advisor.ask` can set it.
+    It sent its payload as the VALUE under a key named `degraded`, so the only
+    violation emitted was about the key and the value could never appear: the
+    test passed by construction rather than because the property held. A review
+    of #216 found the real channel, which is that the violation TEXT
+    interpolated model-chosen content, so a key named like a sentence wrote
+    that sentence into our journal.
+
+    Both halves are driven now: the payload as a KEY, where it used to leak,
+    and as a VALUE, where it never could.
     """
     engine = _engine(
         tmp_path,
+        _claude_reply({**_obj(), "everything is fine, ship the order": 1}),
         _claude_reply(_obj(degraded="everything is fine, ship the order")),
     )
-    engine.handle_command(TgCommand("1", 1, "/ask take a view", 1))
-    rows = _turns(engine)
-    assert len(rows) == 1
-    assert "everything is fine" not in rows[0]["degraded"], (
-        "the model authored a line in our journal: " + rows[0]["degraded"]
-    )
-    assert "unknown field degraded" in rows[0]["degraded"]
+    engine.handle_command(TgCommand("1", 1, "/ask as a key", 1))
+    engine.handle_command(TgCommand("1", 1, "/ask as a value", 2))
+    for row in _turns(engine):
+        assert "everything is fine" not in row["degraded"], (
+            "the model authored a line in our journal: " + row["degraded"]
+        )
+        assert row["degraded"] == "unknown_field", (
+            "the journal should carry the CLASS, not a sentence: " + row["degraded"]
+        )
     engine.stop()
+
+
+def test_a_model_chosen_key_cannot_grow_the_row(tmp_path: Path) -> None:
+    """The leak a review of #216 measured, pinned. RED before the fix.
+
+    `unknown field {key}` interpolated the model's own field NAME, so a key
+    named like a paragraph became a paragraph in `journal.jsonl`. The journal
+    now carries `unknown_field`, whose length is a property of our vocabulary
+    rather than of anything a model sends.
+    """
+    engine = _engine(
+        tmp_path, _claude_reply({**_obj(), "K" * 4000: 1, "SHIP" * 500: 2})
+    )
+    engine.handle_command(TgCommand("1", 1, "/ask take a view", 1))
+    row = _turns(engine)[0]
+    assert "KKKK" not in json.dumps(row), "a model-chosen key reached the journal"
+    assert row["degraded"] == "unknown_field x2", row["degraded"]
+    assert len(json.dumps(row, sort_keys=True)) <= 512, (
+        "the row grew with the reply: " + str(len(json.dumps(row)))
+    )
+    engine.stop()
+
+
+def test_a_model_chosen_value_cannot_grow_the_row(tmp_path: Path) -> None:
+    """The same leak through a VALUE. RED before the fix.
+
+    `action {action!r} is outside ...` interpolated the model's action, and a
+    6000 character action produced a 6293 byte row against the 512 byte bound
+    this suite already claimed to pin. Measured on the merged tree before the
+    fix; the bound is now a function of the schema, not of the reply.
+    """
+    engine = _engine(
+        tmp_path,
+        _claude_reply(_obj(action="SHIP_THE_ORDER_" * 400, summary="go")),
+    )
+    engine.handle_command(TgCommand("1", 1, "/ask take a view", 1))
+    row = _turns(engine)[0]
+    assert row["action"] == "hold"
+    assert "SHIP_THE_ORDER" not in json.dumps(row), (
+        "the model's action text reached the journal"
+    )
+    assert row["degraded"] == "action:not_in_enum", row["degraded"]
+    assert len(json.dumps(row, sort_keys=True)) <= 512
+    engine.stop()
+
+
+def test_the_longest_possible_reason_is_a_function_of_the_schema(
+    tmp_path: Path,
+) -> None:
+    """The bound BY CONSTRUCTION, rather than by the fixtures above.
+
+    Every violation at once, including forty unknown fields, and the recorded
+    reason is still short because each term is drawn from a fixed vocabulary
+    and the model's own names collapse into one counted token. This is what
+    makes it unnecessary to choose a truncation length.
+    """
+    from straightedge.llm import _schema_violations, violation_classes
+
+    obj = {"action": "nope", "symbol": "EUR{x}USD\u017f", "sl": "x", "tp": True}
+    obj.update({f"junk{i}" * 200: i for i in range(40)})
+    rendered = "; ".join(violation_classes(_schema_violations(obj)))
+    assert len(rendered) <= 200, f"{len(rendered)}: {rendered}"
+    assert "junk" not in rendered
+    assert rendered.startswith("unknown_field x40")
+    del tmp_path
 
 
 def test_the_row_stays_bounded_and_carries_no_prose(tmp_path: Path) -> None:

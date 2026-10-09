@@ -202,6 +202,37 @@ nothing degraded. **Always present, never omitted**, because a field that
 appears only on failure cannot be told from a desk too old to emit it, which is
 the partition `survivor_ticket` and `history_error` exist for.
 
+**The reason is a CLASS, not a sentence, and that took a second pass.** The
+first version interpolated the reply's own content into the violation text,
+which was right for the chat and wrong for the record: a review measured a key
+named like a sentence writing that sentence into `journal.jsonl`, and a 6000
+character `action` producing a 6053 character reason and a **6293 byte row
+against the 512 byte bound this suite already pinned**. So a model could author
+unbounded text in our journal through the one field added to make the journal
+trustworthy.
+
+`_schema_violations` now returns `(field, class)` pairs from a fixed vocabulary,
+with two renderings over one producer. `violation_prose` keeps the operator
+sentence #181 added and may echo a value, because the chat already shows the
+model's own prose; `violation_classes` renders `field:class` for the journal and
+collapses the model's own field NAMES into one counted token, so the longest
+possible reason is a function of `ADVICE_PROPERTIES` and not of anything a model
+sends. Truncating the interpolated string would also have worked and would have
+left a judgement about "small enough" in the code; this leaves none. #181's
+twenty cases are green throughout, which is what shows the chat contract did not
+move.
+
+**And both tests written to guard that threat could not observe it**, which is
+the finding worth more than the fix. `test_the_reason_cannot_be_written_by_the_model`
+sent its payload as the VALUE under a key named `degraded`, so the only
+violation emitted was about the key and the value could never appear: it passed
+by construction. The bounded-row case varied `text` and `summary`, neither of
+which is echoed, so it could not see a 6KB row either. Both are rewritten to
+drive the channel that leaked, a model-chosen KEY and a model-chosen VALUE, and
+both red when the pre-fix rendering is restored. A fourth case asserts the bound
+by construction rather than by fixture: forty unknown fields plus every other
+violation at once renders under 200 characters.
+
 **The reason travels OUT OF BAND, and both alternatives were defects.** Parsing
 it back out of the prose is string-matching our own sentence, and the sentence
 is not a contract. Adding a key to the trailing JSON would be a field
