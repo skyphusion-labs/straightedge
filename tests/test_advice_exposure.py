@@ -323,3 +323,89 @@ def test_a_non_three_letter_code_is_netted_the_way_the_gate_nets_it(tmp_path) ->
     _cap, net, _room = _parse(engine.exposure_text())
     assert net == expected, f"reported {net}, gate computes {expected}"
     engine.stop()
+
+
+# The three tests below exist because of a FIXTURE DISCRIMINATION AUDIT, run
+# after the DOGEUSD lesson generalised: for each plausible wrong
+# implementation, can these fixtures tell it apart from the right one? Four
+# mutations passed the whole suite, and each one is pinned here. They were all
+# the same mistake, which is worth naming once: every assertion was a PRESENCE
+# or a SHAPE check, and every fixture used the same default config value, so a
+# constant agreed with all of them.
+
+
+def test_a_non_default_cap_is_read_from_config_not_assumed(tmp_path) -> None:
+    """Measured: `cap = 2` hardcoded in exposure_text passed all 75 tests.
+
+    Every other fixture here runs at `max_currency_exposure = 2`, the default,
+    so no assertion could tell a config read from a literal. USD is the
+    discriminating code: at cap 3 with net -2 the room is 1, where a hardcoded
+    cap gives 0, `abs(net)` gives 2 and `cap - net` gives 5. All four answers
+    differ, which is the property the fixture has to have.
+    """
+    engine = _engine(tmp_path)
+    engine.cfg.risk.max_currency_exposure = 3
+    engine.start()
+    _plant_two_usd_shorts(engine)
+
+    cap, net, room = _parse(engine.exposure_text())
+    assert cap == 3, "the cap is configuration, not a constant"
+    assert net["USD"] == -2
+    assert room["USD"] == 1
+    assert room["EUR"] == 2
+    engine.stop()
+
+
+def test_a_readable_all_fx_book_declares_no_warning_lines(tmp_path) -> None:
+    """Negative control for both conditional lines.
+
+    Measured: printing `INCOMPLETE` unconditionally passed all 75 tests, and so
+    did printing `excluded_from_currency_limit=US30` unconditionally, because
+    every assertion on them was a presence check and nothing asserted their
+    ABSENCE. A warning that is always on carries no information: it would tell
+    the model the aggregate is unreliable, and that part of the book is
+    uncovered, on every healthy book it ever sees.
+    """
+    engine = _engine(tmp_path)
+    engine.start()
+    _plant_two_usd_shorts(engine)
+
+    text = engine.exposure_text()
+    assert "INCOMPLETE" not in text, text
+    assert "excluded_from_currency_limit" not in text, text
+    engine.stop()
+
+
+def test_risk_text_room_is_the_remaining_budget_not_a_constant(tmp_path) -> None:
+    """Measured: `room=0.00` hardcoded in risk_text passed all 75 tests.
+
+    `test_risk_text_states_the_room_the_prompt_promises` asserts the SHAPE with
+    a regex, which a constant satisfies. This asserts the VALUE against the
+    engine's own snapshot arithmetic, on a book that has moved equity off
+    `day_start` so that zero is the wrong answer.
+    """
+    engine = _engine(tmp_path)
+    engine.start()
+    _plant_two_usd_shorts(engine)
+
+    text = engine.risk_text()
+    # risk_text calls observe() itself, so read the snapshot it left behind
+    # rather than a second one computed from a different account read.
+    acct = engine.broker.account()
+    snap = engine.risk.snapshot
+    r = engine.cfg.risk
+    daily_loss = snap.day_start_equity - acct.equity
+    daily_cap = snap.day_start_equity * r.daily_loss_pct
+    dd = snap.peak_equity - acct.equity
+    dd_cap = snap.peak_equity * r.max_drawdown_pct
+
+    assert daily_loss > 0, "the fixture must move equity, or zero would be right"
+    assert (
+        f"daily_loss={daily_loss:.2f}/{daily_cap:.2f} "
+        f"room={max(daily_cap - daily_loss, 0.0):.2f}"
+    ) in text, text
+    assert (
+        f"drawdown={dd:.2f}/{dd_cap:.2f} room={max(dd_cap - dd, 0.0):.2f}"
+    ) in text, text
+    assert "room=0.00" not in text, "a constant zero satisfies a shape-only assertion"
+    engine.stop()
