@@ -31,6 +31,46 @@ type AskBody = {
   history?: unknown;
 };
 
+/**
+ * The tool set the model is given. Exported so a test can ENUMERATE it.
+ *
+ * It is a named function rather than an inline call because of
+ * straightedge#191: `GHSA-hp3w-g68c-fv3c` (sprintf-js, no patched version)
+ * reaches this Worker's dependency tree through
+ * `@cloudflare/computer -> just-bash -> sprintf-js`, and `just-bash` is the
+ * shell behind the `exec` tool. The alert is dismissed as UNREACHABLE on the
+ * ground that this Workspace registers no exec backend, so `createAITools`
+ * returns no `exec` tool and nothing here can invoke a shell.
+ *
+ * That is a claim about THIS call, and a claim nobody can check later is how a
+ * dismissal rots. `agent/test/tools.test.ts` enumerates what this returns and
+ * fails if a shell tool ever appears, which is exactly the moment the dismissal
+ * stops being true.
+ *
+ * WHAT WOULD DO IT, corrected: passing a `shell` option to `createAITools`
+ * below. `exec` is gated on that option ALONE, and the installed source is
+ * explicit: `execOptions` reads `if (options.shell === void 0) return void 0;`
+ * and the type says "Omit for no exec tool". Measured: this same Workspace,
+ * which registers no backends at all, yields `exec` as soon as `shell` is
+ * passed.
+ *
+ * A model-reachable shell needs BOTH halves, and they are checked by different
+ * instruments. `shell` here exposes the TOOL, which `tools.test.ts` sees. A
+ * registered exec backend puts just-bash's CODE in the bundle, which the
+ * `wrangler deploy --dry-run` grep in `agent/README.md` sees. `backends` on the
+ * `Workspace` constructor is the second half only: on its own it adds no tool
+ * and is not model-reachable, so it deliberately does NOT red the test.
+ */
+export function deskTools(workspace: Workspace) {
+  return createAITools({
+    workspace,
+    // Declared in log-retention.ts, not here: the retention bound is
+    // DERIVED from these two, so a second literal could drift and silently
+    // stop the log fitting in one read (straightedge#131).
+    read: { maxBytes: LOG_READ_MAX_BYTES, maxLines: LOG_READ_MAX_LINES },
+  });
+}
+
 export class DeskAgent extends DurableObject<Env> {
   readonly workspace: Workspace;
 
@@ -104,13 +144,7 @@ export class DeskAgent extends DurableObject<Env> {
       },
     });
     const model = openai.chat(modelId || this.env.ADVICE_MODEL || "xai/grok-4.6");
-    const tools = createAITools({
-      workspace: this.workspace,
-      // Declared in log-retention.ts, not here: the retention bound is
-      // DERIVED from these two, so a second literal could drift and silently
-      // stop the log fitting in one read (straightedge#131).
-      read: { maxBytes: LOG_READ_MAX_BYTES, maxLines: LOG_READ_MAX_LINES },
-    });
+    const tools = deskTools(this.workspace);
     const result = await generateText({
       model,
       system: SYSTEM,
