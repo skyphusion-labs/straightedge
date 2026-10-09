@@ -1232,7 +1232,18 @@ class Engine:
             # What it moved FROM, so one row states the transition and a reader
             # does not have to diff two of them. A DST roll is only legible as
             # a pair of numbers.
-            fields["previous_offset_sec"] = previous[0]
+            #
+            # OMITTED rather than null when there was no previous offset
+            # (#225), so the whole row obeys one rule: a key present means a
+            # measured value. `offset_sec` was already omitted that way, and a
+            # field that can be absent OR null has two absent states that
+            # nothing distinguishes, which is #206's version-skew shape. A
+            # parser reaches for `in` on one convention and `is not None` on
+            # the other, and the second misreads a row written without the
+            # key. `previous_unmeasured` below already says what the previous
+            # state was, so nothing is lost by leaving the number out.
+            if previous[0] is not None:
+                fields["previous_offset_sec"] = int(previous[0])
             if previous[1]:
                 fields["previous_unmeasured"] = list(previous[1])
         else:
