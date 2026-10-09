@@ -103,6 +103,62 @@ depends on ships a workerd older than this Worker's `compatibility_date`. Withou
 the override the runtime refuses to start. Raise the override, do not lower the
 compatibility date: the suite has to run the runtime that ships.
 
+## Dependency advisories with no patched version
+
+`GHSA-hp3w-g68c-fv3c` (sprintf-js, denial of service, medium) is **dismissed as
+not present in the deployed Worker**, straightedge#191. Recorded here because a
+dismissal with no reasoning behind it is the same defect as a check that cannot
+fail, and because the alert will come back if anyone re-enables it.
+
+**A bump cannot fix it. The first patched version is `null`,** so `npm update`, a
+Dependabot PR and an `overrides` pin all have nothing to point at. The
+`overrides` block above is not applicable.
+
+It enters the graph here (`npm ls sprintf-js --all`):
+
+```
+mt5-risk-agent -> @cloudflare/computer@0.4.0 -> just-bash@3.4.2 -> sprintf-js@1.1.3
+```
+
+`just-bash` is the shell behind `@cloudflare/computer`'s `exec` tool, and sprintf
+is reached from that shell's `printf` builtin and from `awk`'s `sprintf`
+function. Three measurements, in increasing order of how much they settle:
+
+1. **The amplifier is WIDTH, not precision.** `%.101f` throws `RangeError`
+   because V8 caps `toFixed` at 100 digits; `%100000000d` returns a 100 MB
+   string instantly, because sprintf-js pads with `pad_char.repeat(width - len)`.
+   So the advisory's own wording does not describe the reachable amplifier in
+   this engine, and anyone re-checking it with a precision specifier will
+   wrongly conclude there is nothing there.
+2. **`just-bash` bounds it before sprintf sees it.** Width and precision are both
+   validated against a 67108864-byte ceiling at format-spec PARSE time, and the
+   shell answers `bash: format width limit exceeded (67108864 bytes)`. That holds
+   on the specs its own fast path handles AND on the ones that fall through to
+   raw sprintf (`%+Ns`, `%Nj`, `%Nv`, `%NT`, `%Nb`), all checked.
+3. **None of it is in the deployed artifact.** `npx wrangler deploy --dry-run
+   --outdir <dir>` produces the 2.1 MB bundle wrangler would upload, and
+   `sprintf`, `vsprintf` and sprintf-js's own internal `not_primitive` and
+   `numeric_arg` keys appear **zero** times in it. The same grep finds `sprintf`
+   5 times in `node_modules/just-bash/dist/bundle/index.cjs`, and finds
+   `createAITools`, `Workspace` and `generateText` in the bundle, so the
+   instrument can produce a positive. esbuild drops `just-bash` because nothing
+   imports an exec backend.
+
+**The vantage: no vantage reaches it, and that does not rest on
+authentication.** `/ask` does require `Bearer ADVICE_TOKEN`, but the dismissal
+does not depend on that. `deskTools()` in `src/desk-agent.ts` builds the model's
+tool set from a `Workspace` constructed with `storage` only and no `backends`,
+so `createAITools` returns `delete, edit, find, grep, ls, read, write` and no
+shell. The capability is ABSENT rather than guarded, so an authenticated caller,
+the model itself, and a stranger all reach the same place: there is nothing to
+call.
+
+**What would invalidate this:** passing `backends` to the `Workspace`
+constructor. `test/tools.test.ts` enumerates the tool set and fails the moment a
+shell appears, so the dismissal is re-checked on every push rather than trusted.
+It asserts an allow-list, not the absence of the name `exec`, because a tool
+called `shell` or `run` would reach `just-bash` just as well.
+
 ## Secrets (never in git)
 
 Agent secrets: `CF_AIG_TOKEN`, `ADVICE_TOKEN`.
