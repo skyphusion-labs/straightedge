@@ -318,13 +318,22 @@ states a command, run the command; when it states a count, reproduce the count.
 **But measure whether your documents contain anything a script may safely run,
 before trusting a script to check them.** And **state what you counted over**:
 a count without its domain is not a measurement, which is the
-lines-versus-occurrences trap one level up. Both domains, same regex, measured
-on `main`:
+lines-versus-occurrences trap one level up. Both domains, counted with the same
+regex the script below uses, over the files each `git ls-files` names, on this
+branch:
 
-| domain | files | with fenced blocks | blocks |
-| --- | --- | --- | --- |
-| `docs/*.md` plus `README.md` | 11 | 6 | 41 |
-| `**/*.md` across the repo | 19 | 12 | 56 |
+| domain | command naming the domain | files | with fenced blocks | blocks |
+| --- | --- | --- | --- | --- |
+| `docs/*.md` plus `README.md` | `git ls-files 'docs/*.md' README.md` | 11 | 6 | 40 |
+| `**/*.md` across the repo | `git ls-files '*.md'` | 18 | 12 | 56 |
+
+**Both rows count THIS file, so both move when it does**, which is the same
+self-inclusion the controls table below hit, one domain wider. The row that
+used to sit here read 41 and 19 and was labelled as measured on `main`; it was
+measured on a working tree instead, and re-run on `main` the two commands give
+11 / 5 / 38 and 18 / 11 / 54, so the label matched neither tree. A count in
+this domain is trustworthy only re-derived, which is why the commands are in
+the table and the tree is named.
 
 In both, the command-shaped lines inside fences are `python -m straightedge run`
 and its siblings (`backtest`, `watch`, `supervision`), which start or drive a
@@ -429,6 +438,16 @@ a reviewer running the shipped script against the shipped file. It is now a
 markdown table, which both renders better and keeps the row describing the file
 rather than describing itself; if you add a fence here, re-run and update the
 row.
+
+**The 2 are the `git diff` example far above and the script just above, and
+that is the whole population**, so the only thing that can move the number is a fence added
+to or removed from this file. Name the method as well, because this file is a
+case where both obvious ones lie: `grep -c` on the fence marker reports 5,
+since it counts matching LINES and one line carries two markers; `grep -o` of
+the same marker piped to `wc -l` reports 6, since it counts OCCURRENCES and two
+of them are a string literal inside the script rather than a fence. The script
+counts PAIRS anchored at line start, which is the right domain for a fenced
+BLOCK and the only one of the three that returns 2.
 
 The last row is the one most easily skipped: **a check that cannot return 0 is a
 gate that can never pass**, which is as useless as one that can never fail, and
