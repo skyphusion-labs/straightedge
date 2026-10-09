@@ -346,6 +346,18 @@ def test_a_braced_symbol_is_held_and_never_repaired() -> None:
     assert advice.symbol is None
     assert "contains a brace" in advice.text
     assert "EUR{USD}" in advice.text, "the reason must quote what the model actually said"
+    # THE VIOLATING PATH MUST BE LEGIBLE TOO (strummer's fifth mutation on #181).
+    # That PR pinned "the operator must not be shown raw JSON" for the VALID
+    # path only, and the violating path is where a legible reply matters most:
+    # it is the one where the operator has to decide what the desk could not
+    # read. Measured: dropping `tail["symbol"] = None` survived all 1238 tests,
+    # because without it the braced symbol stays in the tail, `_JSON_TAIL`
+    # cannot match an object with a brace inside a string, and `parse_advice`
+    # falls back to treating the WHOLE reply as prose. Action and reason stay
+    # correct, so it is not a safety gap; the operator just gets the raw object
+    # stapled to the text and an empty summary.
+    assert '"action"' not in advice.text, "the operator must not be shown raw JSON"
+    assert advice.summary, "the summary must survive the violation, not come back empty"
 
 
 def test_a_braced_symbol_is_not_more_permissive_than_the_bare_parser() -> None:
