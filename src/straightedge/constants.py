@@ -354,3 +354,30 @@ MAILBOX_SEND_OPS = frozenset(
         "close_by",
     }
 )
+
+
+# --- venue clock measurement (straightedge#172) -----------------------------
+
+#: Real broker server offsets from UTC sit on a QUARTER HOUR grid. A measured
+#: sample is snapped to this grid, and a sample that does not land on one is
+#: not a measurement at all.
+VENUE_CLOCK_GRID_SEC = 900
+#: How far off a grid point a sample may land and still be the measurement.
+#:
+#: The sample is paired with the venue's own `TimeCurrent()` / tick time, which
+#: is the time of the LAST TICK rather than of now, so the raw difference is
+#: the offset minus however stale that tick is. Inside a trading session that
+#: staleness is seconds; over a market close the venue clock FREEZES and the
+#: raw difference grows without bound, which is exactly the case that must not
+#: be rounded to a plausible answer.
+#:
+#: Twice this is 360s, well inside `VENUE_CLOCK_GRID_SEC`, so no sample can be
+#: within tolerance of two grid points and the snap is unambiguous.
+VENUE_CLOCK_TOLERANCE_SEC = 180
+#: The band a REAL venue offset can sit in: the civil timezone range, UTC-12
+#: to UTC+14. A snapped sample outside it is not a timezone, it is a frozen or
+#: wildly stale venue clock, and the weekend case lands here: a server clock
+#: that stopped at Friday's close is tens of hours out by Saturday, which is a
+#: round number of grid steps and would otherwise pass the grid check cleanly.
+VENUE_CLOCK_MIN_OFFSET_SEC = -12 * 3600
+VENUE_CLOCK_MAX_OFFSET_SEC = 14 * 3600

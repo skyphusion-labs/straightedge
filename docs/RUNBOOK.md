@@ -1204,6 +1204,14 @@ check never ran and the order was NOT sent. `not_measured` with `retcode=-1` is
 an IPC or bridge fault, not a trading decision; check the terminal link.
 Grep `reject` if it never trades.
 `outside_session` and `no_regime` are the usual reasons.
+`venue_clock_unmeasured` means the venue could not state its UTC offset, so
+the auto leg cannot know WHEN it is and refuses every signal. The record
+carries `unmeasured` and `detail`. Run `doctor --connect`: it prints the
+measured offset, or the same refusal with its cause. On MT4 the usual cause
+is an Expert that does not stamp its tick reply with `TimeCurrent()`;
+recompile and reattach `mt4/Experts/Mt4RiskBot.mq4`. Manual `/buy` and
+`/sell` still work while this holds, because they time themselves off the
+bot's clock and never off a bar.
 `reconnect` is a dropped venue link, then a fresh connect.
 It is written on MT4 and on MT5.
 On MT4 it is a mailbox round trip that got no reply.

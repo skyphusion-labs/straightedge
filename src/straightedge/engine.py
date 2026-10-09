@@ -8,7 +8,7 @@ import time
 from datetime import datetime, timezone
 from typing import Any
 
-from straightedge.broker.base import Broker
+from straightedge.broker.base import Broker, venue_clock_of
 from straightedge.config import BotConfig
 from straightedge.constants import MT4_SEND_TIMEOUT_UNKNOWN
 from straightedge.desk import Desk
@@ -128,6 +128,16 @@ def _loss_distance(pos: Position, sl: float) -> float:
 #: so it refuses instead. Same partition as `OrderResult.measured`: PASSED,
 #: REFUSED, COULD NOT MEASURE.
 ORDERS_UNMEASURED = "orders_unmeasured"
+
+#: The venue could not state its UTC offset, so WHEN it is cannot be measured.
+#:
+#: Same partition as `ORDERS_UNMEASURED` one line up, applied to the clock
+#: instead of the book: PASSED, REFUSED, COULD NOT MEASURE. A bar's `time`
+#: is the broker server's wall clock, every gate below the auto leg is
+#: written in UTC, and the offset between the two is a measurement. When it
+#: is missing the leg refuses, because the alternative is to assume UTC, and
+#: assuming UTC IS straightedge#172.
+VENUE_CLOCK_UNMEASURED = "venue_clock_unmeasured"
 
 
 class Engine:
@@ -971,8 +981,61 @@ class Engine:
             return
         self._act(symbol, bars)
 
+    def _bar_instant(self, symbol: str, bars: list[Bar]) -> datetime | None:
+        """The real UTC instant the auto leg is acting at, or None to refuse.
+
+        THE one seam where a venue timestamp becomes a wall-clock instant.
+        Everything below this line is written in UTC: `in_session`, the
+        `day_key` the daily-loss budget is keyed on, `weekday()` for the
+        weekend block and the Friday cutoff.
+
+        What straightedge#172 was. This line read
+
+            datetime.fromtimestamp(bars[-1].time, tz=timezone.utc)
+
+        and a bar's `time` is the BROKER SERVER's wall clock (docs/VENUE.md),
+        so `tz=timezone.utc` RELABELLED the instant instead of converting it.
+        On the live UTC+3 desk that moved the configured 07:00-17:00 window to
+        04:00-14:00, gave the auto leg a different day boundary from the desk
+        and the recap (both of which use `now_fn`), and let a `daily_loss`
+        halt clear up to the broker offset EARLY, because `observe()` releases
+        it on the day-key change and the broker day crosses midnight first.
+
+        The offset is MEASURED off the venue and is never configured or
+        guessed; see `VenueClock`. When the venue cannot state it, this leg
+        REFUSES and journals why. It does not fall back to UTC: a fallback
+        here is the defect with a comment on it, and the standing rule from
+        straightedge#68 is that an unmeasured spec refuses rather than
+        defaults. Direction of harm is a missed auto entry.
+
+        `bars` empty keeps the desk clock, unchanged: there is no venue
+        timestamp in play, so there is nothing to convert and nothing to
+        refuse.
+        """
+        if not bars:
+            return self.now_fn()
+        clock = venue_clock_of(self.broker, symbol)
+        if not clock.measured:
+            # journal.write, never _emit: a refusal is not broadcast to chat.
+            # source and stage are what let one reject event name every path
+            # apart, exactly as the ORDERS_UNMEASURED refusal below does.
+            self.journal.write(
+                "reject",
+                source="auto",
+                stage="signal",
+                symbol=symbol,
+                reason=VENUE_CLOCK_UNMEASURED,
+                unmeasured=sorted(clock.unmeasured),
+                venue=clock.source,
+                detail=clock.detail,
+            )
+            return None
+        return clock.to_utc(bars[-1].time)
+
     def _act(self, symbol: str, bars: list[Bar]) -> None:
-        now = datetime.fromtimestamp(bars[-1].time, tz=timezone.utc) if bars else self.now_fn()
+        now = self._bar_instant(symbol, bars)
+        if now is None:
+            return
         acct = self.broker.account()
         if self._apply_circuit(acct, now):
             return

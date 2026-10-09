@@ -47,6 +47,7 @@ from straightedge.models import (
     Side,
     SymbolSpec,
     Tick,
+    VenueClock,
     WorkingOrder,
 )
 from straightedge.sizing import ticks_between
@@ -128,6 +129,7 @@ class PaperBroker:
         specs: dict[str, SymbolSpec] | None = None,
         bars: dict[str, list[Bar]] | None = None,
         trade_allowed: bool = True,
+        utc_offset_sec: int = 0,
     ) -> None:
         self._balance = float(balance)
         self._leverage = leverage
@@ -140,6 +142,16 @@ class PaperBroker:
         self._trade_allowed = trade_allowed
         self._connected = False
         self._clock = 0
+        #: The UTC offset this SIMULATED venue stamps its bars with.
+        #:
+        #: Zero is a MEASUREMENT here and not a default, which is the whole
+        #: reason paper may answer at all: the paper venue has no server of
+        #: its own, its bars are stamped by whoever seeded them, and both
+        #: `synthetic.generate_bars` and `run_backtest` stamp in UTC. A test
+        #: that needs a venue three hours ahead sets this, which is how the
+        #: straightedge#172 regression drives the real conversion path
+        #: instead of a mock of it.
+        self.utc_offset_sec = int(utc_offset_sec)
 
     def seed_bars(self, symbol: str, bars: list[Bar]) -> None:
         self._bars[symbol.upper()] = list(bars)
@@ -173,6 +185,15 @@ class PaperBroker:
         half = (spec.spread * spec.point) / 2.0
         t = bar.time if bar else self._clock
         return Tick(time=t, bid=mid - half, ask=mid + half, last=mid)
+
+    def venue_clock(self, name: str) -> VenueClock:
+        """What this simulated venue stamps its bars with. See `utc_offset_sec`."""
+        del name
+        return VenueClock(
+            offset_sec=self.utc_offset_sec,
+            measured_at=self._clock,
+            source="paper",
+        )
 
     def rates(self, name: str, timeframe: str | int, count: int) -> list[Bar]:
         del timeframe

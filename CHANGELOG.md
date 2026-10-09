@@ -4,6 +4,118 @@ NOTE: Operator docs from 1.0.0 use 8th-grade Simplified Technical English.
 Do not treat older changelog wording as the operator contract.
 See README.md and docs/CONTRACT.md.
 
+## 1.7.0
+
+### One clock: a broker bar stamp is not UTC, and the offset is measured (issue #172)
+
+Found while pulling the #37 demo evidence off the live box, 2026-10-09, and
+measured there rather than theorised. `C:\bot-state\journal.jsonl` carried three
+auto refusals that could not be right:
+
+```
+2026-10-09T14:00:04Z reject source=auto stage=signal symbol=XAUUSD reason=outside_session
+2026-10-09T15:00:03Z reject source=auto stage=signal symbol=XAUUSD reason=outside_session
+2026-10-09T16:00:02Z reject source=auto stage=signal symbol=XAUUSD reason=outside_session
+```
+
+The live window is `start_utc = "07:00"` / `end_utc = "17:00"` and the box clock
+is UTC. 14:00 and 15:00 are squarely inside it. `in_session` was not the bug;
+the timestamp handed to it was.
+
+`engine.py` built the auto leg's instant as
+`datetime.fromtimestamp(bars[-1].time, tz=timezone.utc)`, and an MT4 bar time is
+BROKER SERVER time. `tz=timezone.utc` does not convert it, it RELABELS it. The
+desk is on a UTC+3 server, so every gate below that line ran three hours off.
+
+- **The session window silently moved by the broker offset.** 07:00-17:00 UTC
+  became 04:00-14:00 UTC, and nothing printed either number, so the operator
+  read the config and believed it. The #37 evidence week was collected through
+  a window nobody chose.
+- **One daily-loss budget had two day boundaries.** The auto path rolled
+  `day_key` on the BROKER day; the desk and the recap roll on the real UTC day.
+  Which boundary applied depended on whether a human or the regime fired.
+- **A `daily_loss` halt could release up to the broker offset EARLY.** The halt
+  clears on the day-key change and the broker day crosses midnight first, so a
+  gate whose whole job is to stop trading for the rest of the day handed the
+  budget back while it was still that day in the units the config is written in.
+  This is the sharp one.
+- **`weekday()` came from the same relabelled value**, so the Saturday/Sunday
+  block and the Friday cutoff landed on the wrong wall-clock instants. Near the
+  weekend edges that is a DAY-sized error: on a UTC+10 server, 22:00 UTC Sunday
+  stamps the bar Monday 08:00, which is a weekday inside the window, so the
+  weekend block did not fire during the illiquid Sunday open.
+
+**The offset is MEASURED off the venue and is never configured.** It is a
+per-server property that moves with the SERVER's DST, so a number in
+`config.toml` is a guess that outlives the first DST change after somebody wrote
+it: that is #68 (an instrument-blind constant that silently mis-sized gold) with
+a clock in place of a tick value, and the rule from #68 applies unchanged. A new
+`VenueClock` carries `SymbolSpec`'s exact partition, applied to a clock:
+`offset_sec` is `None` and `unmeasured` names the field when the measurement
+failed, `to_utc` RAISES rather than returning a plausible instant, and the type
+cannot be constructed half-measured at all. There is no "assume UTC" fallback,
+because zero is a perfectly ordinary offset and a defaulted zero cannot be told
+from a measured one.
+
+**No Expert change and no reattach.** `TickReply` has carried
+`time=TimeCurrent()` since the first version of the ICD, so
+`Mt4Broker.venue_clock` measures the offset from a reply the Expert already
+sends, pairing it with the desk's own clock read either side of the round trip.
+The fix reaches the live desk as a Python upgrade. An Expert that does not send
+`time` reads as NOT MEASURED and refuses, never as UTC.
+
+**The measurement refuses three ways, and the third was found by running it.**
+`TimeCurrent()` is the time of the LAST TICK, not of now, so a sample is snapped
+to a quarter-hour grid and accepted only within 180s of a grid point; a sample
+whose round trip is too wide to pair is rejected as a PAIRING failure. Neither
+check can see a market close: a venue clock frozen at Friday's close is tens of
+hours out by Saturday, and tens of hours is a whole number of grid steps, so it
+lands exactly on a grid point and reads as a measurement. A two-day-stale sample
+returning `offset_sec=-172800` with an empty `unmeasured` is what added the
+third check, the civil timezone band. What the instrument still cannot see is
+stated in `VenueClock.measure` rather than implied.
+
+**`day_key` is the UTC day, decided and written down** (`docs/CONTRACT.md`, "One
+clock"). It was accidentally both before, which is the actual defect. The
+operator's config is written in UTC, the desk and recap already rolled on it,
+and a broker day would key the money budget to something that moves without
+anyone editing anything.
+
+**MT5 was checked rather than assumed.** `copy_rates_from_pos` and
+`symbol_info_tick` return the trade server's clock with no API that states the
+offset, the adapter passed both through unconverted, and the engine seam is
+shared, so the MT5 path carried the identical defect and is fixed identically.
+Verified by reading the adapter and by a unit test against a fake binding; NOT
+verified against a live MT5 terminal, which this repo has never claimed for the
+MT5 path.
+
+**What an operator sees.** `doctor --connect` prints
+`venue clock: server UTC+03:00 measured (...)` and exits non-zero when it is NOT
+MEASURED, because an auto leg that cannot measure when it is refuses every
+signal, and that belongs before a run rather than during one. The auto refusal
+is journaled as `reject` with `reason=venue_clock_unmeasured` plus the
+`unmeasured` field and a `detail`; `docs/RUNBOOK.md` says what to do about it.
+Manual `/buy` and `/sell` are unaffected throughout: they time themselves off
+the bot's clock and never off a bar.
+
+**The test had to go red first, and 1222 green tests could not see this.** Every
+existing fixture seeds bars whose timestamps ARE UTC, so the suite agreed with
+the defect. `tests/test_bar_clock_is_not_utc.py` supplies the one input none of
+them had, a venue whose clock is not UTC, and asserts the session window, the
+day boundary, the halt release and the weekend block against the real UTC
+instant. All four fail on `main` and pass here.
+
+### Fix-forward, in the same change
+
+- **`broker/base.py` is no longer excluded from coverage.** It was omitted as
+  pure type declarations; it now holds `venue_clock_of`, the rule that turns a
+  venue with no clock into a refusal, and a safety rule in an omitted file is a
+  rule whose coverage cannot be measured.
+- **The venue fakes in `test_cli.py`, `test_login_not_leaked.py` and
+  `test_history_preflight.py` now state a clock.** Without it the doctor gate
+  went red for two reasons at once in the history test, which would have made
+  its red unattributable.
+
 ## 1.6.0
 
 ### A git deploy procedure, and a desk that can say what it is running (issue #147)

@@ -10,6 +10,7 @@ from __future__ import annotations
 import sys
 import threading
 import time
+from datetime import datetime, timezone
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, Callable
@@ -44,6 +45,7 @@ from straightedge.models import (
     Side,
     SymbolSpec,
     Tick,
+    VenueClock,
     WorkingOrder,
 )
 
@@ -286,6 +288,11 @@ def _survivor_ticket(d: dict[str, Any], ok: bool) -> int | None:
     if "survivor_ticket" in d:
         return int(d.get("survivor_ticket") or 0)
     return 0 if ok else None
+
+
+def _utc_epoch() -> float:
+    """The desk's clock, as a UTC epoch. The one default `now_fn`."""
+    return datetime.now(timezone.utc).timestamp()
 
 
 def _reported_int(d: dict[str, Any], key: str) -> int | None:
@@ -602,6 +609,10 @@ class FileBridge:
         )
 
 
+#: Named on the measurement so a journal line says WHICH reading produced it.
+MT4_CLOCK_SOURCE = "mt4 tick TimeCurrent"
+
+
 class Mt4Broker:
     #: This venue can answer "no bars" now and serve them a moment later,
     #: because the terminal fetches history from the broker in the background.
@@ -619,6 +630,7 @@ class Mt4Broker:
         startup_wait_sec: float = DEFAULT_STARTUP_WAIT_SEC,
         send_timeout_sec: float = 0.0,
         log: Callable[[str], None] | None = None,
+        now_fn: Callable[[], float] | None = None,
     ) -> None:
         self._call = call
         self._magic = magic
@@ -639,6 +651,11 @@ class Mt4Broker:
         #: already up before the desk starts.
         self._startup_wait = max(0.0, float(startup_wait_sec))
         self._log = log if log is not None else _log_line
+        #: The DESK's clock, in UTC epoch seconds. `venue_clock` measures the
+        #: server's offset by pairing the venue's own stamp with this, so it
+        #: is injectable: a clock test that cannot hold one side of a
+        #: difference still is not measuring a difference.
+        self._now = now_fn if now_fn is not None else _utc_epoch
 
     def connect(self) -> None:
         """One ping, on the bridge's own steady-state timeout.
@@ -953,6 +970,39 @@ class Mt4Broker:
             ask=ask,
             last=float(d.get("last", bid) or bid),
             volume=int(d.get("volume", 0) or 0),
+        )
+
+    def venue_clock(self, name: str) -> VenueClock:
+        """Measure the server's UTC offset from the tick reply's own stamp.
+
+        NO EXPERT CHANGE. `tick` has carried `time=TimeCurrent()` since the
+        first version of the ICD (docs/MT4.md, Ops), so this measurement needs
+        nothing recompiled and nothing reattached, which is what lets the
+        straightedge#172 fix reach a live desk as a Python upgrade.
+
+        The desk's own clock is read on BOTH sides of the call and the
+        midpoint is paired with the server's stamp, so the round trip is
+        measured rather than assumed and `VenueClock.measure` can refuse a
+        sample it cannot place. An Expert too old to stamp its reply has `time`
+        absent, which `_reported_int` reports as None and this reports as NOT
+        MEASURED; it is never read as UTC.
+        """
+        before = self._now()
+        d = self._require("tick", {"symbol": name.upper()})
+        after = self._now()
+        server = _reported_int(d, "time")
+        if server is None:
+            return VenueClock.not_measured(
+                "server_time",
+                source=MT4_CLOCK_SOURCE,
+                measured_at=int(after),
+                detail="the Expert does not stamp its tick reply with TimeCurrent()",
+            )
+        return VenueClock.measure(
+            server,
+            (before + after) / 2.0,
+            source=MT4_CLOCK_SOURCE,
+            round_trip_sec=max(0.0, after - before),
         )
 
     def rates(self, name: str, timeframe: str | int, count: int) -> list[Bar]:

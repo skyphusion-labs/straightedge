@@ -18,6 +18,7 @@ from tempfile import TemporaryDirectory
 
 from straightedge import __version__
 from straightedge.broker import broker_for
+from straightedge.broker.base import venue_clock_of
 from straightedge.broker.mt4_net import (
     DEFAULT_SHIM_PORT,
     TOKEN_ENV,
@@ -278,6 +279,48 @@ def telegram_ping(cfg: BotConfig, *, transport=None) -> str:
     return "ok" if ok else "fail"
 
 
+def venue_clock_check(cfg: BotConfig, broker: object) -> int:
+    """Say which clock the desk is timing itself off. Returns an exit code.
+
+    Why it exists. The straightedge#172 defect was INVISIBLE: the operator
+    read `start_utc = "07:00"` in the config, the desk timed its auto leg off
+    a UTC+3 bar stamp, and nothing anywhere printed the three hours between
+    those two facts. The offset is now measured, so it can be stated, and a
+    measurement that nothing ever displays is one nobody can check against
+    the server's own clock.
+
+    Why NOT MEASURED exits non-zero, like `history_check` above: an auto leg
+    that cannot measure WHEN it is refuses every signal, by design. That is a
+    run-affecting condition, so doctor must not clear a run while it holds.
+    """
+    clock = venue_clock_of(broker, cfg.symbols[0] if cfg.symbols else "EURUSD")
+    if not clock.measured:
+        print(
+            "venue clock: NOT MEASURED ("
+            + ", ".join(sorted(clock.unmeasured))
+            + (f": {clock.detail}" if clock.detail else "")
+            + "). The auto leg REFUSES every signal while this holds, because "
+            "reading a broker stamp as UTC is straightedge#172."
+        )
+        return 1
+    offset = clock.offset_sec or 0
+    sign = "+" if offset >= 0 else "-"
+    hh, mm = divmod(abs(offset) // 60, 60)
+    taken = (
+        datetime.fromtimestamp(clock.measured_at, tz=timezone.utc).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
+        if clock.measured_at
+        else "construction"
+    )
+    print(
+        f"venue clock: server UTC{sign}{hh:02d}:{mm:02d} measured "
+        f"({clock.source}, at {taken}). Bar times are converted to UTC with "
+        "this before any gate sees them."
+    )
+    return 0
+
+
 def history_check(cfg: BotConfig, broker: object) -> int:
     """Per-symbol bars and ATR against a live terminal. Returns an exit code.
 
@@ -440,6 +483,8 @@ def cmd_doctor(args: argparse.Namespace) -> int:
                     print(line)
                     if "TOO SHORT" in line:
                         rc = 1
+                if venue_clock_check(cfg, broker):
+                    rc = 1
                 if history_check(cfg, broker):
                     rc = 1
             except (RuntimeError, OSError, ValueError) as exc:
@@ -467,6 +512,8 @@ def cmd_doctor(args: argparse.Namespace) -> int:
                 f"connected login={mask_account_id(acct.login)} server={acct.server} "
                 f"equity={acct.equity:.2f} {acct.currency} trade_mode={acct.trade_mode}"
             )
+            if venue_clock_check(cfg, broker):
+                rc = 1
             if history_check(cfg, broker):
                 rc = 1
         except (RuntimeError, OSError, ValueError) as exc:

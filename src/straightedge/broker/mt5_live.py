@@ -7,6 +7,7 @@ MetaTrader 5.app. This adapter accepts either.
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Any
 
 from straightedge.constants import (
@@ -41,8 +42,18 @@ from straightedge.models import (
     Side,
     SymbolSpec,
     Tick,
+    VenueClock,
     WorkingOrder,
 )
+
+
+#: Named on the measurement so a journal line says WHICH reading produced it.
+MT5_CLOCK_SOURCE = "mt5 symbol_info_tick"
+
+
+def _utc_epoch() -> float:
+    """The desk's clock, as a UTC epoch. The one default `now_fn`."""
+    return datetime.now(timezone.utc).timestamp()
 
 
 def load_mt5_module() -> Any:
@@ -103,6 +114,7 @@ class Mt5Broker:
         path: str = "",
         timeout_ms: int = 60_000,
         mt5: Any | None = None,
+        now_fn: Any | None = None,
     ) -> None:
         self._login = login
         self._password = password
@@ -110,6 +122,11 @@ class Mt5Broker:
         self._path = path
         self._timeout = timeout_ms
         self._mt5 = mt5
+        #: The DESK's clock, in UTC epoch seconds. `venue_clock` measures
+        #: the server's offset by pairing the venue's own stamp with this,
+        #: so it is injectable: a clock test that cannot hold one side of a
+        #: difference still is not measuring a difference.
+        self._now = now_fn if now_fn is not None else _utc_epoch
 
     def connect(self) -> None:
         mt5 = self._mt5 or load_mt5_module()
@@ -399,6 +416,42 @@ class Mt5Broker:
             ask=float(d.get("ask", 0)),
             last=float(d.get("last", 0)),
             volume=int(d.get("volume", 0) or 0),
+        )
+
+    def venue_clock(self, name: str) -> VenueClock:
+        """Measure the server's UTC offset from the tick's own stamp.
+
+        MT5 has the same server-time semantics as MT4 and the same absence of
+        any API that states the offset: `copy_rates_from_pos` returns bar
+        times on the TERMINAL's trade-server clock, and
+        `symbol_info_tick().time` is that same clock at the last tick. So this
+        adapter was affected by straightedge#172 identically and is fixed
+        identically, through the one seam the engine reads.
+
+        `symbol_info_tick` returning None (symbol not selected, terminal gone)
+        is NOT MEASURED, which refuses; `_with_reconnect` has already had its
+        go at the IPC by then.
+        """
+        before = self._now()
+        t = self._with_reconnect(
+            lambda: self._mt5.symbol_info_tick(name),
+            f"symbol_info_tick({name})",
+        )
+        after = self._now()
+        d = _asdict(t)
+        server = int(d.get("time", 0) or 0)
+        if server <= 0:
+            return VenueClock.not_measured(
+                "server_time",
+                source=MT5_CLOCK_SOURCE,
+                measured_at=int(after),
+                detail=f"symbol_info_tick({name}) carried no server time",
+            )
+        return VenueClock.measure(
+            server,
+            (before + after) / 2.0,
+            source=MT5_CLOCK_SOURCE,
+            round_trip_sec=max(0.0, after - before),
         )
 
     def rates(self, name: str, timeframe: str | int, count: int) -> list[Bar]:

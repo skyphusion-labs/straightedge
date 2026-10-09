@@ -33,6 +33,9 @@ Fields: `symbol`, `side`, `kind`, `volume`, `price`, `sl`, `tp`, `comment`, `mag
 
 `Side` is `buy` or `sell`. MT5 order type integers live in the adapters.
 
+`Bar.time` and `Tick.time` are the BROKER SERVER's wall clock, never UTC.
+See "The venue's clock is not UTC" below before comparing one to anything.
+
 `OrderResult.ok` is true when `retcode` is in `RETCODE_OK`.
 Only `OrderResult.ok` is a send.
 Engine uses `OrderResult.unchanged` and `OrderResult.invalid_stops`.
@@ -79,6 +82,45 @@ said no" from "we never asked".
 
 MT5 integers and `order_send` dicts stay inside `broker/mt5_live.py` and
 `broker/paper.py` as private translation.
+
+## The venue's clock is not UTC, and the offset is MEASURED
+
+`Bar.time` and `Tick.time` are the BROKER SERVER's wall clock, encoded as an
+epoch. They are not UTC and the wire says nothing about the difference. MT4
+`iTime` / `TimeCurrent` and MT5 `copy_rates_from_pos` / `symbol_info_tick` both
+behave this way, so both venues are affected identically.
+
+| Method | Meaning |
+| --- | --- |
+| `venue_clock(symbol)` | A `VenueClock`: `offset_sec` is `server wall clock - UTC`, so UTC+3 is `+10800`. Convert a venue timestamp with `clock.to_utc(bar.time)`, never by hand. |
+
+`VenueClock` carries the `SymbolSpec` partition, applied to a clock:
+`offset_sec` is `None` and `unmeasured` names the field when the offset could
+not be measured, and `to_utc` then RAISES rather than returning a plausible
+instant. There is no "assume UTC" fallback, because zero is a perfectly
+ordinary offset and a defaulted zero cannot be told from a measured one. The
+rule is the standing one from straightedge#68: an unmeasured spec refuses, it
+never defaults.
+
+The offset is never configured. It is a per-server property that moves with the
+SERVER's DST, so a number in `config.toml` is a guess that outlives the first
+DST change after somebody wrote it.
+
+**Who converts.** The engine, in `Engine._bar_instant`, which is the ONE place
+a venue timestamp becomes a wall-clock instant. Every gate below it is written
+in UTC, and there is deliberately no second conversion path that could
+disagree. When the clock is unmeasured the auto leg refuses with
+`venue_clock_unmeasured` and journals which field was missing; the desk path is
+unaffected, because an operator command times itself off the desk clock and
+never off a bar.
+
+A venue with no `venue_clock` method at all reads as UNMEASURED, not as UTC
+(`venue_clock_of` in `broker/base.py`). The Protocol declares the method, so a
+real adapter that omits it is a typecheck failure as well.
+
+`doctor --connect` prints the measured offset and exits non-zero when it is not
+measured, because an auto leg that cannot measure when it is refuses every
+signal, and that is a condition to catch before a run rather than during one.
 
 ## Two optional things a venue may declare about history
 

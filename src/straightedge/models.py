@@ -3,8 +3,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Any
+
+from straightedge.constants import (
+    VENUE_CLOCK_GRID_SEC,
+    VENUE_CLOCK_MAX_OFFSET_SEC,
+    VENUE_CLOCK_MIN_OFFSET_SEC,
+    VENUE_CLOCK_TOLERANCE_SEC,
+)
 
 
 class Side(str, Enum):
@@ -98,6 +106,188 @@ class Tick:
     @property
     def spread(self) -> float:
         return self.ask - self.bid
+
+
+class VenueClockUnmeasured(RuntimeError):
+    """A venue timestamp was converted while the venue's offset was unknown.
+
+    The backstop, not the control. Every caller is expected to check
+    `VenueClock.measured` and refuse with a named reason; this raise is what
+    stops a FUTURE caller getting a plausible-looking instant out of a
+    measurement that was never taken.
+    """
+
+
+@dataclass(frozen=True)
+class VenueClock:
+    """How the venue STAMPS time, measured against real UTC.
+
+    MT4 and MT5 stamp bars and ticks with the broker server's own wall clock,
+    and nothing on the wire says what that clock's offset from UTC is. A desk
+    that reads one of those integers as UTC is not off by a rounding error, it
+    is off by the server's offset: the live desk runs on a UTC+3 server, so
+    before straightedge#172 its session window, its daily-loss day boundary
+    and its weekend block all ran three hours early.
+
+    `offset_sec` is `server wall clock - UTC`, so UTC+3 is +10800. Convert
+    with `to_utc`, never by hand.
+
+    MEASURED, never configured, and that is the whole design. The offset is a
+    per-server property that moves with the SERVER's DST rules, so a number in
+    a config file is a guess that outlives the first DST change after somebody
+    wrote it. That is straightedge#68 (an instrument-blind constant that
+    silently mis-sized gold) with a clock in place of a tick value, and the
+    standing rule from that issue applies unchanged: an unmeasured spec
+    REFUSES, it never defaults.
+
+    So `offset_sec` is `None` exactly when the measurement failed, and
+    `unmeasured` names what could not be measured. There is deliberately no
+    "assume UTC" path: zero is a PLAUSIBLE offset, because a UTC-stamped
+    server is ordinary, which means a defaulted zero is an absent measurement
+    wearing a measurement's clothes. That is the `SymbolSpec.unmeasured` rule
+    applied to the clock, and the two are kept in the same shape on purpose.
+    """
+
+    offset_sec: int | None
+    #: The UTC epoch the sample was taken at. Zero means the venue answered
+    #: from its own construction rather than from a reading.
+    measured_at: int = 0
+    #: Which venue and which reading. For the journal; never parsed.
+    source: str = ""
+    #: WIRE FIELD names that could not be measured, same shape and same rule
+    #: as `SymbolSpec.unmeasured`. Empty means this is a measurement.
+    unmeasured: frozenset[str] = frozenset()
+    #: Why the measurement failed, in words, when `unmeasured` is non-empty.
+    #: The field name says WHAT could not be measured and this says WHICH
+    #: check rejected the sample, because "off the grid" and "outside the
+    #: civil timezone band" are different venue faults with the same victim.
+    detail: str = ""
+
+    def __post_init__(self) -> None:
+        """A half-measured clock cannot be built at all.
+
+        Two fields carry the same fact (`offset_sec is None`, and a non-empty
+        `unmeasured`), and two fields carrying one fact is how a caller comes
+        to check the wrong one. They are asserted consistent HERE, at
+        construction, so that no call site has to.
+        """
+        if (self.offset_sec is None) is not bool(self.unmeasured):
+            raise ValueError(
+                "VenueClock is inconsistent: offset_sec="
+                f"{self.offset_sec!r} with unmeasured={sorted(self.unmeasured)!r}. "
+                "An unmeasured clock has offset_sec None and names the field; a "
+                "measured one has an offset and names nothing."
+            )
+
+    @property
+    def measured(self) -> bool:
+        return not self.unmeasured
+
+    def to_utc(self, venue_epoch: int) -> datetime:
+        """The real UTC instant a venue timestamp names."""
+        if self.offset_sec is None:
+            raise VenueClockUnmeasured(
+                "refusing to convert a venue timestamp: this venue's UTC "
+                f"offset is not measured ({sorted(self.unmeasured)}, "
+                f"source={self.source!r}, detail={self.detail!r})"
+            )
+        return datetime.fromtimestamp(int(venue_epoch) - self.offset_sec, tz=timezone.utc)
+
+    @classmethod
+    def not_measured(
+        cls, *fields: str, source: str = "", measured_at: int = 0, detail: str = ""
+    ) -> VenueClock:
+        return cls(
+            offset_sec=None,
+            measured_at=measured_at,
+            source=source,
+            unmeasured=frozenset(fields or ("offset_sec",)),
+            detail=detail,
+        )
+
+    @classmethod
+    def measure(
+        cls,
+        venue_epoch: int,
+        utc_epoch: float,
+        *,
+        source: str,
+        round_trip_sec: float = 0.0,
+    ) -> VenueClock:
+        """One paired sample: the venue's clock and ours, read together.
+
+        Three checks, and each one exists because of a case the one before it
+        cannot see.
+
+        1. The sample is SNAPPED to `VENUE_CLOCK_GRID_SEC` and must land
+           within `VENUE_CLOCK_TOLERANCE_SEC` of a grid point. Real offsets sit
+           on a quarter-hour grid, so anything else is not an offset. This is
+           what catches an ordinary stale reading, because the venue stamp
+           available on every reply is `TimeCurrent()` on MT4 and
+           `symbol_info_tick().time` on MT5 and BOTH are the time of the LAST
+           TICK rather than of now.
+
+        2. The snapped offset must sit inside the civil timezone band
+           (`VENUE_CLOCK_MIN_OFFSET_SEC` to `VENUE_CLOCK_MAX_OFFSET_SEC`).
+           Check 1 alone CANNOT see the market-close case: a venue clock
+           frozen at Friday's close is tens of hours out by Saturday, and tens
+           of hours is a whole number of grid steps, so it passes check 1
+           cleanly and reads as a measurement. This was found by running the
+           check against a two-day-stale sample and watching it return
+           `offset_sec=-172800` with an empty `unmeasured`.
+
+        3. The round trip the sample came out of must be narrow enough that
+           the midpoint cannot sit outside tolerance. There, the PAIRING
+           failed rather than the venue.
+
+        What this instrument structurally CANNOT see, stated rather than
+        implied: a venue stamp stale by almost exactly a multiple of 900
+        seconds, inside the band, reads as an offset wrong by that multiple.
+        The engine only ever asks on a bar it has just seen advance, which
+        means the venue was ticking within the last bar period, so the
+        surviving error is bounded by one bar period and its visible effect is
+        a session window off by a quarter hour. Narrowing that further needs a
+        second, independent venue reading, which is a bigger change than this
+        issue; it is NOT covered here and is not claimed to be.
+        """
+        taken_at = int(utc_epoch)
+        if int(venue_epoch) <= 0:
+            return cls.not_measured(
+                "server_time",
+                source=source,
+                measured_at=taken_at,
+                detail="the venue sent no server timestamp",
+            )
+        if round_trip_sec / 2.0 > VENUE_CLOCK_TOLERANCE_SEC:
+            return cls.not_measured(
+                "offset_sec",
+                source=source,
+                measured_at=taken_at,
+                detail=f"round trip {round_trip_sec:.1f}s is too wide to pair a sample",
+            )
+        raw = float(venue_epoch) - float(utc_epoch)
+        snapped = int(round(raw / VENUE_CLOCK_GRID_SEC)) * VENUE_CLOCK_GRID_SEC
+        if abs(raw - snapped) > VENUE_CLOCK_TOLERANCE_SEC:
+            return cls.not_measured(
+                "offset_sec",
+                source=source,
+                measured_at=taken_at,
+                detail=(
+                    f"raw offset {raw:.0f}s is {abs(raw - snapped):.0f}s off the "
+                    f"{VENUE_CLOCK_GRID_SEC}s grid, so it is not an offset"
+                ),
+            )
+        if not VENUE_CLOCK_MIN_OFFSET_SEC <= snapped <= VENUE_CLOCK_MAX_OFFSET_SEC:
+            return cls.not_measured(
+                "offset_sec",
+                source=source,
+                measured_at=taken_at,
+                detail=(
+                    f"offset {snapped}s is outside the civil timezone band, so the "
+                    "venue clock is frozen or stale rather than offset"
+                ),
+            )
+        return cls(offset_sec=snapped, measured_at=taken_at, source=source)
 
 
 @dataclass(frozen=True)

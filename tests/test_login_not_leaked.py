@@ -42,6 +42,7 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 
+from straightedge.models import VenueClock
 from straightedge.broker.paper import PaperBroker
 from straightedge.config import BotConfig
 from straightedge.engine import Engine
@@ -174,6 +175,14 @@ def test_doctor_connect_mt5_masks_login(capsys, monkeypatch) -> None:
             del name, timeframe
             return generate_bars(max(int(count), 80), drift=0.0002, seed=7)
 
+        # A venue has to be able to state its clock (straightedge#172).
+        # Zero is this fake stamping UTC, which keeps THIS test's
+        # subject unchanged; the clock's own suite is
+        # tests/test_venue_clock.py.
+        def venue_clock(self, name):
+            del name
+            return VenueClock(offset_sec=0, source="fake")
+
     monkeypatch.setattr("straightedge.broker.mt5_live.load_mt5_module", lambda: object())
     monkeypatch.setattr("straightedge.broker.mt5_live.Mt5Broker", lambda **kw: FakeBroker(**kw))
     assert main(["doctor", "--connect"]) == 0
@@ -218,6 +227,14 @@ def test_doctor_connect_mt4_masks_login(capsys, monkeypatch, tmp_path) -> None:
         def rates(self, name, timeframe, count):
             del name, timeframe
             return generate_bars(max(int(count), 80), drift=0.0002, seed=7)
+
+        # A venue has to be able to state its clock (straightedge#172).
+        # Zero is this fake stamping UTC, which keeps THIS test's
+        # subject unchanged; the clock's own suite is
+        # tests/test_venue_clock.py.
+        def venue_clock(self, name):
+            del name
+            return VenueClock(offset_sec=0, source="fake")
 
     monkeypatch.setattr("straightedge.broker.mt4_live.Mt4Broker", FakeMt4Broker)
     assert main(["doctor", "--connect"]) == 0
