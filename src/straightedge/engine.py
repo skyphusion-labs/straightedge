@@ -148,19 +148,32 @@ VENUE_CLOCK_UNMEASURED = "venue_clock_unmeasured"
 #: the tick stamp the offset came from was stale and the offset is wrong by
 #: that staleness.
 #:
-#: This is the check that closes the one hole `VenueClock.measure` cannot
-#: close on its own: a staleness that is an exact multiple of the offset
-#: grid lands on a grid point and looks perfect, and the civil timezone
-#: band does not see it either (11h is 44 whole grid steps). Measured
-#: through the real adapter during the straightedge#182 review: a stamp
-#: frozen 2h at Friday's close on a UTC+3 server read as UTC+01:00, 5h as
-#: UTC-02:00, 11h as UTC-08:00. Every one of those implies a server time
-#: hours before the bar in hand, so every one of them refuses here.
+#: This NARROWS the one hole `VenueClock.measure` cannot close on its own; it
+#: does not close it, and the difference is measured rather than argued
+#: (straightedge#193). A staleness that is an exact multiple of the offset
+#: grid lands on a grid point and looks perfect, and the civil timezone band
+#: does not see it either (11h is 44 whole grid steps). Measured through the
+#: real adapter during the straightedge#182 review: a stamp frozen 2h at
+#: Friday's close on a UTC+3 server read as UTC+01:00, 5h as UTC-02:00, 11h
+#: as UTC-08:00. Every one of those implies a server time hours before the
+#: bar in hand, so every one of them refuses here.
+#:
+#: WHAT IT DOES NOT CATCH. The comparison is against the forming bar's OPEN,
+#: so it sees a staleness only once that staleness exceeds the AGE of that
+#: bar. It is therefore blind in the last moments before a bar closes:
+#: measured at a bar 899s old on a 900s series, with the caller's bound
+#: VIOLATED, a 900s-stale stamp is accepted and the instant is wrong by 900s.
+#: The residual is bounded by one bar period and the hole only opens when the
+#: measured bound is violated, which takes a defect in `step_symbol`'s own
+#: bookkeeping rather than anything a venue can do. The boundary is pinned by
+#: test rather than left to this sentence.
 #:
 #: It cannot produce a false refusal: a correct offset implies the server's
 #: real `now`, and the forming bar opened at or before that instant by
 #: definition. Both readings come from the same server clock, so our own
-#: clock cancels out of the comparison entirely.
+#: clock cancels out of the comparison entirely. Swept across bar ages and
+#: staleness with an honest bound during the straightedge#182 review: 0 false
+#: refusals in 32 combinations.
 VENUE_CLOCK_BAR_DISAGREES = "venue_clock_bar_disagrees"
 
 #: Slack on that comparison, for the integer rounding of the paired sample
@@ -1140,8 +1153,13 @@ class Engine:
         # VENUE_CLOCK_BAR_DISAGREES: this is what makes a stale stamp
         # unreachable rather than merely unlikely, and it is the only check
         # here that can see a staleness sitting exactly on the offset grid.
-        implied_server_now = (clock.measured_at or 0) + (clock.offset_sec or 0)
-        if clock.measured_at and (
+        # `clock.sampled` is the gate and `clock.measured_at` is the operand.
+        # Those were one field before straightedge#193, with a zero timestamp
+        # standing in for "nothing was sampled"; `VenueClock.__post_init__`
+        # now guarantees a sampled clock carries a real one, so the arithmetic
+        # below cannot be fed a sentinel.
+        implied_server_now = clock.measured_at + (clock.offset_sec or 0)
+        if clock.sampled and (
             implied_server_now + VENUE_CLOCK_BAR_SLACK_SEC < bars[-1].time
         ):
             self.journal.write(
