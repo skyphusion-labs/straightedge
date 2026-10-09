@@ -29,6 +29,30 @@ the read succeeded, so a failed read REFUSES rather than proceeding on an
 assumption. That is the same partition as `OrderResult.measured`: PASSED, REFUSED,
 COULD NOT MEASURE.
 
+## What this suite does NOT cover (straightedge#123)
+
+It pins working orders counting toward the limits (`Engine.preview` handing
+`orders` to `RiskManager.evaluate`, and the fail-closed unmeasured read). It is
+BLIND to the stop-modification guard, which `tests/test_stop_modification_guard.py`
+pins, and that file is equally blind to this one. Neither is a control on the
+other.
+
+Measured by mutation, first during the #107 rebase and re-measured on `main` at
+`b8d7d74` (the counts moved, the property did not):
+
+| mutant | what it deletes | this file | the stop-guard file |
+| --- | --- | --- | --- |
+| A | `reason = self._stop_guard(pos, sl)` -> `reason = ""` in `Engine._modify` | 9 passed, exit 0 | 11 failed, 12 passed, exit 1 |
+| B | `ours_orders = [o for o in orders if o.magic == r.magic]` -> `ours_orders = []` in `RiskManager.evaluate` (`src/straightedge/risk.py`, NOT `engine.py`) | 5 failed, 4 passed, exit 1 | 23 passed, exit 0 |
+
+Orientation note: the original issue's table printed mutant B's failure in the
+stop-guard column; the measurement puts it in the working-orders column, as here.
+
+So each file is green while the other's guard is deleted. After touching either
+guard, run BOTH files:
+
+    pytest -q --override-ini addopts= tests/test_stop_modification_guard.py tests/test_working_orders_count_as_exposure.py
+
 Nothing here is verified against a live MT4 or MT5 terminal.
 """
 

@@ -48,6 +48,31 @@ Three consequences that a symmetric guard would get wrong:
   bounded, so it is always allowed. A cap must never stand between an operator
   and protecting a live position.
 
+## What this suite does NOT cover (straightedge#123)
+
+It pins `Engine._stop_guard` and nothing else. It is BLIND to the working-order
+exposure guard, which `tests/test_working_orders_count_as_exposure.py` pins, and
+that file is equally blind to this one. Neither is a control on the other.
+
+Measured by mutation, not by reading, first during the #107 rebase and
+re-measured on `main` at `b8d7d74` (the counts moved, the property did not):
+
+| mutant | what it deletes | this file | the working-orders file |
+| --- | --- | --- | --- |
+| A | `reason = self._stop_guard(pos, sl)` -> `reason = ""` in `Engine._modify` | 11 failed, 12 passed, exit 1 | 9 passed, exit 0 |
+| B | `ours_orders = [o for o in orders if o.magic == r.magic]` -> `ours_orders = []` in `RiskManager.evaluate` (`src/straightedge/risk.py`, NOT `engine.py`) | 23 passed, exit 0 | 5 failed, 4 passed, exit 1 |
+
+Orientation note: the original issue's table printed mutant B's failure in the
+stop-guard column; the measurement puts it in the working-orders column, as here.
+
+So each file is green while the other's guard is deleted. Why it is written
+down: `engine.py` is edited from both directions on a regular basis, and the
+reassuring check on a conflict resolution there is "is the guard still present".
+That check passes trivially when the resolution looks like two disjoint blocks.
+After touching either guard, run BOTH files:
+
+    pytest -q --override-ini addopts= tests/test_stop_modification_guard.py tests/test_working_orders_count_as_exposure.py
+
 Nothing here is verified against a live MT4 or MT5 terminal.
 """
 
