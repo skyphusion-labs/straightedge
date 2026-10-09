@@ -768,3 +768,139 @@ def test_money_per_lot_at_stop_refuses_a_missing_stop() -> None:
         except MissingStop:
             continue
         raise AssertionError(f"sl={bad} produced a number instead of refusing")
+
+
+def _rest_then_set_stop(engine, value):
+    """A resting order whose stop is `value`, injected the way only a venue can.
+
+    Our own commands cannot produce a non-finite stop any more than they can
+    produce a zero one: `risk.py` refuses `sl_required` at stage time and
+    `_modify_pending` refuses on the way out. Both adapters build
+    `sl=float(d.get("sl", 0) or 0)` with no finiteness check, and `float`
+    accepts `nan`, `NaN`, `-nan` and `inf`, so a corrupt mailbox line or a
+    malformed venue field arrives here exactly as a zero does.
+    """
+    tick = engine.broker.tick("EURUSD")
+    spec = engine.broker.symbol("EURUSD")
+    limit = spec.normalize_price(tick.ask - 0.002)
+    sl = spec.normalize_price(limit - 0.005)
+    tp = spec.normalize_price(limit + 0.010)
+    engine.handle_command(TgCommand("1", 1, f"/buy EURUSD limit={limit} sl={sl} tp={tp}", 1))
+    engine.handle_command(TgCommand("1", 1, "/confirm", 2))
+    order = engine.broker.orders()[0]
+    engine.broker._orders[order.ticket] = replace(order, sl=value)
+    return engine.broker.orders()[0], spec, limit
+
+
+def test_replace_on_a_non_finite_stop_names_the_field_not_the_geometry(tmp_path) -> None:
+    """#208. `nan <= 0` is False, so the #187 refusal was one value short.
+
+    THE OUTCOME WAS ALREADY SAFE AND THAT IS WHY THIS ASSERTS THE REASON. On the
+    pre-fix tree `/replace` on a nan-stop order returns
+    `buy needs sl < entry < tp`, because `nan < px` is False and the GEOMETRY
+    check short-circuits before any arithmetic runs. Nothing is sent and the
+    order does not move, so a test asserting "the order did not move" passes
+    before the change and is testing the geometry guard rather than this one.
+
+    The operator consequence is the whole defect: a corrupt venue field is
+    reported as a stop/entry/target ordering mistake, so the operator goes and
+    re-reads geometry they got right instead of looking at the venue.
+    """
+    import math
+
+    for value in (math.nan, math.inf, -math.inf):
+        engine = _engine(tmp_path / f"n{value}")
+        engine.start()
+        order, spec, limit = _rest_then_set_stop(engine, value)
+        reply = engine.handle_command(
+            TgCommand("1", 1, f"/replace {order.ticket} {spec.normalize_price(limit - 0.001)}", 3)
+        )
+        assert "refused: sl_not_measured" in reply, f"sl={value}: {reply}"
+        assert "needs sl < entry < tp" not in reply, (
+            f"sl={value}: still reported as a geometry problem: {reply}"
+        )
+        assert engine.broker.orders()[0].price == order.price, "the order must not move"
+        engine.stop()
+
+
+def test_a_non_finite_stop_is_distinguished_from_an_absent_one(tmp_path) -> None:
+    """Two different operator actions, so two different reasons.
+
+    `sl_required` means you did not set a stop: set one. A non-finite stop means
+    the VENUE reported something unusable: look at the venue, it is not your
+    omission. Reporting the first for the second teaches the wrong thing, which
+    is what the lead asked be avoided.
+
+    `nan` and `inf` share the reason WORD on purpose and carry the value as the
+    distinguishing detail, because the action they call for is identical.
+    """
+    import math
+
+    engine = _engine(tmp_path / "absent")
+    engine.start()
+    order, spec, limit = _rest_then_set_stop(engine, 0.0)
+    px = spec.normalize_price(limit - 0.001)
+    absent = engine.handle_command(TgCommand("1", 1, f"/replace {order.ticket} {px}", 3))
+    engine.stop()
+
+    engine2 = _engine(tmp_path / "nonfinite")
+    engine2.start()
+    order2, spec2, limit2 = _rest_then_set_stop(engine2, math.nan)
+    px2 = spec2.normalize_price(limit2 - 0.001)
+    nonfinite = engine2.handle_command(TgCommand("1", 1, f"/replace {order2.ticket} {px2}", 3))
+    engine2.stop()
+
+    assert "refused: sl_required" in absent, absent
+    assert "refused: sl_not_measured" in nonfinite, nonfinite
+    assert absent != nonfinite, "an absent stop and an unreadable one must not read alike"
+    assert "nan" in nonfinite, "the offending value is the distinguishing detail"
+
+
+def test_unusable_stop_is_the_one_authority(tmp_path) -> None:
+    """One function answers the question; two places consult it (#208).
+
+    `money_per_lot_at_stop` raises on it and `replace_pending` reads it before
+    the geometry check. That is ONE source of truth consulted twice, not two
+    comparisons that can drift, which is the #187 argument applied to its own
+    fix.
+    """
+    import math
+
+    from straightedge.sizing import MissingStop, money_per_lot_at_stop, unusable_stop
+
+    assert unusable_stop(1.0950) is None
+    assert unusable_stop(0.0) == "sl_required"
+    assert unusable_stop(-1.0) == "sl_required"
+    for bad in (math.nan, math.inf, -math.inf):
+        reason = unusable_stop(bad)
+        assert reason is not None and reason.startswith("sl_not_measured:"), (bad, reason)
+
+    spec = default_spec("EURUSD")
+    assert money_per_lot_at_stop(1.1000, 1.0950, spec) > 0
+    for bad in (0.0, math.nan, math.inf):
+        try:
+            money_per_lot_at_stop(1.1000, bad, spec)
+        except MissingStop as exc:
+            assert exc.reason == unusable_stop(bad), (bad, exc.reason)
+            continue
+        raise AssertionError(f"sl={bad} produced a number instead of refusing")
+
+
+def test_an_ordinary_replacement_still_succeeds(tmp_path) -> None:
+    """Control. A guard that refused every replacement would pass the tests
+    above and be useless, so there must be a reachable world where it allows."""
+    engine = _engine(tmp_path)
+    engine.start()
+    tick = engine.broker.tick("EURUSD")
+    spec = engine.broker.symbol("EURUSD")
+    limit = spec.normalize_price(tick.ask - 0.002)
+    sl = spec.normalize_price(limit - 0.005)
+    tp = spec.normalize_price(limit + 0.010)
+    engine.handle_command(TgCommand("1", 1, f"/buy EURUSD limit={limit} sl={sl} tp={tp}", 1))
+    engine.handle_command(TgCommand("1", 1, "/confirm", 2))
+    order = engine.broker.orders()[0]
+    reply = engine.handle_command(
+        TgCommand("1", 1, f"/replace {order.ticket} {spec.normalize_price(limit - 0.0005)}", 3)
+    )
+    engine.stop()
+    assert f"replace #{order.ticket}" in reply, reply

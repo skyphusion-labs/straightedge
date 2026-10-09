@@ -8,6 +8,14 @@ Every instance produced a REASSURING result rather than an error. That is the
 whole problem: the healthy state and the broken state rendered identically, so
 nothing looked wrong at any point.
 
+**SCOPE.** That sentence is also the boundary: everything here is about a check
+that reports the reassuring state. **Nothing in this file covers the opposite
+failure, a gate that REDS on a healthy system**, which is a real and separate
+defect; we shipped one this sprint, a liveness audit that red on two tasks
+installed thirty seconds earlier. A false alarm is found by the person it
+interrupts, which is why it needs no document; a false reassurance is found by
+nobody.
+
 ## The check
 
 **For any fixture, name a reachable state where the right implementation and the
@@ -37,7 +45,14 @@ the agreement is invisible.
 
 ## The four measured instances
 
-**straightedge#170, the freshly-sized position.** `_stop_guard` measures a
+**Each is labelled by how its BLINDNESS claim was established**, because a
+document arguing that a property stated without its measurement is the problem
+cannot itself mix two kinds of evidence silently. MUTATION means a guard was
+removed and the suite observed; ARITHMETIC means the blindness was derived and
+never observed as a red.
+
+**straightedge#170, the freshly-sized position. [MUTATION, plus ARITHMETIC for
+the empty band.]** `_stop_guard` measures a
 widening against `min(per_trade, loss_room)`. Deleting the halt-room half left
 all 1187 tests green. The band needs `loss_room < per_trade` AND
 `worst <= per_trade` at once, which on the default config means equity below
@@ -45,7 +60,7 @@ all 1187 tests green. The band needs `loss_room < per_trade` AND
 than today's cap would size (a scale-out, or one carried from a lower-equity
 day) escapes it.
 
-**straightedge#169 and #176, currency resolution.** Every planted book was
+**straightedge#169 and #176, currency resolution. [MUTATION.]** Every planted book was
 three-plus-three, so one test (`DOGEUSD`) was the SOLE instrument for two
 separate properties: the aggregation inside `exposure_text`, and
 `risk.currency_exposure` resolving rather than splitting. Reverting the shared
@@ -53,7 +68,8 @@ function to a naive split red exactly ONE test. After one fixture leg was
 changed to a non-three-plus-three symbol: four reds for one property, five for
 the other, with different red sets.
 
-**straightedge#157 and #164, the resting order at the cap.** The `#104`
+**straightedge#157 and #164, the resting order at the cap. [ARITHMETIC for the
+empty band, with NO observed red; MEASUREMENT for the direction defect.]** The `#104`
 regression pin proposed `limit - 0.001`, which moves the entry TOWARD the stop:
 worst 50.00 -> 40.00, a REDUCTION. A test named for refusing a risk-INCREASING
 replacement was asserting that a reduction is refused, and the increase
@@ -66,7 +82,7 @@ proposal 26.00) and asserts the direction so a future reduction fixture cannot
 pass through the carve-out unnoticed.
 
 **straightedge#175, one layer out: the INSTRUMENT could not express the
-failure.** The clamp `max(cap - abs(net), 0)` was unobserved by all eighteen
+failure. [MUTATION, with a control.]** The clamp `max(cap - abs(net), 0)` was unobserved by all eighteen
 mutants run against #169. Its test helper matched rows with `room=(\d+)`, which
 cannot represent a negative number at all, so removing the clamp made the row
 stop matching and the test red on a `KeyError`. Measured both ways: both forms
@@ -97,6 +113,25 @@ and the comment there says exactly that rather than claiming more.
 
 Distinguishing the two cases is the skill. "Nothing reds" means either the
 suite is blind or the change does not matter, and those want opposite responses.
+
+**But "equivalent" is a property of the mutation AND the reachable fixture
+space, never of the mutation alone.** This is the trap, and it is the one this
+whole document exists to stop, so it is worth stating twice.
+
+The halt-room mutation in #170 genuinely IS equivalent for a freshly-sized
+position. Sizing puts worst-case loss AT the per-trade cap, so any widening
+breaks the per-trade bound first and the `min()` term can never decide the
+answer. Run the obvious control on the obvious fixture and nothing reds, and
+that nothing is CORRECT. The same mutation is NOT equivalent once the volume is
+smaller than today's cap would size, which a scale-out or a position carried
+from a lower-equity day produces, and there the engine's verdict flips.
+
+So a clean nothing does not license "equivalent, move on". It licenses exactly
+one conclusion: **equivalent OVER THE FIXTURES I TRIED.** Before recording a
+mutation as equivalent, say which states you reached and name the state class
+you did not. #170 was recorded as a real gap only because someone widened the
+fixture space after the first control came back empty; stopping at the clean
+nothing was the near-miss, and it was one step away.
 
 ## A clean textual merge is not a passing merge
 
@@ -140,6 +175,24 @@ AFTER changing it and treating the result as independent.
   confirm landed on the line you meant is not a measurement.** Assert the
   enclosing function, or that the anchor matches exactly once, before writing.
 
+- A correctly-aimed mutation measured through a **mis-specified baseline**.
+  A reviewer established a real 6-to-1 change in a diff and attributed it to the
+  wrong branch, because `git diff A..B` compares two TREES: on a branch that is
+  BEHIND, every commit `main` has and the branch lacks appears INVERTED, as
+  though the branch removed it. `A...B` is the changeset and matches GitHub's
+  files endpoint.
+
+  ```
+  git diff --stat origin/main..<head>    6 files, 148 insertions, 207 deletions
+  git diff --stat origin/main...<head>   2 files, 144 insertions   <- the changeset
+  ```
+
+  The measurement was real; the baseline was not. Its own diagnosis is the
+  transferable part: it verified the MUTATION carefully, with correct aim and
+  reproducible counts, and **inherited the SETUP without checking it.** Verifying
+  the interesting half of a procedure while assuming the boring half is how a
+  careful person gets a confident wrong answer.
+
 A related trap with the same shape but no mutation of your own: **the record
 lags the artifact.** Immediately after a push, a pull request can report the OLD
 head and a stale `reviewDecision`. Poll until the reported head matches the sha
@@ -175,6 +228,15 @@ change and concludes the instrument cannot fire.
 So when a comment states a property, ask what would red if the property stopped
 holding. If the answer is nothing, the comment is a claim rather than a
 guarantee, and it should say which.
+
+**And check the claim at its EDGE, not its middle.** Every instance above holds
+comfortably in the middle of its range and fails at a boundary:
+`VENUE_CLOCK_BAR_DISAGREES` is correct for most of a bar and blind in the
+instant before one closes; the cap comments are right while the book is
+ordinary and silent on a book sized below the cap; the README claim is true of a
+retained use and false of a bare import. A reading taken mid-range cannot
+distinguish "holds" from "holds here", so test the first and last value a bound
+admits, and the value just past it.
 
 ## An assertion over an empty collection passes for free
 
@@ -224,3 +286,187 @@ GitHub computes `mergeStateStatus` against the required contexts. The gate was
 right and the narration was lucky, which is the distinction worth keeping: a
 correct outcome does not retroactively make the reading that accompanied it
 evidence.
+
+## A control beats a second opinion
+
+Two instruments agreeing is CORROBORATION. A control showing the instrument can
+produce the other answer is PROOF. They are not the same strength and it is easy
+to spend effort on the weaker one.
+
+Worked example, from verifying one of the retractions above. Two independent
+instruments said a patch did not touch a fixture: the files endpoint listed only
+the two expected documentation files, and the raw patch contained zero lines
+matching `LINKUSD|GBPUSD`. Both agreeing is consistent with the patch being
+clean, and equally consistent with the grep being wrong. **The control is what
+settled it: the same grep against `main`'s copy of that file finds six matches.**
+So the instrument can fire, and its zero means absence rather than inability.
+
+This is the same argument this file makes for tests, one level up, and it
+applies to verification of any kind. If your evidence is "I checked it two
+ways", ask what either way would have printed had the thing been true.
+
+## Execute the documentation, do not review it
+
+Every procedure in a document rots silently, because reading one cannot tell a
+correct instruction from a stale one. The instances in this file include a
+README whose stated procedure produced zero and would have convinced a
+re-checker that the instrument could not fire.
+
+Reviewing prose catches wording. Only running it catches rot. So when a document
+states a command, run the command; when it states a count, reproduce the count.
+
+**But measure whether your documents contain anything a script may safely run,
+before trusting a script to check them.** And **state what you counted over**:
+a count without its domain is not a measurement, which is the
+lines-versus-occurrences trap one level up. Both domains, counted with the same
+regex the script below uses, over the files each `git ls-files` names, on this
+branch:
+
+| domain | command naming the domain | files | with fenced blocks | blocks |
+| --- | --- | --- | --- | --- |
+| `docs/*.md` plus `README.md` | `git ls-files 'docs/*.md' README.md` | 11 | 5 | 38 |
+| `**/*.md` across the repo | `git ls-files '*.md'` | 18 | 11 | 57 |
+
+**Those figures are pinned to `main` at `f98984b`, and the pin is the only
+reason they are quotable.** This file is not in them yet: it carries 2 fenced
+blocks and changes no other document, so merging it adds 2 to both `blocks`
+columns (38 to 40, 57 to 59) and one to both `with fenced blocks` columns (5 to
+6, 11 to 12), since on `main` this file holds none. Past that, do
+not read the number, run the command, because **both rows count THIS file, so
+both move when it does.** That is the controls table's self-inclusion one
+domain wider.
+
+**An unpinned corpus count is stale by default, and this one went stale twice
+while the pull request was open.** An earlier version of this row read 56,
+correctly, until `#205` landed three fenced blocks in `agent/README.md` (2 to
+5, so 56 to 59) with nothing in this file changing. Then `#206` touched
+`docs/DEPLOY.md`, which is in both domains, and moved nothing at all: that file
+holds 0 blocks at both refs. So a markdown commit MAY move the count and may
+not, which means you cannot infer staleness from the fact that documentation
+changed, nor freshness from the fact that this file did not. Re-derive, or
+quote a ref. The row that used to sit here read 41 and 19 labelled as measured
+on `main`, and matched no tree, because it was taken from a working tree.
+
+In both, the command-shaped lines inside fences are `python -m straightedge run`
+and its siblings (`backtest`, `watch`, `supervision`), which start or drive a
+desk; `launchctl` and `powershell -File Install-Supervision.ps1`, which mutate
+the machine; `export` and `source`, which set credentials; and desk chat
+commands such as `/trail`, which are not shell at all. **Not one is safe to
+execute automatically.** A verifier that ran them would be far worse than none.
+
+One precision, because the first version of this paragraph was loose: **bare
+`doctor` IS offline and read-only**, so it would be safe, but it appears only in
+PROSE, in README's numbered steps, and never inside a fenced block. The script
+reads fences only, so it never sees it. `doctor --connect` opens a venue
+connection and `run` starts a desk; attributing that to `doctor` was wrong.
+
+So on this repo the automated half checks read-only commands (`git`, `pytest`,
+`ruff`, `mypy`) and legitimately finds none to run, which is a property of the
+documents rather than of the tool. The manual half is the one that applies
+here: when a document states a command you cannot safely automate, run it
+yourself and reproduce its stated output, and when it states a count,
+re-derive the count.
+
+The script below is still worth having, both for the documents that do carry
+read-only commands and because its exit code makes "nothing was checked"
+distinguishable from "nothing was wrong":
+
+```
+python3 - "$DOC" <<'EOF'
+import re, subprocess, sys, textwrap
+src = open(sys.argv[1]).read()
+# INDENTED fences count. The first version of this script anchored the fence at
+# column 0 and silently skipped every block nested in a list, which is most of
+# them. See the note below.
+blocks = re.findall(r"^[ \t]*```[a-zA-Z]*\n(.*?)^[ \t]*```", src, re.S | re.M)
+print(f"fenced blocks: {len(blocks)}")
+ran = failures = 0
+for i, b in enumerate(blocks, 1):
+    for line in (l.strip() for l in textwrap.dedent(b).splitlines()):
+        if not line.startswith(("git ", "pytest", "ruff ", "mypy ")):
+            continue
+        if "<" in line:   # illustrative: carries a <placeholder>, not runnable
+            print(f"block {i}: SKIP (placeholder)  {line}")
+            continue
+        r = subprocess.run(line, shell=True, capture_output=True, text=True)
+        ran += 1
+        failures += r.returncode != 0
+        print(f"block {i}: exit={r.returncode}  {line}")
+print(f"command lines executed: {ran}")
+# NOTHING CHECKED IS NOT A CLEAN RESULT. Without these two exits the script
+# prints its own definition of broken and returns 0, which is the defect this
+# section describes, in the tool this section ships.
+if ran == 0:
+    sys.exit("no command was executed: this is a broken check, not a clean document")
+sys.exit(1 if failures else 0)
+EOF
+```
+
+**A third defect, found by the reviewer EXECUTING it rather than reading it.**
+Run as written on the document it ships in, the first version printed
+`command lines executed: 0` and exited 0, which is this section's own
+definition of a broken check reported as a clean one. The reviewer also ran it
+against every other document in the repo and got zero executions in all of
+them, so the claim that a block "can be lifted and executed directly" was not
+demonstrated for a single document here. Its positive control, a scratch
+document holding three passing commands and one failing one, returned 2 blocks
+and 4 executions with the failure showing `exit=128`: **the instrument can
+fire, and the repo simply has nothing it may safely run.** Hence the exits
+above, and the survey before the script rather than after it.
+
+**Print the denominator, and this script is why.** Its first version anchored
+the fence at the start of a line, so it matched exactly ONE block in this file:
+every other one is nested in a list item and therefore indented. It executed
+zero commands and reported no problems. A reader would have concluded the
+document was verified; what actually happened is that the instrument could not
+see what it was pointed at. That is this file's own subject, reproduced in the
+tool this file ships, within minutes of writing it. Hence the two counts in the
+output: **a run that executes zero commands is a broken verifier, not a clean
+document.**
+
+**Running it found a second defect in it**, which is the section's argument
+again: with the fence fixed it executed both lines of the `git diff` example and
+reported two failures, because those lines carry a `<head>` placeholder and were
+never runnable. A verifier whose only output on a healthy document is two false
+alarms gets ignored, and an ignored check is a decorative one. Hence the
+placeholder skip, and hence the SKIP lines in the output: what it declines to
+run is as much a part of the reading as what it ran.
+
+**Run as written, with all four controls, which is the standard this section
+sets for itself:**
+
+| target | rc | reading |
+| --- | --- | --- |
+| `TESTING.md` | 1 | 2 blocks, 2 SKIP, 0 executed -> broken check, not a clean document |
+| `control.md` | 1 | 2 blocks, 4 executed, deliberate failure shows `exit=128` |
+| `unsafe.md` | 1 | 1 block, 0 executed (`launchctl`, `python -m straightedge run`) |
+| `all_pass.md` | 0 | 2 blocks, 2 executed, both `exit=0` |
+
+**That table is not a fenced block, and it used to be.** While it was one, this
+file held THREE blocks and the row above reported two, so **the act of
+documenting the denominator changed the denominator.** A stale count, in the
+section whose rule is print the denominator, produced by printing it. Caught by
+a reviewer running the shipped script against the shipped file. It is now a
+markdown table, which both renders better and keeps the row describing the file
+rather than describing itself; if you add a fence here, re-run and update the
+row.
+
+**The 2 are the `git diff` example far above and the script just above, and
+that is the whole population**, so the only thing that can move the number is a fence added
+to or removed from this file. Name the method as well, because this file is a
+case where both obvious ones lie: `grep -c` on the fence marker reports 5,
+since it counts matching LINES and one line carries two markers; `grep -o` of
+the same marker piped to `wc -l` reports 6, since it counts OCCURRENCES and two
+of them are a string literal inside the script rather than a fence. The script
+counts PAIRS anchored at line start, which is the right domain for a fenced
+BLOCK and the only one of the three that returns 2.
+
+The last row is the one most easily skipped: **a check that cannot return 0 is a
+gate that can never pass**, which is as useless as one that can never fail, and
+the only way to know is to build a document it should pass on.
+
+Two honest limits that remain, because a verifier overstating its reach is also
+this file's subject. It only runs lines it recognises as commands, so
+prose-with-numbers is untouched; and a non-zero exit is a prompt to look, not
+proof of rot. It catches the command that no longer parses or no longer exists,
+which is the failure mode that actually occurred.
