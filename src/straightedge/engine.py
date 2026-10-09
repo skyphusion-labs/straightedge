@@ -1786,9 +1786,8 @@ class Engine:
         # operator to re-read geometry they got right instead of to the venue.
         #
         # This consults `unusable_stop`, the same authority `money_per_lot_at_stop`
-        # raises from, rather than comparing again here. The `except MissingStop`
-        # below stays as the fail-closed backstop for any path that reaches the
-        # arithmetic another way; this is about naming, not about safety.
+        # raises from, rather than comparing again here. This is about naming,
+        # not about safety: the outcome was already a refusal.
         #
         # `_stop_guard` already carries the finiteness check on the POSITION path
         # (`if not math.isfinite(sl)`), earned by a measured -$58,058 run, so this
@@ -1846,7 +1845,20 @@ class Engine:
             # the cap should ask is whether this replacement ADDS risk (#164).
             worst_resting = money_per_lot_at_stop(order.price, order.sl, spec) * order.volume
         except MissingStop as exc:
-            # The NAME comes from the exception, not from this call site.
+            # TRIPWIRE, NOT A GATE, and the same idiom `risk.currency_exposure`
+            # uses for `UnclassifiedSymbol`. Both calls above receive the SAME
+            # `sl` that `unusable_stop` validated a few lines up, so by
+            # construction this cannot fire today, and a mutation that replaces
+            # `exc.reason` with a hardcoded string leaves the whole suite green.
+            # That is recorded rather than papered over: an unreachable branch
+            # cannot be covered, and a test pretending to cover it would be the
+            # decorative kind.
+            #
+            # It is kept because the NAME still comes from the exception rather
+            # than from this call site. A future refactor that removes or
+            # reorders the early check, or a new caller that reaches the
+            # arithmetic another way, then produces the correct reason instead
+            # of silently reverting to a hardcoded one.
             return f"refused: {exc.reason}"
         account = self.broker.account()
         r = self.cfg.risk
