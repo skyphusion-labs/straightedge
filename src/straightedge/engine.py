@@ -225,12 +225,25 @@ class Engine:
         #: daily-loss budget is measured against, so it would change refusal
         #: behaviour on the real-money path.
         #:
-        #: In memory on purpose, and this is the reachability argument for it:
-        #: `start()` calls `risk.observe()` before the first tick, so after any
-        #: restart `snap.day_key` already equals today and `_maybe_daily_recap`
-        #: cannot owe a recap for a day that ended before the restart. A
-        #: journal-restored marker would therefore guard a state no restart can
-        #: reach, which is decoration, not safety.
+        #: In memory, and the argument for that is now NARROWER than it was.
+        #: It used to read: `start()` calls `risk.observe()` before the first
+        #: tick, so after any restart `snap.day_key` already equals today and
+        #: `_maybe_daily_recap` cannot owe a recap for a day that ended before
+        #: the restart, so a journal-restored marker would guard a state no
+        #: restart can reach. The first half is still true and the conclusion
+        #: was wrong: the state IS reachable, it just is not reachable through
+        #: THIS marker. The day that ended while the desk was down is owed by
+        #: nobody and was therefore silently lost (straightedge#129).
+        #:
+        #: So the two paths now have two markers, deliberately, because they
+        #: guard two different things. `_maybe_daily_recap` is in-process and
+        #: in-memory: it fires on a boundary this process watched, so its marker
+        #: only has to outlive a tick. `_announce_unrecapped_day` reads the
+        #: JOURNAL instead, because the thing it must not repeat is an
+        #: announcement made by a PREVIOUS process, and a crash loop clears
+        #: anything in memory. Neither marker is in the equity snapshot: that
+        #: file is the money gate's input and a recap bookkeeping field has no
+        #: business in it.
         self._recapped_day = ""
         #: Heartbeat bookkeeping. `_hb_gap_max_s` is the largest gap between two
         #: heartbeat writes this process has actually seen, published so the
@@ -354,6 +367,11 @@ class Engine:
                 error=self.risk.state_error,
                 path=str(self.risk.state_path),
             )
+        # BEFORE the roll. `observe()` advances `snapshot.day_key` to today
+        # whenever it differs, and the ended day's identity and baseline live
+        # nowhere else: once it has rolled, the only record that a day ended
+        # while this desk was down is gone (straightedge#129).
+        owed = self._owed_day_before_roll(self.now_fn())
         self.risk.observe(acct, self.now_fn())
         self._emit(
             "start",
@@ -392,6 +410,11 @@ class Engine:
         }
         self.desk.restore_from_journal(self.journal)
         self.advisor.load()
+        # LAST in start(), and after the `start` event: the chat reads start
+        # then recap, and a raising announcement cannot leave the gates
+        # without an observed snapshot or the desk without its restored
+        # state. Nothing below this line needs it.
+        self._announce_unrecapped_day(owed)
 
     def warm_history(self, symbols: list[str] | None = None) -> HistoryReport:
         """Warm and measure the configured symbols, then journal the result.
@@ -2148,6 +2171,111 @@ class Engine:
             return f"{head}\n{tail}"
         return head
 
+    def _owed_day_before_roll(self, now: datetime) -> dict[str, Any] | None:
+        """The day that ended while this desk was down, or None. Read at START.
+
+        `start()` calls `risk.observe()` before the first tick, which rolls
+        `snapshot.day_key` to today. That ordering is deliberate (every gate
+        must have an observed snapshot before anything is evaluated), so the
+        fix for straightedge#129 is NOT to reorder it: it is to read what the
+        roll is about to discard, which is the only place the ended day's
+        identity and baseline exist after a restart.
+
+        Returns None whenever nothing is owed, and the three cases are
+        different: no persisted snapshot at all (a first-ever start), a restart
+        inside the same UTC day (the overwhelming majority), and a clock that
+        has moved BACKWARDS across a boundary. The last one is not a missed
+        recap and is deliberately not reported as one; a desk whose clock went
+        backwards has a different problem than a desk that was switched off.
+        """
+        snap = self.risk.snapshot
+        if not snap.day_key:
+            return None
+        today = day_key(now)
+        if snap.day_key >= today:
+            return None
+        try:
+            ended = datetime.strptime(snap.day_key, "%Y-%m-%d").replace(
+                tzinfo=timezone.utc
+            )
+        except ValueError:
+            # A snapshot whose day_key is not a date cannot be reasoned about,
+            # and `state.py` already refuses to load a mistyped one, so this is
+            # unreachable from a file this process read. Silence is wrong here
+            # even so: it is reported with the value that could not be parsed.
+            return {"day": snap.day_key, "day_start": snap.day_start_equity}
+        skipped = (
+            datetime.strptime(today, "%Y-%m-%d").replace(tzinfo=timezone.utc) - ended
+        ).days
+        return {
+            "day": snap.day_key,
+            "day_start": snap.day_start_equity,
+            "days_skipped": skipped,
+            "last_observed_equity": snap.equity,
+            "last_observed_at": snap.time,
+        }
+
+    def _announce_unrecapped_day(self, owed: dict[str, Any] | None) -> None:
+        """Say that a day ended unobserved. ONE row, no P&L, named unmeasured.
+
+        It is a `recap` event rather than a new event name, and that is a
+        delivery decision rather than a taxonomy one: every `config.toml`
+        written before this change enumerates `notify_events` explicitly (the
+        same argument `telegram.ALWAYS_NOTIFY_EVENTS` carries), so a new name
+        would have reached nobody on the box this is for. The operator who
+        needs this row is the one whose desk just restarted.
+
+        IT CARRIES NO `pnl` AND NO `equity`. The ended day's closing equity was
+        never observed: the persisted snapshot holds `equity` only as of its
+        last durable write, which on a losing day is the last peak and is
+        therefore ABOVE the real close, so a P&L computed from it would be
+        wrong in the flattering direction. The issue is explicit that a recap
+        with the wrong baseline is worse than none, so the two fields are
+        ABSENT and `unmeasured` names them, in the shape `SymbolSpec` and
+        `VenueClock` already use. A missing field cannot be misread; a zero can.
+        `last_observed_equity` is carried separately, labelled as what it is.
+
+        ONE ROW FOR ANY OUTAGE. A box down for a week emits one row naming
+        seven skipped boundaries, not seven recaps. The bound is the design, not
+        a cap applied afterwards.
+
+        The marker is the JOURNAL, not `_recapped_day`, because every restart
+        clears in-process memory and a crash loop would otherwise announce the
+        same day on every boot: that is straightedge#119's defect arriving by
+        the other door. The last `recap` row's `day` is the authority, which
+        also means a journal rotation (10MB) landing between two boots could
+        allow one duplicate; one extra message after a 10MB day is a better
+        failure than a new durable field in the money gate's own input file.
+        """
+        if owed is None:
+            return
+        day = str(owed.get("day") or "")
+        if not day:
+            return
+        previous = self.journal.last_event("recap")
+        if previous is not None and str(previous.get("day") or "") >= day:
+            # Already announced, by this process's predecessor.
+            self._recapped_day = day
+            return
+        fields = {
+            "day": day,
+            "day_start": round(float(owed.get("day_start") or 0.0), 2),
+            "unmeasured": ["equity", "pnl"],
+            "reason": "desk_down_across_the_day_boundary",
+        }
+        if owed.get("days_skipped") is not None:
+            fields["days_skipped"] = int(owed["days_skipped"])
+        if owed.get("last_observed_equity") is not None:
+            fields["last_observed_equity"] = round(
+                float(owed["last_observed_equity"]), 2
+            )
+        if owed.get("last_observed_at"):
+            fields["last_observed_at"] = int(owed["last_observed_at"])
+        self._emit("recap", **fields)
+        # AFTER the emit, same rule as `_maybe_daily_recap`: a raising `_emit`
+        # must not mark the day done.
+        self._recapped_day = day
+
     def _maybe_daily_recap(self, acct, now) -> None:
         key = day_key(now)
         snap = self.risk.snapshot
@@ -2457,6 +2585,24 @@ def _format_event(event: str, fields: dict[str, Any]) -> str:
             f"ok={fields.get('ok')} order={fields.get('order')}"
         )
     if event == "recap":
+        unmeasured = list(fields.get("unmeasured") or [])
+        if unmeasured:
+            # FIRST, before anything reads `pnl`. `float(None or 0)` is 0.0, so
+            # the line below would render `pnl=+0` for a day whose result was
+            # never observed, which is the zero-standing-in-for-an-unanswered
+            # question this repo keeps finding (straightedge#129).
+            skipped = fields.get("days_skipped")
+            tail = ""
+            if fields.get("last_observed_equity") is not None:
+                tail = f", last observed equity={fields.get('last_observed_equity')}"
+            boundaries = (
+                f" ({skipped} day boundary(s) missed)" if skipped is not None else ""
+            )
+            return (
+                f"RECAP {fields.get('day')} day_start={fields.get('day_start')} "
+                f"pnl=NOT MEASURED: the desk was down across the day boundary"
+                f"{boundaries}{tail}"
+            )
         pnl = float(fields.get("pnl") or 0)
         sign = "+" if pnl >= 0 else ""
         # Head only. The day's rows are a PULL (`/recap`), never pushed: see

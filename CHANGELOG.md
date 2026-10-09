@@ -4,6 +4,75 @@ NOTE: Operator docs from 1.0.0 use 8th-grade Simplified Technical English.
 Do not treat older changelog wording as the operator contract.
 See README.md and docs/CONTRACT.md.
 
+## 1.7.1
+
+### The day that ended while the desk was down is no longer silent (issue #129)
+
+`Engine.start()` calls `risk.observe()` before the first tick, which rolls
+`snapshot.day_key` to today. `_maybe_daily_recap` only emits when
+`snap.day_key` differs from today, so after any restart across a UTC midnight
+the condition was already false and **the recap for the day that just ended was
+never sent at all.** No journal row, no message, and nothing to tell "that day
+was recapped" from "that day's recap was swallowed by a restart". A desk
+restarted nightly, by a supervisor, a deploy, a VPS reboot or a crash loop, lost
+its P&L summary on exactly the days something went wrong.
+
+The counterpart to #119, not a duplicate: that one was too many recaps.
+
+**The ordering in `start()` is not the bug and is unchanged.** Every gate must
+have an observed snapshot before anything is evaluated, so the fix reads what
+the roll is about to discard: the ended day's key and its `day_start_equity`
+live nowhere else once `observe()` has rolled.
+
+**The announcement carries NO P&L, and that is the design.** The ended day's
+closing equity was never observed. The persisted snapshot holds `equity` only as
+of its last DURABLE write (`_durable()` is day key, day start, peak, and the two
+counters, so an ordinary equity move does not write), which on a losing day is
+the last peak and therefore ABOVE the real close: a P&L computed from it would
+be wrong in the flattering direction. #129 says in as many words that a recap
+reporting the wrong baseline is worse than no recap, so `equity` and `pnl` are
+ABSENT from the row and `unmeasured` names them, in the shape `SymbolSpec` and
+`VenueClock` already use. A missing field cannot be misread; a zero can. The
+notify line reads `pnl=NOT MEASURED: the desk was down across the day boundary`,
+and the formatter branches on `unmeasured` BEFORE it reads `pnl`, because
+`float(None or 0)` is `0.0` and would have rendered `pnl=+0` for a day nobody
+measured.
+
+**One row per restart, not one per missed day.** A box down for a week emits a
+single row naming the last day it observed and `days_skipped=7`. The bound is
+the design rather than a cap applied afterwards.
+
+**Announced once, and the marker is the JOURNAL.** A crash loop clears
+in-process memory, so `_recapped_day` cannot guard this: three restarts would
+be three announcements, which is #119's defect arriving by the other door. The
+next process reads the last `recap` row's `day` instead. The equity snapshot
+deliberately gains no field and no `SNAPSHOT_VERSION` bump: that file is the
+money gate's input and recap bookkeeping has no business in it. The known cost
+is stated rather than hidden: a journal rotation (10MB) landing between two
+boots could allow one duplicate message, which is a better failure than
+versioning the money file.
+
+**It is a `recap` event rather than a new event name, and that is a delivery
+decision.** Every `config.toml` written before this change enumerates
+`notify_events` explicitly, which is the same argument
+`telegram.ALWAYS_NOTIFY_EVENTS` carries, so a new name would have reached nobody
+on the live box. The operator who needs this row is the one whose desk just
+restarted.
+
+**Two markers now, for two different things, and the old rationale is
+corrected in place.** The comment on `_recapped_day` argued that a
+journal-restored marker "would guard a state no restart can reach". The first
+half of that reasoning was true and the conclusion was wrong, and
+`tests/test_recap_bounds.py::test_a_restart_while_halted_does_not_re_send_the_recap`
+documented the same conclusion in its docstring. Both now say what is actually
+true: the in-process marker guards a boundary this process watched, and the
+restart case has its own marker.
+
+Six cases pin it, including both controls: a same-day restart announces nothing
+and a first-ever start announces nothing, so the new row cannot fire on an
+ordinary boot. A clock that moved BACKWARDS across a boundary is deliberately
+not reported as a missed recap; that is a different fault.
+
 ## 1.7.0
 
 ### One clock: a broker bar stamp is not UTC, and the offset is measured (issue #172)
