@@ -1,5 +1,7 @@
 # Contract
 
+`docs/TESTING.md` is the companion to this file: this one says what the suite enforces, that one says what a green suite cannot see. Read it before writing a fixture.
+
 Code that disagrees with this file is wrong.
 
 The bot is the Python process on this computer.
