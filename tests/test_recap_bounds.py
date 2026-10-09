@@ -779,6 +779,23 @@ def test_a_rotation_between_two_boots_does_not_hide_the_ended_day(
 
     The rotation is driven by a rename rather than by writing 10MB, which is
     exactly what `Journal._rotate_if_needed` does to get there.
+
+    THREE PRECONDITIONS MAKE THIS CASE CAPABLE OF REDDING, measured rather
+    than assumed, because dropping the `.1` read is an EQUIVALENT mutant
+    without all three. (1) A session row before today must exist in `.1`, or
+    both versions of the scan find nothing and neither owes the day. (2) No
+    session row before today may exist in the CURRENT file, or the mutated
+    scan finds the day there too and both announce. (3) No `recap` row
+    covering the ended day may be readable by the MARKER, which reads the
+    current file ONLY, or `_owed_recap_day` returns None on both trees. A
+    fresh current file supplies (2) and (3) at once, which is exactly what a
+    real rotation leaves behind, and the assertions below say so instead of
+    relying on it.
+
+    A `recap` row in `.1` ALONE does not break the red, because the marker
+    cannot see it. That asymmetry is the very thing this case exists to pin,
+    so it is stated here rather than discovered by the next person who tries
+    to strengthen the fixture.
     """
     clock = [datetime(2024, 1, 3, 12, tzinfo=timezone.utc)]
     first = _engine(tmp_path, clock, cfg=_cfg(tmp_path))
@@ -791,9 +808,21 @@ def test_a_rotation_between_two_boots_does_not_hide_the_ended_day(
         "the fixture never wrote the session rows this test rotates away"
     )
     live.rename(tmp_path / "j.jsonl.1")
-    # The only evidence this desk was ever alive now sits in `.1`. A scan of
-    # the current file alone has nothing to find, which is precisely the state
-    # a real rotation leaves between two boots.
+    rotated = [
+        json.loads(line)
+        for line in (tmp_path / "j.jsonl.1").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    # P1. Without a session row in `.1` both versions of the scan find
+    # nothing, and the mutation is equivalent.
+    assert [r for r in rotated if r.get("event") in ("start", "stop")], (
+        "the rotated file holds no session row, so this case cannot red: "
+        "both versions of the scan would find nothing"
+    )
+    # P2 and P3 at once, because the current file does not exist at all: the
+    # mutated scan has no session row to find there, and the MARKER, which
+    # reads the current file only, has no `recap` row to find either. This is
+    # precisely the state a real rotation leaves between two boots.
     assert not live.exists()
 
     clock[0] = datetime(2024, 1, 4, 8, 0, tzinfo=timezone.utc)
@@ -817,11 +846,18 @@ def test_a_recap_row_is_not_evidence_that_the_desk_was_alive(tmp_path) -> None:
     `"recap"` to `SESSION_EVENTS` and every case still passed, so the reasoning
     was right and nothing held it.
 
-    THE RECAP ROW HERE NAMES A LATER DAY THAN THE SESSION ROWS, and that is the
-    only shape in which the scoping is observable. A recap row naming a day the
-    session rows already name cannot red anything, because it loses the
-    comparison either way; this one would WIN it and change the answer. That is
-    why the obvious version of this assertion is not the one written here.
+    THE RECAP ROW HERE NAMES A LATER DAY THAN THE SESSION ROWS, and that is
+    the precondition that makes this case capable of redding. A recap row
+    naming a day the session rows already name cannot red anything, because it
+    loses the `best < stamp` comparison either way; this one WINS it and
+    changes the answer. That is why the obvious version of this assertion, a
+    journal holding only recap rows, is not the one written here: it returns
+    nothing owed on both trees and the mutation is equivalent.
+
+    The second precondition is that a session row exists at all, and it is
+    enforced by the assertion VALUE rather than by a separate line: a scan that
+    found nothing would return the empty string and fail the comparison
+    against `2024-01-02`.
     """
     journal = Journal(tmp_path / "j.jsonl")
     journal.write("start", day="2024-01-02")
