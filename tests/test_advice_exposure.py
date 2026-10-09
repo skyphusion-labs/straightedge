@@ -469,9 +469,16 @@ def test_a_zero_cap_over_an_open_book_reports_zero_room_everywhere(tmp_path) -> 
     text = engine.exposure_text()
     cap, net, room = _parse(text)
     assert cap == 0
-    assert set(room) == {"EUR", "GBP", "USD"}
+    # The codes come from the ENGINE's own computation, not from a literal.
+    # Hardcoding {"EUR","GBP","USD"} coupled this test to which symbols
+    # `_plant_two_usd_shorts` happens to buy: #176 changes its second leg to
+    # LINKUSD so the book is not 3+3, and the two changes merge CLEANLY while
+    # the combined suite reds. Measured, not predicted. A clean merge is not a
+    # passing merge, and an assertion naming a fixture detail it does not care
+    # about is what turns an unrelated fixture edit into a failure.
+    assert set(room) == set(currency_exposure(_committed(engine)))
     assert all(abs(net[c]) > cap for c in room), net
-    assert room == {"EUR": 0, "GBP": 0, "USD": 0}, room
+    assert set(room.values()) == {0}, room
     assert "room=-" not in text, text
     engine.stop()
 
