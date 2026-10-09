@@ -55,13 +55,13 @@ lower bound published as a maximum is the defect being fixed. The heartbeat is
 not risk state, is not rotated, is already 0600 and atomically replaced, and is
 already the file the figure is published in, so no new sidecar was added.
 
-**What it cannot see, stated rather than implied.** The figure is a maximum over
-the heartbeats that SURVIVED. Deleting `journal.heartbeat` resets the box
-history and that is the only way to lose it. A desk upgrading from 1.6.x starts
-the chain at its own observations: the previous process's `tick_gap_max_s` is
-deliberately NOT adopted, because that is the other question's number and
-adopting it would reintroduce the conflation. `watch` reports a missing
-`over_budget_ever` as unknown and never as clean.
+**What it cannot see, stated rather than implied.** The figure is a maximum
+over the heartbeats that SURVIVED. Deleting `journal.heartbeat` resets the box
+history and that is the only way to lose it. A desk upgrading from a build
+before 1.8.0 starts the chain at its own observations: the previous process's
+`tick_gap_max_s` is deliberately NOT adopted, because that is the other
+question's number and adopting it would reintroduce the conflation. `watch`
+reports a missing `over_budget_ever` as unknown and never as clean.
 
 **Every breach is also journaled**, as `tick_gap_breach` with `gap_s`,
 `budget_s`, `symbols` and `run_id`, once per process per breach. The heartbeat
@@ -76,10 +76,23 @@ measurement.
 **Red first.** `tests/test_tick_gap_survives_restart.py` drives two real desk
 processes over a monkeypatched monotonic clock and lets `_write_heartbeat`
 measure the 608.5 itself; nothing assigns the figure. Six mutations were run
-and each produced a named failure: no restore, a restore that overwrites the
-live measurement instead of taking a maximum, a restore that adopts the
-previous process's figure, the watcher note removed, a missing field read as
-clean, and the breach printed but not journaled.
+and each produced a named failure: no restore at all, the live process not
+contributing to the box figure, a restore that adopts the previous process's
+`tick_gap_max_s`, the watcher note removed, a missing field read as clean, and
+the breach printed but not journaled.
+
+**One mutation was run and is NOT in that list, because it cannot fire.**
+Replacing the RESTORE's own `max(self._hb_gap_ever_s, float(raw))` with a plain
+assignment leaves the whole suite green (1349 passed), and correctly so: the
+restore happens once, before any live write, when the carried figure is still
+`0.0`, and a gap is never negative, so the two forms cannot be told apart by
+any reachable input. That `max` is defensive rather than load-bearing. The
+load-bearing one is in the WRITER, where the live process's own observation is
+folded in, and dropping THAT reds four tests. An earlier draft of this entry
+described the equivalent one as though it were the proof, which would have
+claimed a red-proof that is not one; recorded here rather than silently
+corrected, because an equivalent mutant wants a stated reason and not a test
+(`docs/TESTING.md`).
 
 ### Fix-forward, in the same change
 
