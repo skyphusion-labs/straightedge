@@ -36,6 +36,7 @@ from straightedge.constants import (
     TRADE_RETCODE_POSITION_CLOSED,
     TRADE_RETCODE_TRADE_DISABLED,
 )
+from straightedge.risk import parse_fx
 from straightedge.models import (
     Account,
     Bar,
@@ -89,7 +90,7 @@ def default_spec(name: str) -> SymbolSpec:
             trade_stops_level=10,
             trade_freeze_level=0,
             filling_mode=_IOC,
-            currency_base=n[:3],
+            currency_base=(parse_fx(n) or (n[:3], "JPY"))[0],
             currency_profit="JPY",
             currency_margin="USD",
             spread=20,
@@ -107,8 +108,11 @@ def default_spec(name: str) -> SymbolSpec:
         trade_stops_level=10,
         trade_freeze_level=0,
         filling_mode=_IOC,
-        currency_base=n[:3] if len(n) >= 6 else "EUR",
-        currency_profit=n[3:6] if len(n) >= 6 else "USD",
+        # Through the one table, not a 3-and-3 split (#98). A fixture whose
+        # currencies disagree with `parse_fx` would let a future conversion
+        # path pass in tests and fail on a real DOGEUSD spec.
+        currency_base=(parse_fx(n) or ("EUR", "USD"))[0],
+        currency_profit=(parse_fx(n) or ("EUR", "USD"))[1],
         currency_margin="USD",
         spread=10,
     )

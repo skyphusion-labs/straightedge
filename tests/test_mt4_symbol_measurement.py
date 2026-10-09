@@ -391,3 +391,116 @@ def test_the_expert_emits_enough_decimals_to_carry_a_thousandth(tmp_path: Path) 
         "the Expert truncates these to too few decimals, which manufactures a "
         "zero the adapter then has to refuse:\n" + "\n".join(thin)
     )
+
+
+# --------------------------------------------------------------------------
+# Issue #98: the last 3-and-3 split in the tree
+# --------------------------------------------------------------------------
+
+
+def test_a_crypto_name_is_not_cut_three_and_three(tmp_path: Path) -> None:
+    """The #77 misreading, in the copy nobody reads yet (issue #98).
+
+    `currency_base`/`currency_profit` are not on the MT4 wire, so the adapter
+    falls back to a convention. That convention was `n[:3]` / `n[3:6]`, which
+    cuts a ticker longer than three characters into codes the broker never
+    quoted: DOGEUSD became DOG / EUS, AVAXUSD became AVA / XUS, MATICUSD became
+    MAT / ICU.
+
+    It goes live the moment any path reads `currency_profit` to convert a tick
+    value or a risk amount into account currency: a sizer handed `EUS` would
+    produce a WRONG LOT SIZE on a real-money order rather than a refusal. The
+    old values are asserted against by name, so this cannot pass by accident if
+    the split ever comes back.
+    """
+    cases = {
+        "DOGEUSD": ("DOGE", "USD", "DOG", "EUS"),
+        "AVAXUSD": ("AVAX", "USD", "AVA", "XUS"),
+        "MATICUSD": ("MATIC", "USD", "MAT", "ICU"),
+        "BTCUSDT": ("BTC", "USD", "BTC", "USD"),
+    }
+    for name, (base, profit, bad_base, bad_profit) in cases.items():
+        with wired(tmp_path, {"symbol": t_symbol()}):
+            spec = broker(tmp_path).symbol(name)
+        print(f"{name}: base={spec.currency_base!r} profit={spec.currency_profit!r}")
+        assert spec.currency_base == base, (
+            f"{name} derived base {spec.currency_base!r}, wanted {base!r}"
+        )
+        assert spec.currency_profit == profit, (
+            f"{name} derived profit {spec.currency_profit!r}, wanted {profit!r}"
+        )
+        if bad_base != base:
+            assert spec.currency_base != bad_base, f"{name} is cut 3-and-3 again"
+        if bad_profit != profit:
+            assert spec.currency_profit != bad_profit, f"{name} is cut 3-and-3 again"
+        # Still a convention, never a measurement: MQL4 cannot send these.
+        assert "currency_base" in spec.unmeasured
+        assert "currency_profit" in spec.unmeasured
+
+
+def test_a_name_the_table_cannot_confirm_derives_nothing(tmp_path: Path) -> None:
+    """`parse_fx` confirms both halves or answers None, and None means empty.
+
+    An invented code is worse than an absent one, because `unmeasured` already
+    carries "we do not know" and a plausible-looking three letters does not.
+    `PEPEUSD` is the case the crypto suite pins as unresolvable (PEPE is not in
+    the table), so the convention has nothing to offer and must say so.
+    """
+    for name in ("PEPEUSD", "US30", "GER40"):
+        with wired(tmp_path, {"symbol": t_symbol()}):
+            spec = broker(tmp_path).symbol(name)
+        print(f"{name}: base={spec.currency_base!r} profit={spec.currency_profit!r}")
+        assert spec.currency_base == "", f"{name} invented a base"
+        assert spec.currency_profit == "", f"{name} invented a profit currency"
+        assert "currency_base" in spec.unmeasured
+        assert "currency_profit" in spec.unmeasured
+
+
+def test_the_adapter_derivation_is_the_exposure_limits_derivation(tmp_path: Path) -> None:
+    """ONE derivation, so the two cannot diverge again (#77, #98).
+
+    #77 fixed the split where the currency-exposure limit reads it and left
+    this copy behind, which is how a tree ends up with two answers to the same
+    question. This asserts the adapter's convention IS `parse_fx`, over a
+    mixture of FX, metal, crypto and non-pair names, rather than asserting a
+    second hand-written table that could drift the same way.
+    """
+    from straightedge.risk import parse_fx
+
+    names = (
+        "EURUSD", "USDJPY", "GBPUSD", "USDTRY", "XAUUSD", "XAGUSD",
+        "DOGEUSD", "AVAXUSD", "MATICUSD", "BTCUSD", "BTCUSDT", "USDTUSD",
+        "PEPEUSD", "US30", "GER40", "EUR", "",
+    )
+    disagreements = []
+    for name in names:
+        with wired(tmp_path, {"symbol": t_symbol()}):
+            spec = broker(tmp_path).symbol(name)
+        want = parse_fx(name) or ("", "")
+        got = (spec.currency_base, spec.currency_profit)
+        if got != want:
+            disagreements.append((name, got, want))
+    print(f"checked {len(names)} names, {len(disagreements)} disagreement(s)")
+    assert not disagreements, f"adapter and parse_fx disagree: {disagreements}"
+
+
+def test_the_paper_fixture_agrees_with_parse_fx() -> None:
+    """A fixture that disagrees lets a conversion path pass in tests (#98).
+
+    `paper.default_spec` carried the same 3-and-3 split. A future sizer tested
+    only against the paper broker would see `DOGE`/`USD` from a fixture and
+    `DOG`/`EUS` from the MT4 adapter, which is the shape of bug that reaches
+    production green.
+    """
+    from straightedge.risk import parse_fx
+
+    for name in ("EURUSD", "USDJPY", "DOGEUSD", "MATICUSD", "XAUUSD", "BTCUSDT"):
+        spec = default_spec(name)
+        want = parse_fx(name)
+        assert want is not None, name
+        print(f"paper {name}: base={spec.currency_base!r} profit={spec.currency_profit!r}")
+        assert spec.currency_base == want[0], f"{name}: {spec.currency_base!r} != {want[0]!r}"
+        if "JPY" not in name:
+            assert spec.currency_profit == want[1], (
+                f"{name}: {spec.currency_profit!r} != {want[1]!r}"
+            )
