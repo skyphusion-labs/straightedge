@@ -1,3 +1,4 @@
+from dataclasses import replace
 from datetime import datetime, timezone
 
 from straightedge.broker.paper import PaperBroker
@@ -395,11 +396,29 @@ def test_replace_pending_refuses_for_lack_of_loss_room(tmp_path) -> None:
     limit = spec.normalize_price(tick.ask - 0.002)
     sl = spec.normalize_price(limit - 0.005)
     tp = spec.normalize_price(limit + 0.010)
+    # THE RESTING ORDER IS SIZED BELOW TODAY'S CAP ON PURPOSE (#164).
+    #
+    # These fixtures used to size the order AT the per-trade cap and propose
+    # `limit - 0.001`, which moves the entry TOWARD the stop: worst 50.00 ->
+    # 40.00, a REDUCTION. So the #104 pin asserted that a strictly
+    # risk-REDUCING replacement is refused, which is the behaviour #164 ruled
+    # wrong, and the increase direction #104 actually described was never
+    # pinned. Direction was not a variable when this was written.
+    #
+    # Flipping the direction alone does not work: an order sized AT the cap has
+    # an EMPTY band for "an increase that still fits the per-trade cap", since
+    # any increase on it breaches `per_trade` too and the pre-#157 arithmetic
+    # would refuse it as well. Same structural fact as #170's scaled-out
+    # position. So the order is sized at 0.2% to leave the band open and the cap
+    # is restored to 0.5% before the replacement is measured.
+    engine.cfg.risk.risk_pct = 0.002
     engine.handle_command(
         TgCommand("1", 1, f"/buy EURUSD limit={limit} sl={sl} tp={tp}", 1)
     )
     engine.handle_command(TgCommand("1", 1, "/confirm", 2))
     order = engine.broker.orders()[0]
+    engine.cfg.risk.risk_pct = 0.005
+    worst_resting = money_per_lot_at_stop(order.price, order.sl, spec) * order.volume
 
     account = engine.broker.account()
     r = engine.cfg.risk
@@ -420,8 +439,14 @@ def test_replace_pending_refuses_for_lack_of_loss_room(tmp_path) -> None:
     assert engine.risk.circuit_reason(account, engine.now_fn()) == ""
     assert 0 < room < per_trade, f"no window: room={room} per_trade={per_trade}"
 
-    new_px = spec.normalize_price(limit - 0.001)
+    # Entry moved AWAY from the stop, so this is an INCREASE: the direction
+    # #104 is about and the one #164's carve-out must never cover.
+    new_px = spec.normalize_price(limit + 0.0015)
     worst = money_per_lot_at_stop(new_px, order.sl, spec) * order.volume
+    assert worst > worst_resting + 1e-6, (
+        f"worst={worst} does not exceed the resting {worst_resting}; "
+        "#164's carve-out would allow this regardless of the cap"
+    )
     # The refusal must come from the loss-room term ALONE. If `worst` also
     # breached the per-trade cap, the old arithmetic would refuse too and this
     # test could not tell the fixed guard from the broken one.
@@ -452,11 +477,29 @@ def test_replace_pending_still_allows_a_replacement_that_fits(tmp_path) -> None:
     limit = spec.normalize_price(tick.ask - 0.002)
     sl = spec.normalize_price(limit - 0.005)
     tp = spec.normalize_price(limit + 0.010)
+    # THE RESTING ORDER IS SIZED BELOW TODAY'S CAP ON PURPOSE (#164).
+    #
+    # These fixtures used to size the order AT the per-trade cap and propose
+    # `limit - 0.001`, which moves the entry TOWARD the stop: worst 50.00 ->
+    # 40.00, a REDUCTION. So the #104 pin asserted that a strictly
+    # risk-REDUCING replacement is refused, which is the behaviour #164 ruled
+    # wrong, and the increase direction #104 actually described was never
+    # pinned. Direction was not a variable when this was written.
+    #
+    # Flipping the direction alone does not work: an order sized AT the cap has
+    # an EMPTY band for "an increase that still fits the per-trade cap", since
+    # any increase on it breaches `per_trade` too and the pre-#157 arithmetic
+    # would refuse it as well. Same structural fact as #170's scaled-out
+    # position. So the order is sized at 0.2% to leave the band open and the cap
+    # is restored to 0.5% before the replacement is measured.
+    engine.cfg.risk.risk_pct = 0.002
     engine.handle_command(
         TgCommand("1", 1, f"/buy EURUSD limit={limit} sl={sl} tp={tp}", 1)
     )
     engine.handle_command(TgCommand("1", 1, "/confirm", 2))
     order = engine.broker.orders()[0]
+    engine.cfg.risk.risk_pct = 0.005
+    worst_resting = money_per_lot_at_stop(order.price, order.sl, spec) * order.volume
 
     account = engine.broker.account()
     r = engine.cfg.risk
@@ -465,10 +508,148 @@ def test_replace_pending_still_allows_a_replacement_that_fits(tmp_path) -> None:
     # min(per_trade, loss_room) is the per-trade half and nothing changes.
     assert engine.risk.loss_room(account) > per_trade
 
-    new_px = spec.normalize_price(limit - 0.001)
+    worst = money_per_lot_at_stop(
+        spec.normalize_price(limit + 0.0015), order.sl, spec
+    ) * order.volume
+    # An INCREASE that FITS. Without the first assert this control would
+    # pass through #164's carve-out and stop controlling anything: a cap
+    # that refused every increase would still leave it green.
+    assert worst > worst_resting + 1e-6, (worst, worst_resting)
+    assert worst <= per_trade + 1e-6, (worst, per_trade)
+
+    # Entry moved AWAY from the stop, so this is an INCREASE: the direction
+    # #104 is about and the one #164's carve-out must never cover.
+    new_px = spec.normalize_price(limit + 0.0015)
     reply = engine.handle_command(
         TgCommand("1", 1, f"/replace {order.ticket} {new_px}", 3)
     )
     assert f"replace #{order.ticket}" in reply, reply
     assert abs(engine.broker.orders()[0].price - new_px) < spec.point
+    engine.stop()
+
+
+def _rest_at_cap(engine, tmp_path):
+    """One resting buy limit sized AT the per-trade cap, with the day tight.
+
+    #164's measured state: $50.00 resting, $13.80 of room, circuit clear. The
+    order is at the cap on purpose here, which is what makes a reduction the
+    only replacement the cap would otherwise refuse.
+    """
+    tick = engine.broker.tick("EURUSD")
+    spec = engine.broker.symbol("EURUSD")
+    limit = spec.normalize_price(tick.ask - 0.002)
+    sl = spec.normalize_price(limit - 0.005)
+    tp = spec.normalize_price(limit + 0.010)
+    engine.handle_command(TgCommand("1", 1, f"/buy EURUSD limit={limit} sl={sl} tp={tp}", 1))
+    engine.handle_command(TgCommand("1", 1, "/confirm", 2))
+    order = engine.broker.orders()[0]
+    engine.risk.snapshot.day_start_equity = 10_190.0
+    account = engine.broker.account()
+    r = engine.cfg.risk
+    per_trade = account.equity * r.risk_pct * r.max_risk_multiple
+    room = engine.risk.loss_room(account)
+    assert engine.risk.circuit_reason(account, engine.now_fn()) == "", (
+        "the circuit must be CLEAR or it refuses and the cap is not what is measured"
+    )
+    assert 0 < room < per_trade, (room, per_trade)
+    return order, spec, limit, per_trade, room
+
+
+def test_replace_pending_allows_a_strictly_reducing_replacement(tmp_path) -> None:
+    """A replacement that LOWERS risk is always allowed (issue #164).
+
+    `_stop_guard` already solved this shape the other way and documents the
+    asymmetry; `replace_pending` gated reductions too, so two guards on one
+    engine disagreed about whether de-risking needs permission and only one of
+    them stated its position.
+
+    #164's measurement: $50.00 resting, $40.00 proposed, $13.80 of room was
+    REFUSED, leaving `/cancel` as the operator's only move. That removes the
+    order outright rather than reducing it, so the cap left MORE risk resting
+    than allowing the reduction would. A cap that refuses the one action which
+    unconditionally lowers risk inverts its own purpose.
+    """
+    engine = _engine(tmp_path)
+    engine.start()
+    order, spec, limit, per_trade, room = _rest_at_cap(engine, tmp_path)
+
+    worst_resting = money_per_lot_at_stop(order.price, order.sl, spec) * order.volume
+    new_px = spec.normalize_price(limit - 0.001)
+    worst = money_per_lot_at_stop(new_px, order.sl, spec) * order.volume
+
+    # The three facts that make this the carve-out's test and not the cap's:
+    # it REDUCES, and the cap on its own WOULD have refused it.
+    assert worst < worst_resting - 1e-6, (worst, worst_resting)
+    assert worst > min(per_trade, room) + 1e-6, (
+        f"worst={worst} fits in min(per_trade={per_trade}, room={room}); the cap "
+        "would allow this anyway and the carve-out is not what is being tested"
+    )
+
+    reply = engine.handle_command(TgCommand("1", 1, f"/replace {order.ticket} {new_px}", 3))
+    engine.stop()
+
+    assert f"replace #{order.ticket}" in reply, reply
+
+
+def test_replace_pending_refuses_an_increase_in_the_same_state(tmp_path) -> None:
+    """The asymmetry in ONE test: same book, same room, opposite direction.
+
+    Paired with the test above so the two answers sit next to each other. Only
+    the DIRECTION changes the verdict; the threshold never moves, which is what
+    keeps #104's fail-open closed. A carve-out that leaked into the increase
+    direction would red here.
+    """
+    engine = _engine(tmp_path)
+    engine.start()
+    order, spec, limit, per_trade, room = _rest_at_cap(engine, tmp_path)
+
+    worst_resting = money_per_lot_at_stop(order.price, order.sl, spec) * order.volume
+    new_px = spec.normalize_price(limit + 0.001)
+    worst = money_per_lot_at_stop(new_px, order.sl, spec) * order.volume
+    assert worst > worst_resting + 1e-6, (worst, worst_resting)
+
+    reply = engine.handle_command(TgCommand("1", 1, f"/replace {order.ticket} {new_px}", 3))
+    engine.stop()
+
+    assert "refused: size_exceeds_risk" in reply, reply
+
+
+def test_replace_pending_refuses_an_unmeasured_spec(tmp_path) -> None:
+    """Fail CLOSED before the arithmetic (issue #161).
+
+    `money_per_lot_at_stop` needs points, and `ticks_between` returns 0.0 when
+    `trade_tick_size or point` is <= 0, so on a spec the broker never streamed
+    `worst` was 0.0 and `0.0 > min(per_trade, loss_room)` was False: EVERY
+    replacement passed the size guard and was sent. `risk.evaluate` and
+    `_stop_guard` both carry this precondition; this was the third site with
+    the same arithmetic and the only one without it.
+
+    It also has to run BEFORE #164's carve-out, which compares two numbers from
+    the same function: on an unmeasured spec BOTH are 0.0, so
+    `worst <= worst_resting` is trivially true and the carve-out would be a
+    second way to fail open. This refusal is what makes that comparison mean
+    anything, which is why the two land together.
+    """
+    engine = _engine(tmp_path)
+    engine.start()
+    tick = engine.broker.tick("EURUSD")
+    spec = engine.broker.symbol("EURUSD")
+    limit = spec.normalize_price(tick.ask - 0.002)
+    sl = spec.normalize_price(limit - 0.005)
+    tp = spec.normalize_price(limit + 0.010)
+    engine.handle_command(TgCommand("1", 1, f"/buy EURUSD limit={limit} sl={sl} tp={tp}", 1))
+    engine.handle_command(TgCommand("1", 1, "/confirm", 2))
+    order = engine.broker.orders()[0]
+
+    blind = replace(spec, trade_tick_size=0.0, point=0.0,
+                    unmeasured=frozenset({"point", "tick_size"}))
+    engine.broker.symbol = lambda name, _b=blind: _b  # type: ignore[method-assign]
+
+    # A REDUCTION, so the carve-out would cover it if this refusal were absent:
+    # that is the interaction, not a hypothetical.
+    reply = engine.handle_command(
+        TgCommand("1", 1, f"/replace {order.ticket} {spec.normalize_price(limit - 0.001)}", 3)
+    )
+    assert "refused: spec_not_measured" in reply, reply
+    assert "point" in reply and "tick_size" in reply, reply
     engine.stop()
