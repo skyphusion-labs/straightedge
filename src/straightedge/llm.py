@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from straightedge.config import AdviceConfig
+from straightedge.currencies import may_transform_symbol, normalize_model_symbol
 from straightedge.journal import redact_text
 from straightedge.telegram import Transport, UrlLibTransport
 from urllib.parse import urlsplit
@@ -177,6 +178,17 @@ def _schema_violations(obj: dict[str, Any]) -> list[str]:
     # model never named.
     if isinstance(obj.get("symbol"), str) and ("{" in obj["symbol"] or "}" in obj["symbol"]):
         out.append(f"symbol {obj['symbol']!r} contains a brace")
+    # A NON-ASCII `symbol` IS A VIOLATION, for the same reason and with the same
+    # answer (straightedge#197). It is schema-VALID by type, exactly like the
+    # brace above, and `"EURU\u017fD".upper()` is `"EURUSD"`: the transform
+    # renames it into a tradeable instrument. The parser no longer performs that
+    # transform, so this is not what stops the order; it is what makes the
+    # structured path SAY so and hold, instead of leaving the operator to infer
+    # it from a `symbol_not_allowed` refusal further down. A model that emits a
+    # name outside the instrument vocabulary it was given is also evidence the
+    # constraint did not apply, which is this function's whole subject.
+    if isinstance(obj.get("symbol"), str) and not may_transform_symbol(obj["symbol"]):
+        out.append(f"symbol {obj['symbol']!r} is not ASCII")
     for key in ("sl", "tp", "limit", "stop"):
         if key in obj and obj[key] is not None and not _is_num(obj[key]):
             out.append(f"{key} is neither a number nor null")
@@ -275,7 +287,13 @@ def parse_advice(raw: str) -> Advice:
             if action not in set(ADVICE_ACTIONS):
                 action = "hold"
             sym = obj.get("symbol")
-            symbol = str(sym).upper() if sym else None
+            # NOT `.upper()`. Uppercasing a non-ASCII name can rename it
+            # into a real instrument (straightedge#197), and `grok` and
+            # `computer` have no schema gate in front of this, so the
+            # parser is where the rule has to bind for them. The string is
+            # left exactly as sent, so `cfg.advice_allows` refuses it by
+            # name rather than the desk skipping a `None` symbol silently.
+            symbol = normalize_model_symbol(str(sym)) if sym else None
             sl = _num(obj.get("sl"))
             tp = _num(obj.get("tp"))
             limit = _num(obj.get("limit"))
