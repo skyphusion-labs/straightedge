@@ -39,7 +39,7 @@ from straightedge.risk import (
     currency_exposure,
     day_key,
 )
-from straightedge.sizing import money_per_lot_at_stop, normalize_volume
+from straightedge.sizing import MissingStop, money_per_lot_at_stop, normalize_volume
 from straightedge.state import snapshot_path_for
 from straightedge.strategy import TrendStrategy
 from straightedge.telegram import TelegramClient, TgCommand
@@ -149,19 +149,32 @@ VENUE_CLOCK_UNMEASURED = "venue_clock_unmeasured"
 #: the tick stamp the offset came from was stale and the offset is wrong by
 #: that staleness.
 #:
-#: This is the check that closes the one hole `VenueClock.measure` cannot
-#: close on its own: a staleness that is an exact multiple of the offset
-#: grid lands on a grid point and looks perfect, and the civil timezone
-#: band does not see it either (11h is 44 whole grid steps). Measured
-#: through the real adapter during the straightedge#182 review: a stamp
-#: frozen 2h at Friday's close on a UTC+3 server read as UTC+01:00, 5h as
-#: UTC-02:00, 11h as UTC-08:00. Every one of those implies a server time
-#: hours before the bar in hand, so every one of them refuses here.
+#: This NARROWS the one hole `VenueClock.measure` cannot close on its own; it
+#: does not close it, and the difference is measured rather than argued
+#: (straightedge#193). A staleness that is an exact multiple of the offset
+#: grid lands on a grid point and looks perfect, and the civil timezone band
+#: does not see it either (11h is 44 whole grid steps). Measured through the
+#: real adapter during the straightedge#182 review: a stamp frozen 2h at
+#: Friday's close on a UTC+3 server read as UTC+01:00, 5h as UTC-02:00, 11h
+#: as UTC-08:00. Every one of those implies a server time hours before the
+#: bar in hand, so every one of them refuses here.
+#:
+#: WHAT IT DOES NOT CATCH. The comparison is against the forming bar's OPEN,
+#: so it sees a staleness only once that staleness exceeds the AGE of that
+#: bar. It is therefore blind in the last moments before a bar closes:
+#: measured at a bar 899s old on a 900s series, with the caller's bound
+#: VIOLATED, a 900s-stale stamp is accepted and the instant is wrong by 900s.
+#: The residual is bounded by one bar period and the hole only opens when the
+#: measured bound is violated, which takes a defect in `step_symbol`'s own
+#: bookkeeping rather than anything a venue can do. The boundary is pinned by
+#: test rather than left to this sentence.
 #:
 #: It cannot produce a false refusal: a correct offset implies the server's
 #: real `now`, and the forming bar opened at or before that instant by
 #: definition. Both readings come from the same server clock, so our own
-#: clock cancels out of the comparison entirely.
+#: clock cancels out of the comparison entirely. Swept across bar ages and
+#: staleness with an honest bound during the straightedge#182 review: 0 false
+#: refusals in 32 combinations.
 VENUE_CLOCK_BAR_DISAGREES = "venue_clock_bar_disagrees"
 
 #: Slack on that comparison, for the integer rounding of the paired sample
@@ -1111,8 +1124,13 @@ class Engine:
         # VENUE_CLOCK_BAR_DISAGREES: this is what makes a stale stamp
         # unreachable rather than merely unlikely, and it is the only check
         # here that can see a staleness sitting exactly on the offset grid.
-        implied_server_now = (clock.measured_at or 0) + (clock.offset_sec or 0)
-        if clock.measured_at and (
+        # `clock.sampled` is the gate and `clock.measured_at` is the operand.
+        # Those were one field before straightedge#193, with a zero timestamp
+        # standing in for "nothing was sampled"; `VenueClock.__post_init__`
+        # now guarantees a sampled clock carries a real one, so the arithmetic
+        # below cannot be fed a sentinel.
+        implied_server_now = clock.measured_at + (clock.offset_sec or 0)
+        if clock.sampled and (
             implied_server_now + VENUE_CLOCK_BAR_SLACK_SEC < bars[-1].time
         ):
             self.journal.write(
@@ -1790,10 +1808,27 @@ class Engine:
         not_measured = spec.unmeasured_for_sizing()
         if not_measured:
             return "refused: spec_not_measured:" + ",".join(sorted(not_measured))
-        worst = money_per_lot_at_stop(px, sl, spec) * order.volume
-        # WHAT IS ALREADY RESTING, measured the same way, because the question the
-        # cap should ask is whether this replacement ADDS risk (#164).
-        worst_resting = money_per_lot_at_stop(order.price, order.sl, spec) * order.volume
+        # A MISSING STOP IS NAMED, NOT PRICED (#187). `sl` here is the resting
+        # order's own stop, which `/replace` does not change, so a venue-supplied
+        # `sl = 0` reaches both of these. It is the one call site that can:
+        # `_stop_guard` returns early on `sl <= 0` and `risk.evaluate` refuses
+        # `sl_required` before its own call and before `lots_for_risk`.
+        #
+        # Measured before this refusal existed, on a 0.1 lot order resting with
+        # no stop: `worst_resting` was 11,506.70 against a 50.00 cap, so moving
+        # the entry DOWN entered #164's reduction carve-out and the cap was never
+        # consulted, while moving it UP refused with `size_exceeds_risk`, which
+        # blames the size for a missing stop. Neither sent anything, because
+        # `_modify_pending` refuses `sl <= 0` on the way out, so this was a defect
+        # in what the desk SAYS rather than what it does. Being told the wrong
+        # thing about your own book is the whole reason the vocabulary exists.
+        try:
+            worst = money_per_lot_at_stop(px, sl, spec) * order.volume
+            # WHAT IS ALREADY RESTING, measured the same way, because the question
+            # the cap should ask is whether this replacement ADDS risk (#164).
+            worst_resting = money_per_lot_at_stop(order.price, order.sl, spec) * order.volume
+        except MissingStop:
+            return "refused: sl_required"
         account = self.broker.account()
         r = self.cfg.risk
         per_trade = account.equity * r.risk_pct * r.max_risk_multiple

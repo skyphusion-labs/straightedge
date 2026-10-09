@@ -146,6 +146,21 @@ class VenueClock:
     wearing a measurement's clothes. That is the `SymbolSpec.unmeasured` rule
     applied to the clock, and the two are kept in the same shape on purpose.
 
+    AN EXACT OFFSET WITH AN ERROR BAR IT DOES NOT CARRY. `offset_sec` is an
+    int and `measured` is a bool, so nothing downstream can know that the
+    instant derived from them is approximate, and the gates it feeds compare
+    exactly. The error is the venue terminal's own drift from its timezone:
+    bar stamps and `TimeCurrent()` carry that drift identically, so it cancels
+    out of a raw difference, and the grid snap then removes it from the OFFSET
+    while the bar stamp still carries it. The snap is therefore the only error
+    source in the measured path, and the residual check caps the surviving
+    error at the sample's uncertainty, which `2u < VENUE_CLOCK_GRID_SEC` holds
+    strictly under half a grid step. Measured through a real engine: at the
+    widest legal bound a 449s drift is absorbed and a 450s bound measures
+    nothing at all, while on the desk's own path, where the bound is the
+    measured poll gap, a 90s drift already refuses. A gate reading an instant
+    from this is exact to within that, never more. See `docs/CONTRACT.md`.
+
     THREE WAYS TO GET ONE, and which one a caller may use is decided by what
     that caller can measure, not by what it would like to report:
 
@@ -180,6 +195,19 @@ class VenueClock:
     #: is still None, `measured` is still False, and `to_utc` still raises.
     #: NEVER convert with this field.
     implied_offset_sec: int | None = None
+    #: Whether this clock came from READING a server, as opposed to a venue
+    #: STATING what it stamps with.
+    #:
+    #: It exists because `measured_at` was carrying this fact as a sentinel:
+    #: `declared()` left it zero, and `Engine._bar_instant` gated its
+    #: bar-disagreement check on `if clock.measured_at`, so a zero timestamp
+    #: meant "nothing was sampled". That is two meanings on one field, which is
+    #: what `__post_init__` below objects to for `offset_sec`, and the sentinel
+    #: could not simply be swapped out because `measured_at` is ALSO an operand
+    #: in that check (`measured_at + offset_sec`). So the gate reads this and
+    #: the arithmetic reads `measured_at`, and the invariant below keeps the
+    #: second one real wherever the first one is true (straightedge#193).
+    sampled: bool = False
 
     def __post_init__(self) -> None:
         """A half-measured clock cannot be built at all.
@@ -205,6 +233,20 @@ class VenueClock:
                 f"implied_offset_sec={self.implied_offset_sec!r}. An implication "
                 "is what there is INSTEAD of a measurement, never beside one."
             )
+        if self.sampled and not self.measured_at:
+            # Not a new rule, the existing one applied to a third field. A
+            # SAMPLED clock was paired with our clock at a real instant, and
+            # `Engine._bar_instant` uses `measured_at` as an OPERAND, so a
+            # sampled clock with a zero timestamp would compute an implied
+            # server time of `0 + offset` and compare that against a bar. The
+            # zero-check that used to gate it excluded this case by accident;
+            # this states it instead.
+            raise ValueError(
+                "VenueClock is sampled but carries no measured_at: a sampled "
+                "clock was paired with our clock at a real instant, and "
+                f"measured_at={self.measured_at!r} cannot be one. A venue that "
+                "STATES its offset is declared, not sampled."
+            )
 
     @property
     def measured(self) -> bool:
@@ -228,6 +270,7 @@ class VenueClock:
         measured_at: int = 0,
         detail: str = "",
         implied_offset_sec: int | None = None,
+        sampled: bool = False,
     ) -> VenueClock:
         return cls(
             offset_sec=None,
@@ -236,6 +279,7 @@ class VenueClock:
             unmeasured=frozenset(fields or ("offset_sec",)),
             detail=detail,
             implied_offset_sec=implied_offset_sec,
+            sampled=sampled,
         )
 
     @classmethod
@@ -245,6 +289,11 @@ class VenueClock:
         For the paper venue, which has no server to sample: its bars carry
         whatever the simulator or the backtest put there. No staleness exists,
         so no bound is needed and none is accepted.
+
+        `sampled` stays FALSE, which is what keeps `Engine._bar_instant` from
+        running its bar-disagreement check against a venue that never read a
+        clock. Before straightedge#193 that exclusion rode on `measured_at`
+        being zero here, which worked but said nothing.
         """
         return cls(offset_sec=int(offset_sec), measured_at=measured_at, source=source)
 
@@ -267,6 +316,20 @@ class VenueClock:
         DISPLAY and refuses every conversion. A caller holding one may print
         it, next to the fact that freshness is not established; it may not act
         on it.
+
+        THE CIVIL BAND APPLIES TO THE VALUE, NOT TO THE MEASUREMENT STATE, and
+        that distinction is the whole of straightedge#193's second item. Past
+        the band there is no offset to imply at all: UTC-17:00 and UTC-45:00
+        are not timezones, and printing them as implications lost the one
+        reading that separated "stale" from "absurd", which the pre-#182 gate
+        used to give. So `implied_offset_sec` is left ABSENT there.
+        What it must NOT do is refuse differently. `unmeasured` stays exactly
+        `{"freshness"}`, because `__main__.venue_clock_check` keys its exit
+        code on that set: returning `not_measured("offset_sec", ...)` here
+        would send doctor down the NOT MEASURED branch and exit NON-ZERO past
+        about 15h of staleness, which is a red `doctor` every weekend and the
+        exact outcome straightedge#182 decided against. A correction applied
+        through the wrong seam re-creates the thing it was correcting.
         """
         taken_at = int(utc_epoch)
         if int(venue_epoch) <= 0:
@@ -275,9 +338,11 @@ class VenueClock:
                 source=source,
                 measured_at=taken_at,
                 detail="the venue sent no server timestamp",
+                sampled=True,
             )
         raw = float(venue_epoch) - float(utc_epoch)
         snapped = int(round(raw / VENUE_CLOCK_GRID_SEC)) * VENUE_CLOCK_GRID_SEC
+        in_band = VENUE_CLOCK_MIN_OFFSET_SEC <= snapped <= VENUE_CLOCK_MAX_OFFSET_SEC
         return cls.not_measured(
             "freshness",
             source=source,
@@ -285,8 +350,15 @@ class VenueClock:
             detail=(
                 "the venue stamps its LAST TICK and this caller cannot bound "
                 "how old that is, so offset and staleness cannot be separated"
+            )
+            if in_band
+            else (
+                f"the stamp is {abs(snapped)}s from our clock, outside the civil "
+                "timezone band, so it implies no offset at all: the venue clock "
+                "is frozen or wildly stale rather than merely unbounded"
             ),
-            implied_offset_sec=snapped,
+            implied_offset_sec=snapped if in_band else None,
+            sampled=True,
         )
 
     @classmethod
@@ -322,13 +394,17 @@ class VenueClock:
         be false is not a bound.
 
         HOW IT IS USED. The sample's total uncertainty is the bound plus the
-        round trip it was read across. Two grid points are
-        `VENUE_CLOCK_GRID_SEC` apart, so the nearest grid point is the only
-        one consistent with the sample when twice that uncertainty is under
-        one grid step; otherwise several are, and the honest answer is that
-        nothing was measured. The residual check then catches a venue that is
-        not on the grid at all, or a bound that was violated by a non-multiple
-        of the grid.
+        round trip it was read across. Grid points are `VENUE_CLOCK_GRID_SEC`
+        apart, so an interval narrower than one grid step can contain at most
+        one of them, and the nearest is then the only offset consistent with
+        the sample. The test applied here, `2 * uncertainty` under one grid
+        step, is SUFFICIENT for that rather than necessary: it treats the
+        uncertainty as two-sided when staleness is in fact one-sided, so it
+        refuses some samples that could in principle be placed. That is
+        deliberate, because the direction of the error is a refusal and a
+        missed auto entry, never a wrong instant. The residual check then
+        catches a venue that is not on the grid at all, or a bound that was
+        violated by a non-multiple of the grid.
 
         WHAT NO VERSION OF THIS CAN DETECT, stated rather than implied: a
         stamp stale by an exact multiple of 900s lands on a grid point and
@@ -337,6 +413,9 @@ class VenueClock:
         defence is that the bound is MEASURED, so on the engine's path a stamp
         that old is impossible rather than merely unlikely.
         """
+        # Every return below is `sampled=True`: this method exists only for a
+        # caller that READ a server, so even its refusals are refusals about a
+        # reading that happened.
         taken_at = int(utc_epoch)
         if int(venue_epoch) <= 0:
             return cls.not_measured(
@@ -344,6 +423,7 @@ class VenueClock:
                 source=source,
                 measured_at=taken_at,
                 detail="the venue sent no server timestamp",
+                sampled=True,
             )
         bound = max(0.0, float(max_staleness_sec))
         uncertainty = bound + max(0.0, float(round_trip_sec))
@@ -357,6 +437,7 @@ class VenueClock:
                     f"plus round trip) is too wide for the {VENUE_CLOCK_GRID_SEC}s "
                     "grid, so more than one offset fits this sample"
                 ),
+                sampled=True,
             )
         raw = float(venue_epoch) - float(utc_epoch)
         snapped = int(round(raw / VENUE_CLOCK_GRID_SEC)) * VENUE_CLOCK_GRID_SEC
@@ -370,6 +451,7 @@ class VenueClock:
                     f"{VENUE_CLOCK_GRID_SEC}s grid, wider than the {uncertainty:.0f}s "
                     "this sample allows, so it is not an offset"
                 ),
+                sampled=True,
             )
         if not VENUE_CLOCK_MIN_OFFSET_SEC <= snapped <= VENUE_CLOCK_MAX_OFFSET_SEC:
             return cls.not_measured(
@@ -380,8 +462,11 @@ class VenueClock:
                     f"offset {snapped}s is outside the civil timezone band, so the "
                     "venue clock is frozen or stale rather than offset"
                 ),
+                sampled=True,
             )
-        return cls(offset_sec=snapped, measured_at=taken_at, source=source)
+        return cls(
+            offset_sec=snapped, measured_at=taken_at, source=source, sampled=True
+        )
 
 
 @dataclass(frozen=True)

@@ -4,6 +4,133 @@ NOTE: Operator docs from 1.0.0 use 8th-grade Simplified Technical English.
 Do not treat older changelog wording as the operator contract.
 See README.md and docs/CONTRACT.md.
 
+## Unreleased
+
+### Claims that overstate their code, and a missing adapter note (issue #193)
+
+Residue from straightedge#182's approving review. Every item is a sentence, a
+one-branch change or a test; no behaviour on the trading path moves.
+
+- **`VENUE_CLOCK_BAR_DISAGREES` said it made a stale stamp "unreachable rather
+  than merely unlikely". It NARROWS.** The comparison is against the forming
+  bar's OPEN, so it sees a staleness only once that staleness exceeds the
+  bar's AGE, which leaves it blind in the last moments before a bar closes:
+  measured at a bar 899s old on a 900s series with the caller's bound violated,
+  a 900s-stale stamp is accepted and the instant is wrong by 900s. The wording
+  now says narrows, names the residual, and the boundary is pinned by test
+  (`898` refuses, `899` does not) rather than left to the sentence.
+- **`implied()` offered an offset outside the civil timezone band.** A clock
+  frozen 48h on a UTC+3 server was reported as implying `UTC-45:00`, which is
+  not a timezone, and the pre-#182 gate did say "outside the civil timezone
+  band" at that staleness, so the display had lost the one reading that
+  separated stale from absurd. Past the band `implied_offset_sec` is now
+  absent and `doctor` says the stamp implies NO offset.
+  **The band applies to the VALUE and not to the measurement state**, which is
+  the part worth keeping: `venue_clock_check` keys its EXIT CODE on
+  `unmeasured == {"freshness"}`, so refusing differently here would send
+  doctor down the NOT MEASURED branch and exit non-zero past about 15h of
+  staleness. That is a red `doctor` every weekend, which #182 decided against.
+  A correction applied through the wrong seam re-creates the thing it was
+  correcting, and a test pins the exit code at zero.
+- **`measured_at` was carrying two meanings.** `declared()` left it zero and
+  `Engine._bar_instant` gated its cross-check on `if clock.measured_at`, so a
+  zero timestamp meant "nothing was sampled". That is what `__post_init__`
+  already objects to for `offset_sec`. There is now a `sampled` flag for the
+  gate, and the sentinel could not simply be dropped because `measured_at` is
+  ALSO an operand in that check (`measured_at + offset_sec`), so
+  `__post_init__` asserts that a sampled clock carries a real timestamp. The
+  existing rule stated about a third field, not a new one: no current test or
+  live path can produce the shape it rejects.
+- **`Broker.venue_clock` is a contract change for a third-party adapter**, and
+  this was missing from 1.7.0's entry. The method was added in 1.7.0 and takes
+  a keyword-only `max_staleness_sec`. An adapter written against 1.6.0 has no
+  such method and reads as NOT MEASURED through `venue_clock_of`, which
+  refuses rather than assuming UTC; an adapter that added the 1.7.0 method
+  without that argument now fails on the CALL rather than on the `getattr`.
+  Either way the auto leg refuses every signal and `doctor --connect` is where
+  it shows.
+- **The uncertainty rule is conservative by design**, and said so as though it
+  were exact. `2 * uncertainty` under one grid step is SUFFICIENT rather than
+  necessary, because it treats a one-sided staleness as two-sided; it refuses
+  some samples that could in principle be placed, and the direction of that
+  error is a refusal rather than a wrong instant. Code unchanged.
+
+### A regression guard that could not go red
+
+- **`test_no_staleness_is_reported_as_a_measured_offset` passed six ways under
+  a mutation making `implied()` return a measured clock.** It asserted
+  `"measured" not in out`, and that mutation sends `doctor` down the
+  `if clock.measured:` branch, which prints "declared by the venue": the word
+  never appeared, so the guard named for the #182 blocking finding stayed green
+  while doctor confidently asserted a wrong offset. **It pinned the WORD, not
+  the CLAIM.** It now asserts the clock's state and the branch taken, so
+  rephrasing either print line cannot make it decorative again.
+
+### A transform on a model-chosen symbol can no longer manufacture one (issue #197, p0-safety)
+
+`"EURUſD".upper()` is `"EURUSD"`. Unicode uppercasing maps U+017F LATIN SMALL
+LETTER LONG S onto ASCII `S`, so a model reply naming an instrument that does
+not exist reached the desk as a staged BUY on one that does. Measured through
+the shipped functions on merged `main`:
+
+```
+sent='EURUſD'  ->  parsed='EURUSD'  action='buy'  advice_allows=True
+```
+
+The string is a valid `["string","null"]`, carries no brace, raises no schema
+violation and survives `_JSON_TAIL`. The ligatures `ff`, `fi` and `st`, the
+dotless `i`, and `ß` (which expands to `SS`) all transform the same way.
+
+**The same shape as the brace defect #181 fixed, one character different:** a
+repair on `symbol` turns a NAMED REFUSAL into an order.
+
+**#181's own guard could not see it, and that is worth knowing because the
+guard reads like a general safety net.**
+`test_a_braced_symbol_is_not_more_permissive_than_the_bare_parser` compares the
+structured path against the bare parser, and both transform identically here:
+a comparison between two paths is blind to a defect they share. Fixing this by
+extending that comparison would have produced a green test over a live defect.
+
+**The rule is ASCII BEFORE the transform, applied at every site that can
+transform, and it is not a codepoint blocklist.** `isascii()` separates every
+member of this family from every legitimate instrument name, and the next
+case-mapping character is always one nobody enumerated. Four sites, each
+sufficient on its own to have kept the defect alive:
+
+- `config.advice_allows` refuses a non-ASCII name itself, rather than trusting a
+  caller to have checked. The issue measured it returning True with no parser
+  involved at all.
+- `llm.parse_advice` leaves the name EXACTLY as sent instead of uppercasing it.
+  `grok` and `computer` have no schema gate, so the parser is the only gate
+  they have. The name is not blanked either: a `None` symbol makes the desk skip
+  its staging block in silence, and the whitelist refusal is the loud answer.
+- `llm._schema_violations` reports `symbol ... is not ASCII` and forces `hold`,
+  so the structured path SAYS what was wrong instead of leaving an operator to
+  infer it from a refusal further down. A model emitting a name outside the
+  instrument vocabulary it was given is also evidence the schema constraint did
+  not apply, which is that function's whole subject.
+- `desk` names the string the MODEL sent in the `symbol_not_allowed` record and
+  in the chat line. It used to log `advice.symbol.upper()`, so the refusal for
+  `EURUſD` would have read `EURUSD`: a named refusal for an instrument that IS
+  allowed, which looks like a bug in the whitelist rather than a rejected reply.
+
+**The operator's own whitelist is held to the same rule**, because the claim in
+`advice_allows` was not true without it: the config loader did
+`[str(x).upper() for x in advice_names]`, so a typo of `EURUſD` in
+`advice.symbols` became `EURUSD` before any gate could filter it, silently
+widening the list to a symbol nobody typed. It now stays as typed and matches
+nothing, which is a visible failure rather than an invisible widening.
+
+`eurusd` still works throughout. An ASCII case fold is the same instrument, and
+that is why the rule is ASCII-before-transform rather than no transform at all.
+
+Thirty cases pin it, including the controls that keep the benign path alive and
+a pin on the two-path agreement that made #181's comparison silent. One of the
+six characters in the corpus reaches a symbol in the SHIPPED whitelist and that
+is said out loud in the corpus comment rather than left to look like six
+exploits; all six share the parser transform, which is the mechanism the rule
+binds.
+
 ## 1.8.0
 
 ### The worst tick gap this box has seen now outlives the process (issue #153)
@@ -199,6 +326,23 @@ cancels out and a correct offset cannot be refused by it. A positive control
 pins that: it caught a fixture of this change's own, which had seeded a bar an
 hour ahead of the venue's clock and was therefore observing its own refusal
 rather than the defect's.
+
+**The session window is exact only to within the clock's uncertainty, and it
+now says so.** `offset_sec` is an int and `measured` is a bool, so nothing
+downstream could know the instant carries an error bar while the gate reading it
+compares exactly. The error is the venue terminal's own drift: bar stamps and
+`TimeCurrent()` carry it identically, so it cancels from the measured
+difference, and the grid snap then removes it from the offset while the bar
+stamp keeps it, which makes the snap the only error source left in the measured
+path. The residual check caps it at the sample's uncertainty, held strictly
+under half a grid step. Measured through a real engine: at the widest legal
+bound a 449s drift is absorbed and a 450s bound measures nothing at all, while
+on the desk's own path, where the bound is the measured poll gap, a 90s drift
+refuses. Under the chosen 180s tolerance this change started with, that same
+90s silently moved a 17:00:00 instant to 16:58:30 and the session gate did not
+fire, leaving the desk armed up to three minutes past its configured close.
+`VenueClock` and `docs/CONTRACT.md` state it, four tests pin it, and the number
+has one home in `VENUE_CLOCK_GRID_SEC`.
 
 **`day_key` is the UTC day, decided and written down** (`docs/CONTRACT.md`, "One
 clock"). It was accidentally both before, which is the actual defect. The

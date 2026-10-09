@@ -342,11 +342,42 @@ class TestTheFrozenFridaySweep:
     def test_no_staleness_is_reported_as_a_measured_offset(
         self, capsys: pytest.CaptureFixture, stale_sec: float, was: str
     ) -> None:
-        """The assertion that reds if the `measured` claim ever comes back."""
+        """Asserts the PROPERTY and the branch, never the absence of a word.
+
+        This test could not go red (straightedge#193). It read
+        `"measured" not in out`, and making `implied()` return a MEASURED
+        clock sends doctor down the `if clock.measured:` branch, which prints
+        "declared by the venue". The word never appeared, so the test stayed
+        green at all six stalenesses while doctor confidently asserted a wrong
+        offset. It pinned the WORD, not the CLAIM, and a rewording of either
+        print line could have made it decorative again.
+
+        FAILS IF: a venue that SAMPLES a server hands a measured clock to a
+        caller that supplied no staleness bound, or doctor reports a sampled
+        clock as one the venue declared. Both are assertions about state, so
+        neither can be satisfied by changing prose.
+        """
         del was
-        _rc, out = self._doctor_line(capsys, stale_sec)
-        assert "measured" not in out.replace("NOT MEASURED", ""), (
-            "doctor vouched for an offset it cannot bound: " + out.strip()
+        server_now = int(NOW_EPOCH) + PLUS_3
+        broker = Mt4Broker(
+            _FakeMt4Call(int(server_now - stale_sec)), now_fn=lambda: NOW_EPOCH
+        )
+        # The property, read off the same seam doctor reads: no bound, so a
+        # sampling venue cannot produce a measurement whatever anything prints.
+        clock = venue_clock_of(broker, "EURUSD", max_staleness_sec=None)
+        assert not clock.measured, (
+            "a venue that samples a server returned a MEASURED clock to a "
+            "caller that supplied no staleness bound"
+        )
+        assert clock.offset_sec is None, "an unmeasured clock must carry no offset"
+        assert clock.sampled, "this venue read a server, so the clock is sampled"
+        # The branch taken, which is what an operator actually sees.
+        rc, out = self._doctor_line(capsys, stale_sec)
+        assert rc == 0
+        assert "freshness NOT established" in out
+        assert "declared by the venue" not in out, (
+            "doctor reported a SAMPLED clock as one the venue declared: "
+            + out.strip()
         )
 
     @pytest.mark.parametrize("stale_sec,was", SWEEP)
@@ -668,16 +699,22 @@ BAR_OPENED_AGO = 60
 
 
 def _advancing_engine(
-    tmp_path: Path, broker: _StaleSamplingPaper
+    tmp_path: Path, broker: _StaleSamplingPaper, *, bar_opened_ago: int = BAR_OPENED_AGO
 ) -> tuple[Engine, list[datetime]]:
-    """An engine whose clock, the venue's clock and the bars move together."""
+    """An engine whose clock, the venue's clock and the bars move together.
+
+    `bar_opened_ago` is a parameter because the bar-disagreement check's blind
+    spot is a function of it: the comparison is against the bar's OPEN, so the
+    check sees a staleness only once that staleness exceeds the bar's age.
+    Every existing caller keeps the default.
+    """
     cfg = BotConfig()
     cfg.journal_path = str(tmp_path / "j.jsonl")
     cfg.session.enabled = False
     cfg.risk.halt_file = str(tmp_path / "HALT")
     cfg.risk.max_spread_atr_frac = 10.0
     n = 250
-    last_open = int(broker.our_clock + broker.utc_offset_sec) - BAR_OPENED_AGO
+    last_open = int(broker.our_clock + broker.utc_offset_sec) - bar_opened_ago
     bars = generate_bars(
         n, drift=0.0006, vol=0.0002, seed=7, start_ts=last_open - (n - 1) * HOUR
     )
@@ -759,6 +796,148 @@ def test_a_fresh_sampling_venue_passes_the_bar_check(tmp_path: Path) -> None:
     engine.stop()
 
 
+@pytest.mark.parametrize("bar_opened_ago,refuses", ((898, True), (899, False)))
+def test_the_bar_check_is_blind_in_the_last_moments_before_a_bar_closes(
+    tmp_path: Path, bar_opened_ago: int, refuses: bool
+) -> None:
+    """Pin the RESIDUAL, so the constant's docstring has a test under it.
+
+    `VENUE_CLOCK_BAR_DISAGREES` used to claim it made a stale stamp
+    "unreachable rather than merely unlikely". It narrows rather than closes
+    (straightedge#193): the comparison is against the forming bar's OPEN, so it
+    sees a staleness only once that staleness exceeds the bar's AGE. With a
+    900s stale stamp the arithmetic is `refuse iff bar_opened_ago < 900 - slack`,
+    which is 899, so these two parameters are the two sides of the blind spot
+    and nothing between them exists to test.
+
+    The bound is VIOLATED here, which is the only world this check is for: a
+    900s staleness is a whole grid multiple, so it lands exactly on a grid
+    point, `measure()` reports it as a clean measurement, and the venue's own
+    bar is the only remaining contradiction.
+
+    FAILS IF: the comparison moves to the bar's CLOSE or gains a staleness
+    allowance, which would change where the blind spot sits without anything
+    else noticing.
+    """
+    broker = _StaleSamplingPaper(
+        stale_sec=VENUE_CLOCK_GRID_SEC, offset_sec=PLUS_3, balance=10_000
+    )
+    engine, clock = _advancing_engine(tmp_path, broker, bar_opened_ago=bar_opened_ago)
+    engine.start()
+    engine.step_symbol("EURUSD")
+    _advance_one_bar(engine, broker, clock)
+
+    # State the error this staleness produces, so the accepted case documents
+    # the harm rather than merely the absence of a refusal.
+    measured = broker.venue_clock("EURUSD", max_staleness_sec=1.0)
+    assert measured.measured, "a grid-multiple staleness has to survive measure()"
+    assert measured.offset_sec == PLUS_3 - VENUE_CLOCK_GRID_SEC, (
+        "the snap absorbs a whole grid step, so the offset is wrong by one"
+    )
+
+    engine.step_symbol("EURUSD")
+    got = "venue_clock_bar_disagrees" in _reject_reasons(engine)
+    assert got is refuses, (
+        f"bar opened {bar_opened_ago}s ago with a {VENUE_CLOCK_GRID_SEC}s stale "
+        f"stamp: expected refusal={refuses}, got {got}. This is the documented "
+        "blind spot and its boundary; if it moved, the constant's docstring is "
+        "now wrong again."
+    )
+    engine.stop()
+
+
+def test_a_stamp_past_the_civil_band_implies_no_offset_at_all(tmp_path: Path) -> None:
+    """Past the band there is no timezone to imply, so none is offered.
+
+    `implied()` snapped and reported whatever came out, so a 48h-frozen clock
+    on a UTC+3 server was presented as implying `UTC-45:00`. That is not a
+    timezone, and printing it lost the one reading that separated "stale" from
+    "absurd" (straightedge#193).
+
+    The band applies to the VALUE. `unmeasured` stays `{"freshness"}` on
+    purpose, which the next test pins from the doctor side.
+
+    FAILS IF: the band is applied by refusing differently instead, or not at
+    all.
+    """
+    del tmp_path
+    frozen = int(NOW_EPOCH) + PLUS_3 - 48 * HOUR
+    got = VenueClock.implied(frozen, NOW_EPOCH, source="s")
+    assert not got.measured
+    assert got.implied_offset_sec is None, (
+        "an offset outside the civil band is not an offset and must not be "
+        "offered as one"
+    )
+    assert "outside the civil" in got.detail
+    assert got.unmeasured == frozenset({"freshness"}), (
+        "the measurement STATE must not change with the band: doctor keys its "
+        "exit code on this set"
+    )
+    inside = VenueClock.implied(int(NOW_EPOCH) + PLUS_3, NOW_EPOCH, source="s")
+    assert inside.implied_offset_sec == PLUS_3, "a real offset still implies itself"
+
+
+def test_doctor_says_no_offset_past_the_band_and_still_exits_zero(
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """The seam the band must NOT be applied through.
+
+    Applying it by returning `not_measured("offset_sec", ...)` would break the
+    `unmeasured == {"freshness"}` equality in `venue_clock_check`, send doctor
+    down the NOT MEASURED branch and exit NON-ZERO past about 15h of
+    staleness. That is a red `doctor` every weekend, which straightedge#182
+    decided against. A correction applied through the wrong seam re-creates
+    the thing it was correcting.
+
+    FAILS IF: exit goes non-zero on a closed market, or the line states an
+    offset it cannot stand behind.
+    """
+    server_now = int(NOW_EPOCH) + PLUS_3
+    broker = Mt4Broker(
+        _FakeMt4Call(int(server_now - 48 * HOUR)), now_fn=lambda: NOW_EPOCH
+    )
+    rc = venue_clock_check(BotConfig(), broker)
+    out = capsys.readouterr().out
+    assert rc == 0, "a closed market is not a run-affecting fault"
+    assert "implies NO offset" in out
+    assert "freshness NOT established" in out
+    assert "UTC-" not in out, "no offset may be printed where none is implied"
+
+
+def test_a_sampled_clock_cannot_carry_a_zero_timestamp() -> None:
+    """The invariant that replaces an accidental guard.
+
+    `Engine._bar_instant` reads `measured_at` as an OPERAND
+    (`measured_at + offset_sec`). Before straightedge#193 the same field was
+    the GATE, so a sampled clock with a zero timestamp was excluded by
+    accident rather than by rule. `sampled` took over the gate, so the rule
+    has to be stated or the arithmetic could be fed a sentinel.
+
+    FAILS IF: the assertion is dropped, which would make the sentinel
+    reachable again with nothing saying so.
+    """
+    with pytest.raises(ValueError, match="sampled but carries no measured_at"):
+        VenueClock(offset_sec=0, measured_at=0, source="s", sampled=True)
+    # And the two legitimate shapes still build.
+    VenueClock(offset_sec=0, measured_at=int(NOW_EPOCH), source="s", sampled=True)
+    VenueClock.declared(PLUS_3, source="paper")
+
+
+def test_a_declared_clock_is_not_sampled() -> None:
+    """What keeps the bar check away from a venue that never read a clock.
+
+    FAILS IF: `declared()` starts reporting itself as sampled, which would put
+    the paper venue's own bars through a cross-check against a clock that was
+    never sampled from anything.
+    """
+    got = VenueClock.declared(PLUS_3, source="paper")
+    assert got.measured
+    assert got.sampled is False
+    assert VenueClock.measure(
+        int(NOW_EPOCH) + PLUS_3, NOW_EPOCH, source="s", max_staleness_sec=POLL
+    ).sampled is True
+
+
 def test_a_stamp_one_poll_stale_still_passes_the_bar_check(tmp_path: Path) -> None:
     """The boundary that matters: ordinary lag must not refuse.
 
@@ -775,4 +954,138 @@ def test_a_stamp_one_poll_stale_still_passes_the_bar_check(tmp_path: Path) -> No
     _advance_one_bar(engine, broker, clock)
     engine.step_symbol("EURUSD")
     assert "venue_clock_bar_disagrees" not in _reject_reasons(engine)
+    engine.stop()
+
+
+# --- 9. the error bar the type does not carry ------------------------------
+
+
+class _DriftedVenue(PaperBroker):
+    """A terminal whose OWN clock is wrong by `drift`, like everything it serves.
+
+    This is the input strummer's addendum found: the drift cancels out of the
+    measured difference, the grid snap takes it out of the offset, and the bar
+    stamp still carries it, so the instant every gate sees moves by exactly
+    `drift`. It is the only error source left in the measured path.
+    """
+
+    def __init__(self, *, drift: float, offset_sec: int = PLUS_3, **kw: object) -> None:
+        super().__init__(utc_offset_sec=offset_sec, **kw)  # type: ignore[arg-type]
+        self.drift = float(drift)
+        self.our_clock = SESSION_CLOSE.timestamp()
+
+    def venue_clock(self, name: str, *, max_staleness_sec: float | None = None):
+        del name
+        stamp = int(self.our_clock + self.utc_offset_sec + self.drift)
+        if max_staleness_sec is None:
+            return VenueClock.implied(stamp, self.our_clock, source="drifted")
+        return VenueClock.measure(
+            stamp,
+            self.our_clock,
+            source="drifted",
+            max_staleness_sec=max_staleness_sec,
+        )
+
+
+#: The bar's TRUE UTC instant, placed exactly on the configured session close.
+SESSION_CLOSE = datetime(2024, 1, 4, 17, 0, tzinfo=timezone.utc)
+#: The widest bound the grid rule can accept, and the first one it cannot.
+WIDEST_LEGAL_BOUND = VENUE_CLOCK_GRID_SEC / 2 - 1
+NARROWEST_ILLEGAL_BOUND = VENUE_CLOCK_GRID_SEC / 2
+
+
+def _session_engine(tmp_path: Path, broker: PaperBroker) -> tuple[Engine, list]:
+    cfg = BotConfig()
+    cfg.journal_path = str(tmp_path / "j.jsonl")
+    cfg.session.enabled = True  # the shipped 07:00-17:00 UTC window
+    cfg.risk.halt_file = str(tmp_path / "HALT")
+    cfg.risk.max_spread_atr_frac = 10.0
+    n = 250
+    last = int(SESSION_CLOSE.timestamp()) + broker.utc_offset_sec + int(
+        getattr(broker, "drift", 0)
+    )
+    bars = generate_bars(
+        n, drift=0.0006, vol=0.0002, seed=7, start_ts=last - (n - 1) * HOUR
+    )
+    broker.seed_bars("EURUSD", bars)
+    engine = Engine(
+        cfg, broker, halt_dir=str(tmp_path), now_fn=lambda: SESSION_CLOSE
+    )
+    return engine, bars
+
+
+def test_no_drift_puts_the_boundary_exactly_where_the_config_says(
+    tmp_path: Path,
+) -> None:
+    """The reference row. A bar ON the close is outside the window."""
+    broker = _DriftedVenue(drift=0, balance=10_000)
+    engine, bars = _session_engine(tmp_path, broker)
+    engine.start()
+    engine._act("EURUSD", bars, max_staleness_sec=POLL)
+    assert "outside_session" in _reject_reasons(engine)
+    engine.stop()
+
+
+@pytest.mark.parametrize("drift", (-90, -179, -449))
+def test_a_drift_wider_than_the_bound_refuses_instead_of_sliding(
+    tmp_path: Path, drift: float
+) -> None:
+    """On the desk's own path the softness is the MEASURED poll gap, seconds.
+
+    Every one of these drifts was absorbed silently under the chosen 180s
+    tolerance this change started with, moving a 17:00:00 instant back inside
+    the window and leaving the desk armed up to three minutes past its
+    configured close. Against a measured bound they refuse by name.
+    """
+    broker = _DriftedVenue(drift=drift, balance=10_000)
+    engine, bars = _session_engine(tmp_path, broker)
+    engine.start()
+    engine._act("EURUSD", bars, max_staleness_sec=POLL)
+    reasons = _reject_reasons(engine)
+    assert VENUE_CLOCK_UNMEASURED in reasons, (
+        f"a {drift}s drift was absorbed against a {POLL}s bound"
+    )
+    assert not engine.broker.positions(magic=engine.cfg.risk.magic)
+    engine.stop()
+
+
+def test_the_worst_legal_bound_absorbs_its_own_width_and_that_is_disclosed(
+    tmp_path: Path,
+) -> None:
+    """The error bar, pinned at its worst legal value.
+
+    A caller declaring the widest bound the grid rule accepts absorbs a drift
+    of that width: the instant slides and the session gate does not fire. That
+    is the softness `docs/CONTRACT.md` and `VenueClock` disclose, and this is
+    the test that keeps the disclosure true. One second wider and nothing is
+    measured at all, so the softness cannot grow past half a grid step.
+    """
+    broker = _DriftedVenue(drift=-WIDEST_LEGAL_BOUND, balance=10_000)
+    engine, bars = _session_engine(tmp_path, broker)
+    engine.start()
+    clock = broker.venue_clock("EURUSD", max_staleness_sec=WIDEST_LEGAL_BOUND)
+    assert clock.measured and clock.offset_sec == PLUS_3
+    seen = clock.to_utc(bars[-1].time)
+    assert seen == SESSION_CLOSE - timedelta(seconds=WIDEST_LEGAL_BOUND), (
+        "the absorbed error is exactly the terminal's drift"
+    )
+    engine._act("EURUSD", bars, max_staleness_sec=WIDEST_LEGAL_BOUND)
+    assert "outside_session" not in _reject_reasons(engine), (
+        "this row is the disclosure: inside the bound, the window is soft"
+    )
+    engine.stop()
+
+
+def test_one_second_past_the_grid_rule_measures_nothing_at_all(
+    tmp_path: Path,
+) -> None:
+    """The cap on that softness, so it cannot be widened by a caller."""
+    broker = _DriftedVenue(drift=0, balance=10_000)
+    engine, bars = _session_engine(tmp_path, broker)
+    engine.start()
+    got = broker.venue_clock("EURUSD", max_staleness_sec=NARROWEST_ILLEGAL_BOUND)
+    assert not got.measured
+    assert "too wide" in got.detail
+    engine._act("EURUSD", bars, max_staleness_sec=NARROWEST_ILLEGAL_BOUND)
+    assert VENUE_CLOCK_UNMEASURED in _reject_reasons(engine)
     engine.stop()

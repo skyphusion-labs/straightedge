@@ -30,6 +30,7 @@ import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from straightedge.currencies import may_transform_symbol, normalize_model_symbol
 from straightedge.constants import (
     EA_CLAIM_RETRY_MS,
     EA_LADDER_SLEEP_MS,
@@ -502,9 +503,29 @@ class BotConfig:
     advice_symbols: list[str] = field(default_factory=list)
 
     def advice_allows(self, symbol: str) -> bool:
-        """Whether the model may OPEN this symbol. Closes are never gated."""
+        """Whether the model may OPEN this symbol. Closes are never gated.
+
+        THE NAME IS CHECKED BEFORE IT IS TRANSFORMED, and this gate carries
+        that rule itself rather than trusting a caller to have applied it: it
+        is reachable with no parser in front of it, and straightedge#197
+        measured `advice_allows("EURU\u017fD") -> True` because
+        `"EURU\u017fD".upper()` is `"EURUSD"`. A model-chosen name that is not
+        ASCII is refused here, which keeps the benign `eurusd` working (a pure
+        ASCII case fold) while a string that merely UPPERCASES into an allowed
+        instrument is not one.
+
+        The allowed set is filtered the same way, for the same reason in the
+        other direction: a non-ASCII entry in the operator's own list would
+        uppercase into a symbol they did not type and widen the whitelist
+        silently. No real MetaTrader symbol is non-ASCII, so such an entry
+        matches nothing rather than matching something unintended.
+        """
+        if not may_transform_symbol(symbol):
+            return False
         allowed = self.advice_symbols or self.symbols
-        return symbol.upper() in {s.upper() for s in allowed}
+        return symbol.upper() in {
+            s.upper() for s in allowed if may_transform_symbol(s)
+        }
     risk: RiskConfig = field(default_factory=RiskConfig)
     strategy: StrategyConfig = field(default_factory=StrategyConfig)
     session: SessionConfig = field(default_factory=SessionConfig)
@@ -746,7 +767,12 @@ def load_config(path: str | Path | None = None) -> BotConfig:
         mode=os.environ.get("ACCOUNT_MODE", str(account.get("mode", "paper"))),
         initial_balance=float(account.get("initial_balance", 10_000.0)),
         symbols=names,
-        advice_symbols=[str(x).upper() for x in advice_names],
+        # `normalize_model_symbol`, not `.upper()`, so that the claim in
+        # `advice_allows` is actually true: uppercasing HERE would turn a
+        # non-ASCII entry into an ASCII one before that gate could filter
+        # it, which is the same manufacture (straightedge#197) one step
+        # earlier and on the operator's own list.
+        advice_symbols=[normalize_model_symbol(str(x)) for x in advice_names],
         poll_seconds=int(os.environ.get("POLL_SECONDS", engine_s.get("poll_seconds", 15))),
         comment=str(engine_s.get("comment", "straightedge")),
         journal_path=resolve_state_path(
