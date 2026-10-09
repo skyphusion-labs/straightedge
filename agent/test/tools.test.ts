@@ -1,5 +1,7 @@
+import { createAITools } from "@cloudflare/computer/tools";
 import { describe, expect, it } from "vitest";
 import { deskTools } from "../src/desk-agent";
+import { LOG_READ_MAX_BYTES, LOG_READ_MAX_LINES } from "../src/log-retention";
 import { withDeskEnv } from "./helpers";
 
 /**
@@ -20,10 +22,19 @@ import { withDeskEnv } from "./helpers";
  * a shell at all.
  *
  * A dismissal nobody can re-check is how a dismissal rots, and what would
- * quietly invalidate this one is a single added argument: `backends` on the
- * `Workspace` constructor in `desk-agent.ts`. So this enumerates the tool set
- * and fails the moment a shell appears, which is the moment the reasoning
- * stops holding rather than the moment someone notices.
+ * quietly invalidate this one is a single added argument: a `shell` option on
+ * the `createAITools` call in `deskTools()`. `exec` is gated on that option
+ * ALONE: the installed source reads
+ * `if (options.shell === void 0) return void 0;` and the type says "Omit for no
+ * exec tool". So this enumerates the tool set and fails the moment a shell
+ * appears, which is the moment the reasoning stops holding rather than the
+ * moment someone notices.
+ *
+ * NOT `backends` on the `Workspace` constructor, which an earlier version of
+ * this file named and which is wrong: that is the half that puts just-bash's
+ * CODE in the bundle, and on its own it adds no tool and nothing the model can
+ * call. The bundle half is re-checked by the `wrangler deploy --dry-run` grep
+ * recorded in `agent/README.md`, not here.
  *
  * It asserts on an ALLOW-LIST rather than `not.toContain("exec")`, because a
  * tool named `shell`, `run` or `bash` would reach `just-bash` just as well and
@@ -52,13 +63,34 @@ describe("the tool set the model is given", () => {
     }
   });
 
-  it("would reject a tool set that did contain a shell", () => {
-    // The control on the control. The assertion above means something only if
-    // a tool set WITH a shell would fail it, so check the predicate against
-    // one rather than trusting that it would.
-    const withExec = [...EXPECTED, "exec"].sort();
-    expect(withExec).not.toEqual(EXPECTED);
-    expect(SHELL_TOOLS.some((s) => withExec.includes(s))).toBe(true);
-    expect(SHELL_TOOLS.some((s) => EXPECTED.includes(s))).toBe(false);
+  it("rejects a REAL tool set that contains a shell", async () => {
+    // The positive control, and it has to build a real tool set to be one.
+    //
+    // An earlier version of this test compared the two local constants to each
+    // other, which cannot go red on the code under test and was therefore
+    // decoration in the one file whose whole purpose is re-checkability. This
+    // calls `createAITools` with a `shell` option, which is the actual
+    // invalidator, and checks that the assertion above REJECTS what comes back.
+    const names = await withDeskEnv("tools-shape-control", {}, async (instance) => {
+      const tools = createAITools({
+        workspace: instance.workspace as unknown as Parameters<
+          typeof createAITools
+        >[0]["workspace"],
+        read: { maxBytes: LOG_READ_MAX_BYTES, maxLines: LOG_READ_MAX_LINES },
+        // The only difference from `deskTools()`. A descriptor is enough: the
+        // tool appears because `shell` was passed, not because a backend works.
+        shell: {
+          backends: { control: { label: "control", description: "positive control" } },
+          defaultBackend: "control",
+        } as unknown as Parameters<typeof createAITools>[0]["shell"],
+      });
+      return Object.keys(tools).sort();
+    });
+
+    console.log(`#191 positive control: with a shell option = ${names.join(", ")}`);
+
+    expect(names).toContain("exec");
+    expect(names).not.toEqual(EXPECTED);
+    expect(SHELL_TOOLS.some((name) => names.includes(name))).toBe(true);
   });
 });

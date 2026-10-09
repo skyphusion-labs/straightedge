@@ -146,18 +146,51 @@ function. Three measurements, in increasing order of how much they settle:
 
 **The vantage: no vantage reaches it, and that does not rest on
 authentication.** `/ask` does require `Bearer ADVICE_TOKEN`, but the dismissal
-does not depend on that. `deskTools()` in `src/desk-agent.ts` builds the model's
-tool set from a `Workspace` constructed with `storage` only and no `backends`,
-so `createAITools` returns `delete, edit, find, grep, ls, read, write` and no
-shell. The capability is ABSENT rather than guarded, so an authenticated caller,
-the model itself, and a stranger all reach the same place: there is nothing to
-call.
+does not depend on that. `deskTools()` in `src/desk-agent.ts` calls
+`createAITools` WITHOUT a `shell` option, and that option alone is what gates
+the `exec` tool: the installed source reads
+`if (options.shell === void 0) return void 0;` and the type says "Omit for no
+exec tool". So the tool set is `delete, edit, find, grep, ls, read, write` and
+no shell. The capability is ABSENT rather than guarded, so an authenticated
+caller, the model itself, and a stranger all reach the same place: there is
+nothing to call.
 
-**What would invalidate this:** passing `backends` to the `Workspace`
-constructor. `test/tools.test.ts` enumerates the tool set and fails the moment a
-shell appears, so the dismissal is re-checked on every push rather than trusted.
-It asserts an allow-list, not the absence of the name `exec`, because a tool
-called `shell` or `run` would reach `just-bash` just as well.
+## What would invalidate this, and how to re-check it
+
+**Two changes are needed for a model-reachable shell, and they are seen by
+different instruments. Watch for both.**
+
+| change | effect | caught by |
+| --- | --- | --- |
+| a `shell` option on `createAITools` | exposes the `exec` TOOL | `test/tools.test.ts`, on every push |
+| a registered exec backend | puts just-bash's CODE in the bundle | the `wrangler deploy --dry-run` grep below |
+
+`exec` is gated on the `shell` option ALONE. Measured: this Workspace registers
+no backends at all, and passing `shell` yields
+`delete, edit, exec, find, grep, ls, read, write`. `backends` on the `Workspace`
+constructor is the other half only: on its own it adds no tool and nothing the
+model can call, so it deliberately does NOT red the test.
+
+`test/tools.test.ts` asserts an ALLOW-LIST rather than the absence of the name
+`exec`, because a tool called `shell` or `run` would reach `just-bash` just as
+well, and it carries a positive control that builds a tool set WITH a shell and
+checks the assertion rejects it. A test that cannot be shown failing is not a
+control.
+
+**The bundle half has to be re-checked by hand, and the zero is a MEASURED
+negative rather than an absence.** Importing
+`@cloudflare/computer/backends/worker-shell`, which is what registering a real
+exec backend does and which imports `just-bash` directly, moves every number:
+
+```
+                              as shipped    with the backend imported
+Total Upload                  2118.84 KiB   5119.18 KiB
+grep -ci sprintf\|vsprintf\|not_primitive\|numeric_arg          0            44
+grep -c "format width limit exceeded\|printf: usage"             0             4
+```
+
+So the instrument can be shown going positive on exactly the change that would
+invalidate this, which is what makes the shipped zero worth quoting.
 
 ## Secrets (never in git)
 
