@@ -246,8 +246,14 @@ every ping and nothing listened: the desk ran one 5000ms budget where #84's
 derivation says a send needs 7060ms. `doctor --connect` could not surface it
 either, because the `send fence:` line is in the missing half: a pre-#84 desk
 against a post-#84 Expert reports a clean connect, the shape of a check that
-cannot distinguish two states and reports the reassuring one. Deploying the desk
-(#143, Conrad's call) makes the check live and the skew disappear.
+cannot distinguish two states and reports the reassuring one.
+
+**Resolution of the instance (historical).** #143 was closed as completed on
+2026-10-08T17:37:39Z with "The desk is deployed. 25 commits were behind on the
+demo box. That is fixed." So this skew existed and has been closed by that
+deploy. What remains true is the mechanism, which is the reason this section is
+kept: the next split deployment will have the same shape, and the check will be
+absent in exactly the configuration that needs it.
 
 **Two counting traps found while telling the halves apart.**
 
