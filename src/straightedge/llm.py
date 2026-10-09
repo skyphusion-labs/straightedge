@@ -7,6 +7,7 @@ wipe desk context. Bound to KEEP_TURNS messages. Secrets redacted.
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 from dataclasses import dataclass
@@ -417,6 +418,13 @@ def parse_advice(raw: str) -> Advice:
     )
 
 
+#: The largest magnitude a venue ticket can plausibly take. MT4 and MT5 order
+#: tickets are 32 or 64 bit integers, so this is generous by orders of
+#: magnitude; the point is that it is FINITE, so no ticket can contribute an
+#: unbounded number of digits to a journal row (straightedge#226).
+_TICKET_CEILING = 2**63
+
+
 def _num(v: Any) -> float | None:
     if v is None or v == "":
         return None
@@ -427,12 +435,28 @@ def _num(v: Any) -> float | None:
 
 
 def _int(v: Any) -> int | None:
+    """A ticket, or None. Never a 309 digit integer and never a raise.
+
+    `int(n)` on a non-finite float raises `OverflowError`, which derives from
+    `ArithmeticError` and is therefore NOT in the
+    `(ValueError, RuntimeError, OSError)` tuple `Desk.handle_command` and
+    `Engine.poll_telegram` catch: a model emitting a 400 digit ticket was an
+    uncaught exception out of the command handler. Measured, and it is the same
+    family #219 found in `normalize_volume` (straightedge#226).
+
+    `math.isfinite` is the check rather than the except clause, because a
+    finite-but-enormous float still produces an integer with as many digits as
+    its exponent: `1e308` gave a 309 digit ticket and a 501 byte journal row on
+    its own. A ticket is a venue handle, so a value no venue could have issued
+    is not a ticket; refusing it is the same rule as `_num` returning None for
+    a non-number, and the `except` stays as the backstop.
+    """
     n = _num(v)
-    if n is None:
+    if n is None or not math.isfinite(n) or abs(n) > _TICKET_CEILING:
         return None
     try:
         return int(n)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
 
 

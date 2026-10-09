@@ -190,6 +190,51 @@ class InstanceLockError(RuntimeError):
     """Another process already holds this journal's run lock."""
 
 
+#: The size a single journal row must stay under.
+#:
+#: Stated here and in `docs/CONTRACT.md` rather than only inside a test, which
+#: is what it was until straightedge#226: a bound that lives in one assertion
+#: is a number nobody can check a change against, and two separate suites had
+#: already hardcoded it. Tests import this, so the documented figure and the
+#: asserted figure cannot drift apart.
+#:
+#: 512 is not arithmetic, it is the observed size of a healthy row plus room:
+#: an ordinary `advice_turn` measures 196 bytes and the widest `recap` about
+#: 300. #119 is why a ceiling exists at all, where one row stored a rendering
+#: of other rows and the payload compounded daily.
+RECORD_ROW_BOUND = 512
+
+#: How much of a MODEL-CHOSEN string a row may carry.
+#:
+#: Long enough that every real instrument name, vendor suffix and all, survives
+#: whole (`EURUSD`, `EURUSDm`, `EURUSD.a`, `XAUUSD`, `BTCUSD`), and short enough
+#: that no number of such fields can push a row past the bound
+#: `docs/CONTRACT.md` states (straightedge#226).
+RECORD_STRING_CHARS = 48
+
+
+def clip_for_record(value: str, limit: int = RECORD_STRING_CHARS) -> str:
+    """Bound a model-chosen string for the durable record, and SAY it was cut.
+
+    straightedge#226. `advice_turn` wrote `symbol` verbatim, and `symbol` is
+    model-chosen on the advice path, which is the premise of #197: a 5600
+    character symbol produced a 5838 byte row against the 512 byte bound this
+    repo documents, and the bounded-row test passed anyway because it varied
+    fields that are not echoed. #216 bounded the REASON and this is the same
+    exposure one field over.
+
+    The marker is not decoration. A silently truncated value reads as the whole
+    value, so a reader cannot tell `EURUSD` from a 5600 character string that
+    starts with it, and that is the defect class rather than a nicety: the
+    length is stated so the row says what it dropped.
+
+    Short values are returned unchanged, so nothing that fits is reshaped.
+    """
+    if len(value) <= limit:
+        return value
+    return f"{value[:limit]}[+{len(value) - limit} chars]"
+
+
 def lock_path_for(journal_path: str | Path) -> Path:
     p = Path(journal_path)
     return p.with_name(p.stem + ".lock")

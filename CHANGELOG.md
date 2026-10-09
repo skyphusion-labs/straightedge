@@ -390,6 +390,63 @@ attaching nothing, collecting nothing, and leaving the stale marker uncleared.
 #181's own suite stays green through all four, which is what shows the chat
 surface did not move.
 
+### The advice row is bounded by construction, not by fixture (issue #226)
+
+#216 bounded the degrade REASON and left the same exposure one field over.
+`symbol` is model-chosen on the advice path, which is the premise of #197, and
+the `advice_turn` row wrote it verbatim: a 5600 character symbol gave a **5838
+byte row** against the 512 byte bound this repo asserts, with `degraded` empty.
+
+**And #216's own bounded-row test passed while that row was reachable**, because
+it varied `text` and `summary`, neither of which is echoed. That is the second
+time a bound on this row was asserted by FIXTURE rather than by construction,
+and the first was the defect #216 exists to fix. So the fix is not "bound
+`symbol` too".
+
+**Every schema field is driven large AT ONCE, from the code's own table.** The
+fixture is derived from `ADVICE_PROPERTIES`, which is the table the request is
+built from and the one `_schema_violations` validates against, so a field added
+there tomorrow is driven large by these tests without anyone editing them. Both
+providers are covered, and the `grok` path is the harder one: the claude path
+forces `hold` on a violation, which could mask the bound by blanking fields,
+while the bare parser carries its own output.
+
+**A clipped string says what it dropped.** `clip_for_record` keeps
+`RECORD_STRING_CHARS` and appends the count, because a silently truncated value
+reads as the whole value and a reader could not tell `EURUSD` from a 5600
+character string beginning with it. Every real instrument name, vendor suffix
+and all, survives whole, asserted against a list of them.
+
+**A second defect, found by enumerating rather than by reading.** `_int` did
+`int(_num(v))`, so:
+
+* `1e308` produced a **309 digit** ticket and a 501 byte row on its own, which
+  alone nearly breaches the bound;
+* a 400 digit ticket string raised **`OverflowError`**, which derives from
+  `ArithmeticError` and is therefore NOT in the
+  `(ValueError, RuntimeError, OSError)` tuple `Desk.handle_command` catches, so
+  it left the handler uncaught. Same family #219 found in `normalize_volume`,
+  reached through a model reply rather than an operator command.
+
+A ticket is a venue handle, so a value no venue could have issued is not a
+ticket: `_int` refuses non-finite and out-of-range values, which closes both.
+The `except` clause is widened too, as the backstop rather than the check.
+
+**The bound now has one home.** It lived only inside test assertions, in two
+suites, each repeating 512. `journal.RECORD_ROW_BOUND` is the figure,
+`docs/CONTRACT.md` states it, and both suites import it, so the documented bound
+and the asserted bound cannot drift. A bound asserted in a test and stated
+nowhere is a number nobody can check a change against.
+
+**Four mutations, each red where it should be, and one of them only after a
+second look.** Restoring the unclipped symbol reds 3; dropping the ticket guard
+reds 1; making the clip silent reds 1. The 400 digit case stayed GREEN under the
+ticket-guard mutation, because the widened `except` catches the raise on its
+own: the isfinite guard and the except clause are each independently sufficient,
+so that case is pinned only by restoring `_int`'s pre-fix body exactly, which
+reds 4. An equivalent mutant hiding inside a guard I had just written is the
+same trap as the two tests this issue is about.
+
 ## 1.8.0
 
 ### The worst tick gap this box has seen now outlives the process (issue #153)

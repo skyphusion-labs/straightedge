@@ -8,7 +8,7 @@ from dataclasses import dataclass
 
 from straightedge.currencies import normalize_model_symbol
 from straightedge.inflight import new_key
-from straightedge.journal import redact_text
+from straightedge.journal import clip_for_record, redact_text
 from straightedge.llm import Advice, Advisor
 from straightedge.models import OrderResult, Signal, SignalKind
 from straightedge.telegram import HELP, NOT_ADVICE, TgCommand
@@ -771,7 +771,11 @@ class Desk:
                 # `EURUSD`, which is an instrument the whitelist ALLOWS, so the
                 # record read as a bug in the gate rather than as a rejected
                 # reply (straightedge#197).
-                shown = normalize_model_symbol(advice.symbol)
+                # Bounded for the record for the same reason as the
+                # `advice_turn` row, and AFTER `normalize_model_symbol` so the
+                # #197 rule still decides what the string is before this
+                # decides how much of it the row keeps.
+                shown = clip_for_record(normalize_model_symbol(advice.symbol))
                 self._reject(
                     "advice_symbol",
                     "symbol_not_allowed",
@@ -829,7 +833,10 @@ class Desk:
             provider=getattr(self.advisor.cfg, "provider", ""),
             session=session,
             action=advice.action,
-            symbol=advice.symbol,
+            # BOUNDED, because `symbol` is model-chosen on this path and the
+            # row is the durable record (straightedge#226). Unbounded here gave
+            # a 5838 byte row from a 5600 character symbol.
+            symbol=clip_for_record(advice.symbol) if advice.symbol else advice.symbol,
             sl=advice.sl,
             tp=advice.tp,
             limit=advice.limit,
