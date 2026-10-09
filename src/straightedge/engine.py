@@ -29,6 +29,7 @@ from straightedge.models import (
     Position,
     Signal,
     SignalKind,
+    Tick,
     WorkingOrder,
 )
 from straightedge.risk import (
@@ -44,6 +45,7 @@ from straightedge.sizing import (
     MissingStop,
     money_per_lot_at_stop,
     normalize_volume,
+    unusable_price,
     unusable_stop,
     unusable_volume,
 )
@@ -1396,6 +1398,40 @@ class Engine:
             return
         self._open(sig, decision.volume)
 
+    def _require_quote(self, symbol: str, tick: Tick) -> None:
+        """Refuse a quote that is absent OR unreadable (#211).
+
+        One site, two callers. `market_signal` and `reverse_signal` both carried
+        `if tick.bid <= 0 or tick.ask <= 0`, and `nan <= 0` is False, so the
+        guard written to refuse a broken quote missed the most broken quote
+        there is.
+
+        IT WAS A FAIL-OPEN ON THE SEND PATH, not a reason defect, and the
+        asymmetry is why it was easy to miss. A buy takes its entry from the
+        ASK, so an unreadable BID never enters a geometry comparison and nothing
+        downstream objects; a sell is the mirror. Measured on the pre-fix tree:
+        `/buy` with `bid=nan` and a real ask reached `retcode=10009` with a
+        full-size position on the book, and so did `bid=inf`, and so did
+        `/sell` with `ask=nan`. The resulting position carried
+        `price_current=nan, profit=nan`, so the corruption outlived the send.
+
+        The spread gate could not save it either: `tick.spread` is `ask - bid`
+        and therefore `nan`, and `risk.py`'s
+        `tick.spread > max_spread_atr_frac * atr` is False for a nan, so the
+        guard that refuses a blown-out spread is bypassed in the same move.
+
+        UNREADABLE OUTRANKS ABSENT when both apply, because it is the more
+        specific diagnosis: a zero tells you the feed is quiet, a nan tells you
+        the field is corrupt, and only the second sends you to the wire.
+        """
+        for value in (tick.bid, tick.ask):
+            if unusable_price(value) == "unreadable":
+                raise RuntimeError(
+                    f"unreadable tick for {symbol}: bid={tick.bid!r} ask={tick.ask!r}"
+                )
+        if unusable_price(tick.bid) or unusable_price(tick.ask):
+            raise RuntimeError(f"no tick for {symbol}")
+
     def market_signal(
         self,
         kind: SignalKind,
@@ -1409,8 +1445,7 @@ class Engine:
         spec = self.broker.symbol(symbol)
         self.broker.select_symbol(symbol)
         tick = self.broker.tick(symbol)
-        if tick.bid <= 0 or tick.ask <= 0:
-            raise RuntimeError(f"no tick for {symbol}")
+        self._require_quote(symbol, tick)
         if limit is not None and stop is not None:
             raise RuntimeError("use limit= or stop=, not both")
         bars = self.broker.rates(
@@ -1505,8 +1540,7 @@ class Engine:
         kind = SignalKind.SELL if pos.side.value == "buy" else SignalKind.BUY
         spec = self.broker.symbol(pos.symbol)
         tick = self.broker.tick(pos.symbol)
-        if tick.bid <= 0 or tick.ask <= 0:
-            raise RuntimeError(f"no tick for {pos.symbol}")
+        self._require_quote(pos.symbol, tick)
         entry = tick.ask if kind is SignalKind.BUY else tick.bid
         bars = self.broker.rates(
             pos.symbol, self.cfg.strategy.timeframe, self.strategy.needed_bars()
