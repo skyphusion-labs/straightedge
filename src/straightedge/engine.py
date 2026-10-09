@@ -1756,7 +1756,36 @@ class Engine:
             return "buy needs sl < entry < tp"
         if order.side.value == "sell" and not (sl > px and (tp <= 0 or tp < px)):
             return "sell needs tp < entry < sl"
+        # FAIL CLOSED BEFORE THE ARITHMETIC (#161), the precondition `risk.evaluate`
+        # and `_stop_guard` both carry and this, the third site with the same
+        # arithmetic, did not. `money_per_lot_at_stop` needs points and
+        # `ticks_between` returns 0.0 when `trade_tick_size or point` is <= 0, so on
+        # a spec the broker has not streamed `worst` was 0.0 and
+        # `0.0 > min(per_trade, loss_room)` was False: EVERY replacement passed the
+        # size guard and was sent. Reachable, not theoretical: `mt4_live` records
+        # tick_size/point unmeasured when `MarketInfo` answers zero, which is what a
+        # symbol outside Market Watch does, and #68 measured exactly that on gold.
+        #
+        # PRECISELY WHAT THIS ORDERING BUYS, because the stronger claim does not
+        # survive measurement. Moving this refusal BELOW the cap decision was
+        # mutated and the suite stayed green, correctly: wherever it sits above
+        # `_modify_pending`, an unmeasured spec still refuses before anything is
+        # sent, so the two placements are observationally equivalent and that is
+        # an equivalent mutant rather than a missing test.
+        #
+        # What the position above the arithmetic buys is that the carve-out's
+        # comparison is never evaluated on numbers that are both 0.0, which is
+        # a readability and future-proofing argument, not a live fail-open: a
+        # later refactor that returned early from the carve-out branch would
+        # skip a refusal placed below it. The fail-open this CLOSES is the
+        # 0.0-worst one above, which existed with or without the carve-out.
+        not_measured = spec.unmeasured_for_sizing()
+        if not_measured:
+            return "refused: spec_not_measured:" + ",".join(sorted(not_measured))
         worst = money_per_lot_at_stop(px, sl, spec) * order.volume
+        # WHAT IS ALREADY RESTING, measured the same way, because the question the
+        # cap should ask is whether this replacement ADDS risk (#164).
+        worst_resting = money_per_lot_at_stop(order.price, order.sl, spec) * order.volume
         account = self.broker.account()
         r = self.cfg.risk
         per_trade = account.equity * r.risk_pct * r.max_risk_multiple
@@ -1774,7 +1803,32 @@ class Engine:
         #
         # `loss_room` wants a current snapshot; `circuit_reason` above ran
         # `observe`, so it has one.
-        if worst > min(per_trade, self.risk.loss_room(account)) + 1e-6:
+        #
+        # A STRICTLY RISK-REDUCING REPLACEMENT IS ALWAYS ALLOWED (#164, resolution
+        # 1). `_stop_guard` already solved this shape the other way at
+        # `engine.py:640` and names the asymmetry at `:654`: a change that lowers
+        # worst-case loss never pays for the cap, because an operator must never be
+        # prevented from de-risking a live commitment, and that is exactly the
+        # moment they most need to. Before this, the two guards on one engine
+        # disagreed about whether de-risking needs permission and only one of them
+        # documented its position, which is the version-skew shape: whichever a
+        # reader checks first, they infer the other.
+        #
+        # Measured on #164: a $50.00 resting order, a $40.00 proposed replacement
+        # and $13.80 of remaining room was REFUSED, leaving the operator `/cancel`
+        # as their only move. That removes the order outright rather than reducing
+        # it, so the cap left MORE risk resting than allowing the reduction would.
+        # A cap that refuses the one action which unconditionally lowers risk
+        # inverts the cap's own purpose.
+        #
+        # This does NOT widen the cap back toward `per_trade` alone, which would
+        # reopen #104's fail-open ($40 of risk against $13.80 of room) and is
+        # pinned by a test that reds on exactly that revert. An INCREASE is still
+        # measured against `min(per_trade, loss_room)`; only the direction changes
+        # the answer, never the threshold.
+        if worst > worst_resting + 1e-6 and worst > min(
+            per_trade, self.risk.loss_room(account)
+        ) + 1e-6:
             return "refused: size_exceeds_risk"
         result = self._modify_pending(order, sl=sl, tp=tp, price=px)
         if not result.ok:

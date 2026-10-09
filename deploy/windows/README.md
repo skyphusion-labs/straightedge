@@ -40,7 +40,7 @@ live definitions and goes red.
 | --- | --- | --- |
 | `straightedge-desk.xml` | declared definition of the restart task | no |
 | `straightedge-watch.xml` | declared definition of the watcher task | no |
-| `Export-Tasks.ps1` | dumps the LIVE definitions for the audit | no, read-only |
+| `Export-Tasks.ps1` | dumps the LIVE definitions AND their liveness sidecars for the audit | no, read-only |
 | `Install-Supervision.ps1` | registers both from XML, after recording what was there | **yes** |
 | `Deploy-Desk.ps1` | the git deploy executor, see [`docs/DEPLOY.md`](../../docs/DEPLOY.md) | **yes, with `-Apply`** |
 | `assert-config-loads.py` | validates a config through the LOADER before a restart | no, read-only |
@@ -48,6 +48,63 @@ live definitions and goes red.
 `python -m straightedge supervision --tasks <dir>` is the audit. With no
 `--tasks` it audits the DECLARED definitions in this directory, which is what
 CI does; point it at `Export-Tasks.ps1` output to audit the live box.
+
+## The declaration is not the behaviour (#151)
+
+`Export-Tasks.ps1` writes TWO files per task: `<task>.xml`, which is what the
+task is DECLARED to be, and `<task>.info.json`, which is what Task Scheduler
+says it will actually DO next. Both are read-only queries.
+
+The second one exists because the first one is not enough, and that was
+measured rather than reasoned. On 2026-09-26 the desk's definition carried a
+`PT5M` repetition on its `LogonTrigger`; every other field was correct, and the
+audit returned **zero findings and exit 0** while that desk had not restarted
+in twelve days. A repetition that will never fire and a working cadence are the
+same XML.
+
+So the audit now has two instruments that fail independently:
+
+| reading | source | catches |
+| --- | --- | --- |
+| trigger TYPE under the repetition | the XML alone | the shape that actually happened: a cadence hung only on an event trigger |
+| `NextRunTime` | `<task>.info.json` | the shapes XML cannot settle: a future `StartBoundary`, an expired `EndBoundary`, an elapsed `Duration`, a task the live system has disabled |
+
+**A dump of a real task with no `.info.json` is a FAILURE** (`liveness_unmeasured`),
+not a pass, by the same rule a corrupt dump already follows. If you audit an
+export taken before this change, re-run `Export-Tasks.ps1`. The templates in
+this directory are exempt, because they are registered with nothing and carry
+`REPLACE_ME`; the audit says which question it answered on its `liveness:` line.
+
+### Why a non-zero `LastTaskResult` is not a failure
+
+The desk's task reports `LastTaskResult = 0x800710E0` on a healthy box. The
+5-minute trigger fires, finds the desk already running, and
+`MultipleInstances=IgnoreNew` refuses the duplicate launch. **For a task whose
+job is "start it if it is not running", a refused launch IS the healthy steady
+state**, and a zero would mean it had just started a fresh instance.
+
+`mt4-terminal-supervisor` reports `0` for the opposite reason: its action is a
+short probe that exits cleanly, so it is never the already-running case. Same
+family of task, opposite healthy value. So the audit judges the TUPLE
+(`State`, `LastTaskResult`, `NextRunTime`, `MultipleInstances`) and never one
+field: `Running` plus `0x800710E0` plus a populated `NextRunTime` is healthy.
+
+And "non-zero" is not the same as "error". That field carries two vocabularies:
+Task Scheduler reports its own STATUS through it with the `SCHED_S_*` family,
+whose HRESULT severity bit is clear.
+
+| result | severity | reading |
+| --- | --- | --- |
+| `0` | success | the last launch ran and exited cleanly |
+| `0x00041303` | informational | has never run. Expected right after install, the finding later |
+| `0x00041307` | informational | Task Scheduler says the task cannot fire: a FAILURE |
+| any other `SCHED_S_*` | informational | named in the report, never dropped |
+| `0x800710E0` | error | duplicate launch refused. Healthy with `State=Running` |
+| any other error | error | the last launch failed: a FAILURE |
+
+**So a freshly installed box reports `0x00041303` and audits clean**, with a
+`never_run` warning saying so. The first version of this check called that a
+failed launch and red the CI job on a correctly installed task.
 
 ## Install
 

@@ -32,6 +32,29 @@ if (Test-Path Variable:PSNativeCommandUseErrorActionPreference) {
 
 New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
 
+# A DateTime from Task Scheduler as an explicit UTC ISO-8601 string, or $null.
+#
+# The offset is resolved HERE, on the box, where the box's own offset is known.
+# Writing a bare local timestamp and letting the audit label it UTC is
+# straightedge#172's defect with a different clock in it, and a reader cannot
+# recover an offset that was never written. An Unspecified Kind is treated as
+# LOCAL, because that is what Task Scheduler hands out, and it is stated rather
+# than assumed silently.
+function ConvertTo-UtcIso {
+    param($Value)
+    if ($null -eq $Value) { return $null }
+    try { $dt = [datetime]$Value } catch { return $null }
+    # Task Scheduler reports a sentinel in the distant past for "never ran".
+    # That is not a timestamp and must not become one: a 1899 LastRunTime
+    # compared against a 300s cadence would report a 1.1 million hour staleness
+    # and bury the real finding, which is that it has never run at all.
+    if ($dt.Year -lt 2000) { return $null }
+    if ($dt.Kind -eq [System.DateTimeKind]::Unspecified) {
+        $dt = [datetime]::SpecifyKind($dt, [System.DateTimeKind]::Local)
+    }
+    return $dt.ToUniversalTime().ToString("o")
+}
+
 $missing = @()
 foreach ($name in $TaskName) {
     $dest = Join-Path $OutDir "$name.xml"
@@ -54,12 +77,50 @@ foreach ($name in $TaskName) {
     }
     $xml | Out-File -FilePath $dest -Encoding utf8
     Write-Host "dumped $name -> $dest"
+
+    # THE LIVENESS HALF (#151). `schtasks /query /xml` carries none of this, and
+    # the audit cannot infer it: a repetition that will never fire is
+    # indistinguishable from supervision in the declaration alone. Measured, on
+    # the merged audit against the shape the live box actually carried: zero
+    # findings and exit 0, while that desk had not restarted in twelve days.
+    # `Get-ScheduledTaskInfo` is what Task Scheduler will actually DO next.
+    #
+    # Still read-only. Get-ScheduledTaskInfo queries; it changes nothing.
+    $infoDest = Join-Path $OutDir "$name.info.json"
+    $info = Get-ScheduledTaskInfo -TaskName $name -ErrorAction SilentlyContinue
+    if ($null -eq $info) {
+        # No sidecar is written, deliberately. The audit reports
+        # liveness_unmeasured for a real task with no sidecar, and inventing an
+        # empty one here would turn "could not measure" into "measured nothing",
+        # which is the collapse this whole audit exists to prevent.
+        if (Test-Path $infoDest) { Remove-Item $infoDest -Force }
+        Write-Warning "no Get-ScheduledTaskInfo for $name (the audit will report liveness_unmeasured)"
+    } else {
+        # MultipleInstances comes from the task, not the info, and it is carried
+        # here so the audit can read the benign-refusal tuple without
+        # re-deriving it from the XML half.
+        [ordered]@{
+            task_name              = $name
+            measured_utc           = (Get-Date).ToUniversalTime().ToString("o")
+            state                  = [string] $existing.State
+            multiple_instances     = [string] $existing.Settings.MultipleInstances
+            last_task_result       = $info.LastTaskResult
+            number_of_missed_runs  = $info.NumberOfMissedRuns
+            next_run_time_utc      = (ConvertTo-UtcIso $info.NextRunTime)
+            last_run_time_utc      = (ConvertTo-UtcIso $info.LastRunTime)
+        } | ConvertTo-Json -Depth 4 | Out-File -FilePath $infoDest -Encoding utf8
+        Write-Host "dumped $name liveness -> $infoDest (NextRunTime $($info.NextRunTime))"
+    }
 }
 
 foreach ($name in $missing) {
     Write-Warning "no such scheduled task: $name (the audit will report task_missing)"
 }
 
+Write-Host ""
+Write-Host "every task above should have BOTH a .xml and a .info.json."
+Write-Host "a missing .info.json makes the audit report liveness_unmeasured,"
+Write-Host "which is a FAILURE and not a pass (straightedge#151)."
 Write-Host ""
 Write-Host "now run the audit, with the DESK's own config:"
 Write-Host "  python -m straightedge --config C:\path\to\config.toml supervision --tasks $OutDir"
