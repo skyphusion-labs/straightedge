@@ -42,18 +42,41 @@ measured.
 single row naming the last day it observed and `days_skipped=7`. The bound is
 the design rather than a cap applied afterwards.
 
-**Announced BEFORE the roll, which is what makes it recoverable at all.**
-`observe()` persists the roll the instant the durable tuple moves, so with the
-announcement later in `start()` a process that died in between lost the day for
-good: the next boot read the rolled key, owed nothing, and no row or message
-ever named it. That is this issue's own symptom surviving in a narrower window,
-and it is the EXPECTED failure mode here rather than a rare one, because
-supervision restarts this desk on a repeating trigger (#151) and a crash loop
-lands in that window on every pass. Found in review of #198 and closed by
-ordering: the row is a journal write and the journal is the marker, so nothing
-about it needs the roll to have happened. The window that remains is stated at
-the call site: a death between the row and the roll leaves the day owed again
-and the marker declines to repeat it.
+**The owed day is derived from the JOURNAL, which is what makes it
+recoverable at all.** The first version read it from the equity snapshot before
+`observe()` rolled, and `observe()` persists the roll the instant the durable
+tuple moves, so a process that died between the roll and the announcement lost
+the day for good: every later boot read the rolled key, owed nothing, and no row
+or message ever named it. That is this issue's own symptom surviving in a
+narrower window, and it is the EXPECTED failure mode here rather than a rare
+one, because supervision restarts this desk on a repeating trigger (#151) and a
+crash loop lands in that window on every pass. Found in review of #198, which
+ruled the direction: make the owed day recoverable rather than order two
+statements carefully, because ordering moves the hazard to wherever the next
+person inserts a line.
+
+Two durable journal facts answer it, and neither rolls: the most recent `day` on
+a `start` or `stop` row, which is evidence the desk was alive on a day that has
+since ended, and the last `recap` row's `day`, which is what has already been
+announced. Today's rows cannot erase yesterday's, so a boot that dies anywhere
+in `start()` leaves the next boot able to reach the same conclusion. The `start`
+and `stop` rows now carry the ENGINE's day rather than relying on `ts`, because
+`ts` is the wall clock and every gate here runs on the injected clock; #182 is
+the whole lesson about conflating those two.
+
+**The baseline is enrichment, not evidence.** `day_start_equity` for the ended
+day exists only in the pre-roll snapshot, so it is attached when the snapshot
+still names that day and is named in `unmeasured` when it does not, which is
+exactly the state a previous boot's death leaves behind. Three unmeasured fields
+instead of one is the honest reading of a day whose baseline no longer exists
+anywhere.
+
+**One case got strictly better rather than merely safer.** A desk whose snapshot
+cannot be READ announced nothing at all under the snapshot-derived version,
+because `_persist_state` returns early there and `day_key` stays empty: #129's
+silent miss surviving in the state where an operator most needs the record. The
+journal does not care, so the day is announced with its baseline named
+unmeasured.
 
 **Announced once, and the marker is the JOURNAL, for a narrower reason than
 "memory does not survive a restart".** On the ordinary path the PERSISTED

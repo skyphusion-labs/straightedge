@@ -553,17 +553,19 @@ def test_the_operator_sees_it_on_an_install_that_enumerates_notify_events(
 def test_a_death_between_the_roll_and_the_row_does_not_lose_the_day(
     tmp_path, monkeypatch
 ) -> None:
-    """The window a review of #198 measured, closed by ORDERING.
+    """The window a review of #198 measured, closed by CONSTRUCTION.
 
-    `observe()` persists the roll the instant the durable tuple moves, so with
-    the announcement later in `start()` a process that died in between lost the
-    day for good: the next boot read the rolled key, owed nothing, and no row
-    or message ever named it. #129's own symptom in a narrower window, and the
+    `observe()` persists the roll the instant the durable tuple moves, so a
+    process that died between the roll and the announcement lost the day for
+    good: every later boot read the rolled key, owed nothing, and no row or
+    message ever named it. #129's own symptom in a narrower window, and the
     expected failure mode on a supervised desk rather than a rare one.
 
-    Driven by killing `start()` in exactly that window: the snapshot write is
-    allowed, then the next thing after it raises. The announcement now precedes
-    the roll, so the row is already in the journal when the process dies.
+    The owed day is derived from the JOURNAL now, which never rolls, so there
+    is no window to preserve and no ordering for a future edit to break. This
+    drives the same kill point the review used, and then asserts the part that
+    matters more: the NEXT boot reaches the same conclusion, which is what the
+    snapshot-derived version could not do at all.
     """
     clock = [datetime(2024, 1, 3, 12, tzinfo=timezone.utc)]
     first = _engine(tmp_path, clock, cfg=_cfg(tmp_path))
@@ -593,6 +595,46 @@ def test_a_death_between_the_roll_and_the_row_does_not_lose_the_day(
     clean.start()
     assert _recap_days(clean).count("2024-01-03") == 1, (
         "the next boot either lost it or repeated it: " + repr(_recap_days(clean))
+    )
+    clean.stop()
+
+
+def test_a_boot_that_rolled_without_writing_the_row_leaves_the_day_recoverable(
+    tmp_path, monkeypatch
+) -> None:
+    """The property that only a DURABLE derivation gives, isolated.
+
+    The case above drives the kill point a review of #198 used, but it cannot
+    distinguish the two candidate fixes: the row is written before the roll
+    either way, so a snapshot-derived version passes it too. This one removes
+    that confound. The roll is allowed to land and the row is suppressed, which
+    is the state "the snapshot has moved on and nobody announced", however a
+    future edit arranges the two statements.
+
+    A snapshot-derived owed day cannot recover from that at all, because the
+    only record of the ended day has been overwritten. The journal can, because
+    the `start` row from that day is still there and `recap` rows are the only
+    thing that marks a day as announced.
+    """
+    clock = [datetime(2024, 1, 3, 12, tzinfo=timezone.utc)]
+    first = _engine(tmp_path, clock, cfg=_cfg(tmp_path))
+    first.start()
+    first.step_all()
+    first.stop()
+
+    clock[0] = datetime(2024, 1, 4, 8, 0, tzinfo=timezone.utc)
+    silent = _engine(tmp_path, clock, cfg=_cfg(tmp_path))
+    monkeypatch.setattr(silent, "_announce_unrecapped_day", lambda owed: None)
+    silent.start()
+    assert silent.risk.snapshot.day_key == "2024-01-04", "the roll has to have landed"
+    assert _recaps(silent) == [], "this boot is the one that said nothing"
+    silent.stop()
+
+    clean = _engine(tmp_path, clock, cfg=_cfg(tmp_path))
+    clean.start()
+    days = _recap_days(clean)
+    assert days == ["2024-01-03"], (
+        "the day was unrecoverable once the roll had landed: " + repr(days)
     )
     clean.stop()
 
@@ -644,26 +686,64 @@ def test_the_journal_marker_is_what_guards_an_unwritable_snapshot(
     )
 
 
-def test_an_unreadable_snapshot_owes_nothing_rather_than_everything(
+def test_an_unreadable_snapshot_still_announces_and_names_what_it_lost(
     tmp_path,
 ) -> None:
-    """The other half of the distinction above, asserted rather than assumed.
+    """The case a review of #198 asked for, whose OUTCOME this design changes.
 
-    An unreadable snapshot leaves `day_key` at its constructor default, so
-    there is no observed day to owe a recap for. A desk that cannot read its
-    own state must not also invent a recap for a day it cannot name.
+    `_persist_state` returns early on `state_unreadable`, so the roll never
+    lands and the snapshot carries no `day_key` at all. Against the first
+    version of this change, which read the owed day from the snapshot, that
+    meant a desk which could not read its own state announced NOTHING: #129's
+    silent miss, surviving in the exact state where an operator most needs the
+    record.
+
+    Deriving the owed day from the JOURNAL removes the dependency entirely.
+    The day is still announced, and the baseline, which really is gone, is
+    named as unmeasured rather than invented. Three unmeasured fields instead
+    of one is the honest reading of a day whose snapshot cannot be read.
+    """
+    clock = [datetime(2024, 1, 3, 12, tzinfo=timezone.utc)]
+    cfg = _cfg(tmp_path)
+    first = _engine(tmp_path, clock, cfg=cfg)
+    first.start()
+    first.step_all()
+    first.stop()
+
+    snapshot_path_for(cfg.journal_path).write_text("{not json at all", encoding="utf-8")
+    clock[0] = datetime(2024, 1, 4, 8, 0, tzinfo=timezone.utc)
+    second = _engine(tmp_path, clock, cfg=_cfg(tmp_path))
+    assert second.risk.halt_reason == "state_unreadable"
+    assert second.risk.snapshot.day_key == "", (
+        "an unreadable snapshot leaves no observed day, which is why the "
+        "snapshot cannot be what decides this"
+    )
+    second.start()
+    rows = _recaps(second)
+    assert len(rows) == 1, (
+        "a desk that cannot read its state said nothing about the day that "
+        f"ended while it was down: {rows}"
+    )
+    assert rows[0]["day"] == "2024-01-03"
+    assert sorted(rows[0]["unmeasured"]) == ["day_start", "equity", "pnl"]
+    assert "day_start" not in rows[0], "a baseline that is gone must not be invented"
+    second.stop()
+
+
+def test_a_first_ever_start_with_an_unreadable_snapshot_announces_nothing(
+    tmp_path,
+) -> None:
+    """The control for the case above: no session evidence, nothing owed.
+
+    The journal is the authority now, so the question is no longer "what does
+    the snapshot say" but "was this desk ever alive on a day that has ended".
+    A first boot has no `start` or `stop` row before today, so there is nothing
+    to announce and nothing is invented.
     """
     clock = [datetime(2024, 1, 4, 8, 0, tzinfo=timezone.utc)]
     cfg = _cfg(tmp_path)
     snapshot_path_for(cfg.journal_path).write_text("{not json at all", encoding="utf-8")
     engine = _engine(tmp_path, clock, cfg=cfg)
-    # BEFORE start(). `observe()` sets the in-memory key to today even here,
-    # where the write is refused, so the state that decides whether anything is
-    # owed is the one the RiskManager restored at construction.
-    assert engine.risk.halt_reason == "state_unreadable"
-    assert engine.risk.snapshot.day_key == "", (
-        "an unreadable snapshot is supposed to leave no observed day at all"
-    )
     engine.start()
-    assert _recaps(engine) == [], "a desk that cannot read its state invented a recap"
+    assert _recaps(engine) == [], "a desk with no history invented a recap"
     engine.stop()

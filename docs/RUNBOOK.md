@@ -1201,11 +1201,17 @@ day that ended while the desk was off, so its closing equity was never
 observed and NO P&L is computed for it. The notify line says
 `pnl=NOT MEASURED`. There is no `pnl` field in the row at all, deliberately,
 because a zero there could not be told from a flat day.
+`day_start` is in the `unmeasured` list too when a previous boot died after
+rolling the day: the baseline then exists nowhere and is named rather than
+invented.
 One such row per restart, whatever the number of missed boundaries, and the
 count is in `days_skipped`. If you see one, the desk was down across a UTC
 midnight: check the supervision task and `journal.heartbeat`. A second restart
-on the same day does not repeat it, because the next process reads the last
-`recap` row before announcing.
+on the same day does not repeat it, because whether a day is owed is read from
+the journal: the most recent `day` on a `start` or `stop` row against the last
+`recap` row's `day`. That also means it survives a snapshot the desk cannot
+read, and that a journal rotation between two boots can at worst repeat the
+message once, never swallow it.
 `flatten` is one record per sweep.
 It carries `requested`, `confirmed_closed`, `closed_elsewhere`, `survivor_count`, and `measured`.
 `flatten_incomplete` is the same record, written again, when the sweep left risk open.

@@ -371,32 +371,26 @@ class Engine:
         # whenever it differs, and the ended day's identity and baseline live
         # nowhere else: once it has rolled, the only record that a day ended
         # while this desk was down is gone (straightedge#129).
-        owed = self._owed_day_before_roll(self.now_fn())
-        # ANNOUNCED BEFORE THE ROLL, and the order is the whole guard.
-        #
-        # `observe()` calls `_persist_state()` the moment the durable tuple
-        # moves, and a `day_key` roll always moves it, so the roll is DURABLE
-        # the instant it happens. With the announcement later in `start()`, a
-        # process that died in between lost the day for good: the next boot
-        # reads the rolled key, owes nothing, and no journal row or message
-        # ever named it. That is straightedge#129's own symptom surviving in a
-        # narrower window, and it is not exotic on this desk: supervision
-        # restarts it on a repeating trigger (#151), so a death during
-        # `start()` is the expected failure mode and a crash loop lands in that
-        # window on every pass. Found in review of #198.
-        #
-        # THE WINDOW THIS ACCEPTS, stated rather than implied: a death between
-        # the journal write and the roll leaves the row written and the key
-        # unrolled, so the next boot owes the day again and the journal marker
-        # declines to repeat it. A torn journal line is skipped as unparseable
-        # by `tail`/`last_event`, which costs one duplicate message, the same
-        # bound the rotation case already carries. Nothing here needs the roll
-        # to have happened: the row is a journal write, and the journal is the
-        # marker.
+        owed = self._owed_recap_day(self.now_fn())
+        # Read before `observe()`, and NOT because correctness depends on it.
+        # `_owed_recap_day` decides from the journal, which never rolls, so
+        # there is no window here to preserve and no ordering for a future
+        # edit to break: a boot that dies anywhere in `start()` leaves the next
+        # one able to reach the same conclusion. What the pre-roll position
+        # buys is the BASELINE: `day_start_equity` for the ended day exists
+        # only until the roll overwrites it, so reading here attaches a real
+        # number where one survives and the row names it unmeasured where it
+        # does not. Review of #198 ruled this direction over ordering for
+        # exactly that reason.
         self._announce_unrecapped_day(owed)
         self.risk.observe(acct, self.now_fn())
         self._emit(
             "start",
+            # The engine's OWN day, which is what makes this row durable
+            # evidence of a session for `_owed_recap_day`. `ts` is the wall
+            # clock and the gates are not, so the two must not be conflated
+            # (#182); `journal.last_session_day_before` reads THIS field.
+            day=day_key(self.now_fn()),
             mode=self.cfg.mode,
             login=acct.login,
             equity=acct.equity,
@@ -470,7 +464,10 @@ class Engine:
         return report
 
     def stop(self) -> None:
-        self._emit("stop")
+        # `day` for the same reason as the `start` row: session evidence on
+        # the engine's clock. A session that ran for days is better
+        # evidenced by where it ENDED than by where it began.
+        self._emit("stop", day=day_key(self.now_fn()))
         self.broker.disconnect()
 
     def flatten(self, reason: str) -> FlattenReport:
@@ -2188,49 +2185,65 @@ class Engine:
             return f"{head}\n{tail}"
         return head
 
-    def _owed_day_before_roll(self, now: datetime) -> dict[str, Any] | None:
-        """The day that ended while this desk was down, or None. Read at START.
+    def _owed_recap_day(self, now: datetime) -> dict[str, Any] | None:
+        """The day that ended with nobody announcing it, or None. DURABLE.
 
-        `start()` calls `risk.observe()` before the first tick, which rolls
-        `snapshot.day_key` to today. That ordering is deliberate (every gate
-        must have an observed snapshot before anything is evaluated), so the
-        fix for straightedge#129 is NOT to reorder it: it is to read what the
-        roll is about to discard, which is the only place the ended day's
-        identity and baseline exist after a restart.
+        DERIVED FROM THE JOURNAL, not from the equity snapshot, and that is
+        what removes the window rather than relocating it. The first version of
+        this read `snapshot.day_key` before `observe()` rolled it, which is
+        correct only while nothing can die in between; `observe()` persists the
+        roll the instant the durable tuple moves, so a process that died after
+        the roll and before the announcement lost the day for good, and no
+        later boot could know it was owed. On a desk that supervision restarts
+        on a repeating trigger (#151) that is the EXPECTED failure, not a rare
+        one. Measured in review of #198; ruled there that the fix is to make
+        the owed day recoverable rather than to order two statements carefully.
 
-        Returns None whenever nothing is owed, and the three cases are
-        different: no persisted snapshot at all (a first-ever start), a restart
-        inside the same UTC day (the overwhelming majority), and a clock that
-        has moved BACKWARDS across a boundary. The last one is not a missed
-        recap and is deliberately not reported as one; a desk whose clock went
-        backwards has a different problem than a desk that was switched off.
+        Two durable facts answer it, both from the journal, which never rolls:
+
+        * `last_session_day_before(today)`: the most recent day a `start` or
+          `stop` row names, which is evidence the desk was alive on a day that
+          has since ended. Today's rows cannot erase it, because they are
+          stamped today, so a boot that dies mid-`start()` leaves the next boot
+          able to reach the same conclusion.
+        * the last `recap` row's `day`: what has already been announced, by
+          this process or any previous one.
+
+        A day is owed when the first exists, is strictly before today, and the
+        second does not already cover it. Nothing here consults the snapshot to
+        DECIDE, so the decision survives any ordering, any crash point, and an
+        unreadable state file.
+
+        THE BASELINE IS ENRICHMENT, NOT EVIDENCE. `day_start_equity` for the
+        ended day exists only in the pre-roll snapshot, so it is attached when
+        the snapshot still names that day and is reported as unmeasured when it
+        does not. That is the one thing the journal cannot supply, and the
+        honest answer to it is the same as for the closing equity: name the
+        field, never invent a number.
         """
-        snap = self.risk.snapshot
-        if not snap.day_key:
-            return None
         today = day_key(now)
-        if snap.day_key >= today:
+        ended = self.journal.last_session_day_before(today)
+        if not ended:
+            # No durable evidence of a day that has ended. A first-ever start,
+            # or a journal whose only rows are from today.
             return None
-        try:
-            ended = datetime.strptime(snap.day_key, "%Y-%m-%d").replace(
-                tzinfo=timezone.utc
-            )
-        except ValueError:
-            # A snapshot whose day_key is not a date cannot be reasoned about,
-            # and `state.py` already refuses to load a mistyped one, so this is
-            # unreachable from a file this process read. Silence is wrong here
-            # even so: it is reported with the value that could not be parsed.
-            return {"day": snap.day_key, "day_start": snap.day_start_equity}
-        skipped = (
-            datetime.strptime(today, "%Y-%m-%d").replace(tzinfo=timezone.utc) - ended
-        ).days
-        return {
-            "day": snap.day_key,
-            "day_start": snap.day_start_equity,
-            "days_skipped": skipped,
-            "last_observed_equity": snap.equity,
-            "last_observed_at": snap.time,
+        previous = self.journal.last_event("recap")
+        announced = str((previous or {}).get("day") or "")
+        if announced and announced >= ended:
+            return None
+        snap = self.risk.snapshot
+        owed: dict[str, Any] = {
+            "day": ended,
+            "days_skipped": (
+                datetime.strptime(today, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+                - datetime.strptime(ended, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+            ).days,
         }
+        if snap.day_key == ended:
+            owed["day_start"] = snap.day_start_equity
+            owed["last_observed_equity"] = snap.equity
+            owed["last_observed_at"] = snap.time
+        return owed
 
     def _announce_unrecapped_day(self, owed: dict[str, Any] | None) -> None:
         """Say that a day ended unobserved. ONE row, no P&L, named unmeasured.
@@ -2250,60 +2263,49 @@ class Engine:
         with the wrong baseline is worse than none, so the two fields are
         ABSENT and `unmeasured` names them, in the shape `SymbolSpec` and
         `VenueClock` already use. A missing field cannot be misread; a zero can.
-        `last_observed_equity` is carried separately, labelled as what it is.
+
+        `day_start` joins them when the snapshot has already rolled past the
+        ended day, which happens exactly when a previous boot died between the
+        roll and this row. The row then names three unmeasured fields instead
+        of one, which is the honest reading of a day whose baseline no longer
+        exists anywhere.
 
         ONE ROW FOR ANY OUTAGE. A box down for a week emits one row naming
-        seven skipped boundaries, not seven recaps. The bound is the design, not
-        a cap applied afterwards.
+        seven skipped boundaries, not seven recaps. The bound is the design,
+        not a cap applied afterwards.
 
-        THE MARKER IS THE JOURNAL, and the honest reason is narrower than
-        "memory does not survive a restart". On the ordinary path it is the
-        PERSISTED day_key that stops a second announcement: boot 1 rolls it,
-        and boot 2 owes nothing before this function is ever reached. The state
-        this marker uniquely guards is a desk whose snapshot cannot be WRITTEN.
-        `_persist_state` halts on `StateUnwritable` and the roll never lands,
-        so every boot restores the old `day_key`, every boot owes the same day,
-        and without the journal row a crash loop sends one message per boot:
-        straightedge#119's defect arriving by the other door. Found in review
-        of #198, which measured the ordinary path passing with this marker
-        removed.
-
-        It is NOT reached by `state_unreadable`, and the difference inverts the
-        obvious reading: an unreadable snapshot leaves `day_key` at its
-        constructor default of `""`, so `_owed_day_before_roll` returns None
-        and nothing is owed at all. Unwritable is the live case; unreadable
-        cannot reach here.
-
-        The journal being the authority also means a rotation (10MB) landing
-        between two boots can allow exactly ONE duplicate, because
-        `Journal.last_event` scans the current file and never `.1`. One extra
-        message after a 10MB day beats a new durable field in the money gate's
-        own input file.
+        THE MARKER IS THE JOURNAL, and with the derivation above it is the SAME
+        fact rather than a second one: `_owed_recap_day` returns None once a
+        `recap` row covers the day, so the row this writes is what stops the
+        next boot repeating it. A crash loop therefore sends one message
+        whatever state the snapshot is in, including a snapshot that cannot be
+        read or cannot be written, where the roll never lands at all. Removing
+        the marker makes every boot owe the same day again, which is
+        straightedge#119's defect arriving by the other door.
         """
         if owed is None:
             return
         day = str(owed.get("day") or "")
         if not day:
             return
-        previous = self.journal.last_event("recap")
-        if previous is not None and str(previous.get("day") or "") >= day:
-            # Already announced, by this process's predecessor.
-            self._recapped_day = day
-            return
-        fields = {
+        unmeasured = ["equity", "pnl"]
+        fields: dict[str, Any] = {
             "day": day,
-            "day_start": round(float(owed.get("day_start") or 0.0), 2),
-            "unmeasured": ["equity", "pnl"],
+            "days_skipped": int(owed.get("days_skipped") or 0),
             "reason": "desk_down_across_the_day_boundary",
         }
-        if owed.get("days_skipped") is not None:
-            fields["days_skipped"] = int(owed["days_skipped"])
-        if owed.get("last_observed_equity") is not None:
-            fields["last_observed_equity"] = round(
-                float(owed["last_observed_equity"]), 2
-            )
-        if owed.get("last_observed_at"):
-            fields["last_observed_at"] = int(owed["last_observed_at"])
+        if owed.get("day_start") is None:
+            # The baseline died with the snapshot roll. Named, never invented.
+            unmeasured.append("day_start")
+        else:
+            fields["day_start"] = round(float(owed["day_start"]), 2)
+            if owed.get("last_observed_equity") is not None:
+                fields["last_observed_equity"] = round(
+                    float(owed["last_observed_equity"]), 2
+                )
+            if owed.get("last_observed_at"):
+                fields["last_observed_at"] = int(owed["last_observed_at"])
+        fields["unmeasured"] = sorted(unmeasured)
         self._emit("recap", **fields)
         # AFTER the emit, same rule as `_maybe_daily_recap`: a raising `_emit`
         # must not mark the day done.
