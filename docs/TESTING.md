@@ -114,6 +114,80 @@ When two branches touch one test file, run the combined suite before either
 merges. `git merge --no-commit --no-ff <other>` then the suite, then
 `git merge --abort`.
 
+## An observation taken downstream of your own mutation is not evidence
+
+Four of this sprint's wrong readings were the same act: looking at something
+AFTER changing it and treating the result as independent.
+
+- A working tree read while a mutation harness was still running against it. The
+  file showed `_stop_guard` with the halt-room term missing and the comment
+  still above it, which is exactly the regression one issue describes. It was
+  the harness, mid-run, not yet reverted. **A working tree is not a measurement
+  while something else is writing to it**; check the instrument EXITED before
+  believing the artifact, the same way you check an exit code rather than
+  trusting piped output.
+- A pull request's `reviewDecision` read AFTER pushing to it. It said
+  `REVIEW_REQUIRED`, which was the output of that very push dismissing an
+  approval given fourteen minutes earlier. Read review state BEFORE pushing,
+  never after.
+- A revert-based mutation sweep run over UNCOMMITTED work. `git checkout -- src/`
+  restores to HEAD, so every mutation after the first measured the unpatched
+  tree, and the implementation was destroyed. A sweep that reverts must refuse a
+  dirty `src/`.
+- A mutation whose anchor did not land where it was aimed: one matched a line
+  inside a COMMENT, another matched two sites and changed the wrong one, leaving
+  a guard untouched while the run read as "verified". **A mutation you did not
+  confirm landed on the line you meant is not a measurement.** Assert the
+  enclosing function, or that the anchor matches exactly once, before writing.
+
+A related trap with the same shape but no mutation of your own: **the record
+lags the artifact.** Immediately after a push, a pull request can report the OLD
+head and a stale `reviewDecision`. Poll until the reported head matches the sha
+you pushed, then read the rest.
+
+## A comment asserting a property the code does not have
+
+Four instances this sprint, in four files, which makes it a pattern rather than
+a coincidence. **A wrong comment has a longer half-life than wrong code,
+because the code gets re-read and the comment gets believed.**
+
+- `ADVICE_ACTIONS` said "both read this name so the two gates cannot drift
+  apart". `parse_advice` did not read it; it carried its own literal set, so the
+  documented invariant was unimplemented and widening the literal was invisible
+  to every test.
+- `_stop_guard`'s cap comment claimed the halt-room term "makes a spent daily
+  budget refuse a widening by arithmetic alone", while no test could observe
+  that half at all.
+- A comment added with `replace_pending`'s carve-out claimed the unmeasured-spec
+  refusal "has to come BEFORE" it or the carve-out becomes a second fail-open.
+  Measured, the two placements are observationally equivalent; the narrower true
+  claim replaced it.
+- `VENUE_CLOCK_BAR_DISAGREES` claimed it makes a stale stamp "unreachable" when
+  measured it only NARROWS, accepting an instant wrong by 900s at `bar_age=899`
+  under a violated bound, because it compares against the bar's OPEN and is
+  blind just before a bar closes.
+
+A fifth, in a README rather than code, shows the cost directly: it stated that
+IMPORTING a module moves the bundle numbers, when a bare import is tree-shaken
+and only a retained use does. Anyone re-checking by that procedure sees zero
+change and concludes the instrument cannot fire.
+
+So when a comment states a property, ask what would red if the property stopped
+holding. If the answer is nothing, the comment is a claim rather than a
+guarantee, and it should say which.
+
+## An assertion over an empty collection passes for free
+
+`all(...)` over an empty iterable is `True`, and a set-equality assertion
+against an empty set holds when the thing under test produced nothing at all.
+So any `all`-shaped or set-shaped assertion needs to be shown FAILING on the
+empty case before it counts.
+
+Worked example from this suite: `set(room.values()) == {0}` is sound precisely
+because it also fails on an empty `room`, so it cannot pass by the exposure
+block rendering no rows. That property is what separates it from
+`all(v == 0 for v in room.values())`, which an empty book satisfies silently.
+
 ## Two traps specific to this codebase
 
 **Always probe a config value at a NON-DEFAULT setting.** Every exposure fixture
@@ -138,5 +212,15 @@ ran. Measured: the required `ci` context was ABSENT from a sha for four polls
 while every `ci-matrix` leg was already green, and the pull request sat
 `BLOCKED` with no failing check to point at.
 
-The required contexts on `main` are `ci` and `coverage`. Assert both are present
-AND successful.
+The required contexts on `main` are `ci` and `coverage`, read from
+`/rules/branches/main`. Assert both are PRESENT and successful, by name.
+
+**An absence and a clean result are the same reading unless you name what must
+be present.** This one is worth more than the others because it was found in a
+CERTIFYING instrument rather than a measuring one: the others corrupted a
+measurement, this corrupted the check that signs measurements off. Two seats
+were narrating a count all day while the merge gate itself was sound, because
+GitHub computes `mergeStateStatus` against the required contexts. The gate was
+right and the narration was lucky, which is the distinction worth keeping: a
+correct outcome does not retroactively make the reading that accompanied it
+evidence.
