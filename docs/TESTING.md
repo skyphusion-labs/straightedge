@@ -316,12 +316,28 @@ Reviewing prose catches wording. Only running it catches rot. So when a document
 states a command, run the command; when it states a count, reproduce the count.
 
 **But measure whether your documents contain anything a script may safely run,
-before trusting a script to check them.** Surveyed across this repo: 11
-documents, 40 fenced blocks, and the command-shaped lines are `python -m
-straightedge` (which starts a desk), `launchctl` (which mutates the machine),
-`export` (which sets credentials), `powershell`, and desk chat commands such as
-`/trail` that are not shell at all. **Not one is safe to execute
-automatically.** A verifier that ran them would be far worse than none.
+before trusting a script to check them.** And **state what you counted over**:
+a count without its domain is not a measurement, which is the
+lines-versus-occurrences trap one level up. Both domains, same regex, measured
+on `main`:
+
+| domain | files | with fenced blocks | blocks |
+| --- | --- | --- | --- |
+| `docs/*.md` plus `README.md` | 11 | 6 | 41 |
+| `**/*.md` across the repo | 19 | 12 | 56 |
+
+In both, the command-shaped lines inside fences are `python -m straightedge run`
+and its siblings (`backtest`, `watch`, `supervision`), which start or drive a
+desk; `launchctl` and `powershell -File Install-Supervision.ps1`, which mutate
+the machine; `export` and `source`, which set credentials; and desk chat
+commands such as `/trail`, which are not shell at all. **Not one is safe to
+execute automatically.** A verifier that ran them would be far worse than none.
+
+One precision, because the first version of this paragraph was loose: **bare
+`doctor` IS offline and read-only**, so it would be safe, but it appears only in
+PROSE, in README's numbered steps, and never inside a fenced block. The script
+reads fences only, so it never sees it. `doctor --connect` opens a venue
+connection and `run` starts a desk; attributing that to `doctor` was wrong.
 
 So on this repo the automated half checks read-only commands (`git`, `pytest`,
 `ruff`, `mypy`) and legitimately finds none to run, which is a property of the
@@ -398,12 +414,21 @@ run is as much a part of the reading as what it ran.
 **Run as written, with all four controls, which is the standard this section
 sets for itself:**
 
-```
-target=TESTING.md    rc=1   2 blocks, 2 SKIP, 0 executed -> "broken check, not a clean document"
-target=control.md    rc=1   2 blocks, 4 executed, deliberate failure shows exit=128
-target=unsafe.md     rc=1   1 block,  0 executed (launchctl / python -m straightedge)
-target=all_pass.md   rc=0   2 blocks, 2 executed, both exit=0
-```
+| target | rc | reading |
+| --- | --- | --- |
+| `TESTING.md` | 1 | 2 blocks, 2 SKIP, 0 executed -> broken check, not a clean document |
+| `control.md` | 1 | 2 blocks, 4 executed, deliberate failure shows `exit=128` |
+| `unsafe.md` | 1 | 1 block, 0 executed (`launchctl`, `python -m straightedge run`) |
+| `all_pass.md` | 0 | 2 blocks, 2 executed, both `exit=0` |
+
+**That table is not a fenced block, and it used to be.** While it was one, this
+file held THREE blocks and the row above reported two, so **the act of
+documenting the denominator changed the denominator.** A stale count, in the
+section whose rule is print the denominator, produced by printing it. Caught by
+a reviewer running the shipped script against the shipped file. It is now a
+markdown table, which both renders better and keeps the row describing the file
+rather than describing itself; if you add a fence here, re-run and update the
+row.
 
 The last row is the one most easily skipped: **a check that cannot return 0 is a
 gate that can never pass**, which is as useless as one that can never fail, and
