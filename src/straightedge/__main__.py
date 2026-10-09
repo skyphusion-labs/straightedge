@@ -36,6 +36,7 @@ from straightedge.journal import (
 )
 from straightedge.models import Bar
 from straightedge.strategy import TrendStrategy
+from straightedge.llm import _is_cf_gateway
 from straightedge import supervision
 from straightedge.synthetic import generate_bars, generate_ranging
 from straightedge.telegram import TelegramClient, TgCommand, offset_path_for
@@ -398,7 +399,14 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     print("telegram token:", _presence(cfg, "telegram.token", cfg.telegram.token))
     print("telegram chat:", _presence(cfg, "telegram.chat_id", cfg.telegram.chat_id))
     print("xai key:", _presence(cfg, "advice.grok_key", cfg.advice.grok_key))
-    print("anthropic key:", _presence(cfg, "advice.claude_key", cfg.advice.claude_key))
+    # Labelled by FUNCTION, not by provider: `advice.claude_key` carries an
+    # Anthropic key when `claude_url` is api.anthropic.com and a Cloudflare token
+    # when it points at an AI Gateway. Printing "anthropic key" for a Cloudflare
+    # token on the pre-live check is wrong in the one place an operator looks.
+    _ck_label = "claude credential (cloudflare gateway token)" if _is_cf_gateway(
+        cfg.advice.claude_url
+    ) else "claude credential (anthropic key)"
+    print(f"{_ck_label}:", _presence(cfg, "advice.claude_key", cfg.advice.claude_key))
     print("ai provider:", cfg.advice.provider)
     ping = telegram_ping(cfg)
     print(f"telegram ping: {ping}")

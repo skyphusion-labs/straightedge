@@ -35,12 +35,12 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-EA_PATH = Path(__file__).resolve().parents[1] / "mt4" / "Experts" / "Mt4RiskBot.mq4"
-
 # The numbers these guards are bounded against are MEASURED, and
 # `tests/live_measurements.py` is where a measured number has its one home. They
 # are cited here, never restated, so the bound and the measurement cannot drift.
 from live_measurements import ADAPTER_BUDGET_MS, BRIDGE_ROUND_TRIP_P50_MS
+
+EA_PATH = Path(__file__).resolve().parents[1] / "mt4" / "Experts" / "Mt4RiskBot.mq4"
 
 MEASURED_ROUND_TRIP_MS = BRIDGE_ROUND_TRIP_P50_MS
 
