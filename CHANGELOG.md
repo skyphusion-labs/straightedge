@@ -210,7 +210,7 @@ the breach printed but not journaled.
 
 **One mutation was run and is NOT in that list, because it cannot fire.**
 Replacing the RESTORE's own `max(self._hb_gap_ever_s, float(raw))` with a plain
-assignment leaves the whole suite green (1349 passed), and correctly so: the
+assignment leaves the whole suite green (1394 passed), and correctly so: the
 restore happens once, before any live write, when the carried figure is still
 `0.0`, and a gap is never negative, so the two forms cannot be told apart by
 any reachable input. That `max` is defensive rather than load-bearing. The
