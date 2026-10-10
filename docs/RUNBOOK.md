@@ -1328,6 +1328,15 @@ read the chat for the sentence and the journal for the fact. `advice_error`
 also carries `turn_spent`: the daily advice budget is counted before the
 provider is called, so a failed turn still costs a slot, and this row is the
 only place that says which slot went where.
+`advice_memory_unsaved` is the row for a turn that SUCCEEDED and whose
+conversation memory could not be written to disk (straightedge#282). The reply
+reached the operator, the slot was spent and bought something, and the file did
+not update, so a restart will not remember that turn. Same shape as
+`advice_error`: `error_type` carries the exception class and never its message,
+and `turn_spent` is true. **Chase it**, because the causes are a full disk, a
+revoked ACL on the state directory, or a vanished directory, and all three will
+also stop the journal, the inflight ledger and the equity snapshot. The chat
+carries a one-line note on that turn as well.
 It is journal-only and never pings the chat. One row at `start()`, and one more
 whenever the offset CHANGES: a server-side DST roll or a reconnect that lands on
 a different server, both of which happen with nobody editing anything. An offset
