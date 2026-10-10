@@ -7,12 +7,14 @@ wipe desk context. Bound to KEEP_TURNS messages. Secrets redacted.
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from straightedge.atomic import replace_retrying_on_share_conflict
 from straightedge.config import AdviceConfig
 from straightedge.currencies import may_transform_symbol, normalize_model_symbol
 from straightedge.journal import redact_text
@@ -417,6 +419,13 @@ def parse_advice(raw: str) -> Advice:
     )
 
 
+#: The largest magnitude a venue ticket can plausibly take. MT4 and MT5 order
+#: tickets are 32 or 64 bit integers, so this is generous by orders of
+#: magnitude; the point is that it is FINITE, so no ticket can contribute an
+#: unbounded number of digits to a journal row (straightedge#226).
+_TICKET_CEILING = 2**63
+
+
 def _num(v: Any) -> float | None:
     if v is None or v == "":
         return None
@@ -427,12 +436,36 @@ def _num(v: Any) -> float | None:
 
 
 def _int(v: Any) -> int | None:
+    """A ticket, or None. Never a 309 digit integer and never a raise.
+
+    `int(n)` on a non-finite float raises `OverflowError`, which derives from
+    `ArithmeticError` and is therefore NOT in the
+    `(ValueError, RuntimeError, OSError)` tuple `Desk.handle_command` and
+    `Engine.poll_telegram` catch: a model emitting a 400 digit ticket was an
+    uncaught exception out of the command handler. Measured, and it is the same
+    family #219 found in `normalize_volume` (straightedge#226).
+
+    `math.isfinite` is the check rather than the except clause, because a
+    finite-but-enormous float still produces an integer with as many digits as
+    its exponent: `1e308` gave a 309 digit ticket and a 501 byte journal row on
+    its own. A ticket is a venue handle, so a value no venue could have issued
+    is not a ticket; refusing it is the same rule as `_num` returning None for
+    a non-number.
+
+    THE `except OverflowError` BELOW IS UNREACHABLE WHILE THE GUARD STANDS, and
+    no test pins it: a review measured dropping it with the guard kept and the
+    whole suite stayed green. That is the correct state for a backstop rather
+    than a gap to close with a test, because a test that could only pass by
+    removing the guard first would be pinning the guard twice. It is kept for
+    the case the guard is ever narrowed, and it is named here so the next reader
+    does not mistake an untested line for an untested behaviour.
+    """
     n = _num(v)
-    if n is None:
+    if n is None or not math.isfinite(n) or abs(n) > _TICKET_CEILING:
         return None
     try:
         return int(n)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
 
 
@@ -532,7 +565,15 @@ class Advisor:
         tmp = path.with_name(path.name + ".tmp")
         tmp.write_text(payload, encoding="utf-8")
         os.chmod(tmp, 0o600)
-        tmp.replace(path)
+        # NOT a bare `os.replace` (straightedge#251). This is NOT merely a
+        # dropped nicety: `save` is reached from `_remember`, which `ask` calls
+        # AFTER the provider has already answered and been billed, and no call
+        # site wraps it. So a refused replace discards a reply the operator has
+        # already paid for and that `advice.max_turns_per_day` has already
+        # counted. The retry absorbs the race; that the reply is lost at all
+        # when persistence fails is a control-flow question in the advice path,
+        # filed as straightedge#282 rather than changed here.
+        replace_retrying_on_share_conflict(tmp, path)
         os.chmod(path, 0o600)
 
     def _computer(
