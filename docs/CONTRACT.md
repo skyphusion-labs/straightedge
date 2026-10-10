@@ -1,6 +1,6 @@
 # Contract
 
-`docs/TESTING.md` is the companion to this file: this one says what the suite enforces, that one says what a green suite cannot see. Read it before writing a fixture.
+`docs/TESTING.md` is the companion to this file: this one says what the suite enforces, that one says what a green suite cannot see. Read it before writing a fixture or a probe: the failures it records reach a script written to settle a review as readily as they reach the suite, and a probe has no suite behind it.
 
 Code that disagrees with this file is wrong.
 
@@ -79,6 +79,95 @@ Auto EMA trading is off until `/auto on`.
 | Unmeasured is not refused | An advice action that could not be turned into an order at all writes `advice_stage_failed` with `measured=false`, never `reject`. COULD NOT MEASURE stays distinct from REFUSED. |
 | Error record | A command that fails with `ValueError` or `RuntimeError` writes a row before the chat gets its sentence: `command_error` with `command`, `source` and `error_type`, or `advice_error` with `provider`, `stage` and `turn_spent` when the provider call itself raised. Both carry `measured=false`, so a crash is never counted as a gate saying no. The row carries the exception CLASS and deliberately NOT its message: a message can be authored by a provider or quote a model reply, which is the channel #216 and #226 closed, and the chat already has the sentence. `advice_error` exists separately because the daily advice cap is spent BEFORE the provider call (the turn is billed either way), so a failed turn costs a budget slot and `turn_spent` is the only field that can say so; before this the whole path was invisible to the journal and the operator saw the budget shrink with no record of why (straightedge#232, found by the live end-to-end run #35 requires, because a fake transport returns a payload and never raises). |
 | Auto arming | `/auto on` and `/auto off` write `auto_on` and `auto_off`, the audit trail `/live` and `/approve` already had. |
+
+### Refusal reasons: every `refused:` reply
+
+`refused: <reason>` reaches the operator verbatim, so the reason word is part of
+the contract and not an implementation detail. **This table is the ENUMERATION
+for that one reply shape; the rows above carry the mechanism in depth.** It is
+kept complete in BOTH directions by
+`tests/test_contract_refusal_vocabulary.py`, which scans the source for every
+word the desk can put after `refused: ` and fails when one has no row here, and
+also fails on a row naming a word the code can no longer emit (#220).
+
+**What that gate does and does not cover**, because a guarantee stated loosely
+is the thing this document keeps having to correct. It is closed over sites
+that name a word LITERALLY. A site whose word arrives by interpolation
+(`f"refused: {decision.reason}"`) is covered only because another scanner reads
+that word where it is set; a site whose payload is free text nobody defines
+(`f"refused: {result.comment}"`, filled by `OrderResult.not_sent`) has no word
+to document at all. Those sites are not counted and not ignored: the scanner
+returns each one and the test PINS the set, so a new one of either kind fails
+until a person decides which it is. The pin is the part that forces the look,
+and two earlier versions of it did not: the first saw no f-string site, the
+second saw no CONCATENATED one, which is how most people would spell it.
+
+What the pin sees is stated rather than implied, because this paragraph has
+twice claimed more than the mechanism did. A refusal reply must carry the
+literal `refused: ` prefix somewhere in the source, so every string constant
+carrying it is a site whatever assembles the rest, and the forms are measured
+one per test: f-string, concatenation with and without the space, `str.join`,
+an f-string with a leading expression, `%` and `.format`. **The one thing not
+seen is a prefix computed at runtime** (`"ref" + "used: "`), which leaves no
+literal to find; that limit is pinned by its own test so it cannot quietly
+become wrong in either direction.
+
+**SCOPE, stated because the table cannot close over what it does not scan.**
+A refusal that does not take the `refused: <word>` shape is NOT in this table
+and is NOT gated by that test:
+
+* `_stop_guard` refuses a `/sl` with `stop_removal_refused` or
+  `stop_exceeds_risk`, which surface as `sl failed retcode=<n> <word>` and
+  journal as `modify_refused`. Both words are documented, in the `/sl` row
+  above, and neither is scanned; widening the gate to cover that channel is
+  filed separately rather than grown into this change.
+* A quote that cannot be read is refused by raising, with operator PROSE rather
+  than a word (`unreadable tick for <symbol>`, `no tick for <symbol>`), so
+  there is no vocabulary entry to make.
+
+So read this table as closed over `refused:` replies, which is what it is, and
+not over everything the operator can be refused with.
+
+A `:` suffix means the word is a PREFIX and a measured payload follows it, which
+is what makes the refusal actionable rather than merely named.
+
+| reason | what was measured | what the operator does |
+| --- | --- | --- |
+| `already_in_symbol` | a commitment in that symbol already exists | close or replace it first |
+| `currency_exposure` | the order would push net exposure in one currency past `max_currency_exposure` | reduce elsewhere in that currency, or raise the cap deliberately |
+| `daily_loss` | the UTC day's loss budget is spent | nothing today; this also HALTS and flattens |
+| `deviation_below_spread:` | the effective slippage tolerance is smaller than the current spread, with the measurement and the config key to change in the payload | raise `symbol_deviation_points` for that symbol, or wait for the spread |
+| `exposure_unmeasured` | currency exposure could not be computed at all | look at the venue; this is COULD NOT MEASURE, not a cap |
+| `halt_file` | the HALT file exists on disk | remove it when you mean to resume (`docs/RUNBOOK.md`) |
+| `halted` | the circuit is latched halted and names no narrower reason | read the journal for the halt that latched it |
+| `live_not_accepted` | mode is live and the account is real, but the risk phrase was never given | `/live on I-ACCEPT-RISK`, or start with `--i-accept-risk` |
+| `margin_buffer` | free margin as a fraction of equity is below `min_free_margin_pct` | reduce exposure, or add margin |
+| `max_advice_turns_per_day` | the UTC day's advice turn budget is spent | nothing today |
+| `max_drawdown` | the peak-to-trough drawdown cap is hit | nothing today; this also HALTS and flattens |
+| `max_positions` | open commitments carrying our magic are at `max_positions` | close one, or raise the cap deliberately |
+| `max_trades_per_day` | the UTC day's trade budget is spent | nothing today |
+| `no_signal` | the strategy produced FLAT or no side | not an error; nothing to send |
+| `orders_unmeasured` | `broker.orders()` could not be READ, so commitment is unmeasured | look at the venue or the Expert; reading a failed read as "no orders" would fail OPEN |
+| `outside_session` | an AUTO order fell outside the configured session window | wait for the session, or send it manually, which is not session-gated |
+| `rr_below_min` | reward-to-risk on the signal is below `min_rr` | widen the target, tighten the stop, or skip |
+| `size_exceeds_risk` | the order's worst case exceeds **`min(per_trade, loss_room)`**, the LESSER of the per-trade cap and `loss_room`, which is the money the account may still lose before EITHER halt gate trips, daily loss or drawdown, computed from the persisted snapshot the sizer never sees (#157). Measured that way at both emission sites: `risk.py` on a new order, `engine.py` on a `/replace`. The reason carries NO payload, so it does not say which half bound | **depends on which half bound, and you have to work that out.** Per-trade cap: reduce size. `loss_room`: size is not the problem and halving it refuses again. If DAILY LOSS is the near one, stop and wait for the UTC roll; if DRAWDOWN is, the roll will not help, because peak-to-trough outlives the day. From `/replace` the refusal means specifically that the replacement ADDS risk, since #164 exempts a reduction from the cap entirely, so the action there is a replacement at or below what is already resting and never a smaller version of the increase |
+| `size_zero` | sizing returned zero lots | the stop distance is too wide for the risk budget at min lot; skip it |
+| `sl_not_measured:` | the VENUE reported a stop that cannot be a price (`nan`, `inf`), with the value in the payload | look at the venue; this is not your omission |
+| `sl_required` | no USABLE stop: `unusable_stop` returns this for any `sl <= 0`, so it covers a stop that was never set (the venue encodes that as `0`) AND one set to a negative price, which is set but cannot be a price | set a stop at a real price. A negative value is not a missing stop and is worth re-reading as a sign or units mistake rather than an omission |
+| `spec_not_measured:` | the venue never streamed the named sizing fields, which are in the payload | get the symbol into Market Watch; sizing refuses rather than defaulting |
+| `spread_too_wide` | spread exceeds `max_spread_atr_frac` of ATR | wait for the spread to come in |
+| `state_unreadable` | the durable risk state could not be READ | fix the path or permissions; the budgets cannot be trusted without it |
+| `state_unwritable` | the durable risk state could not be WRITTEN | fix the path or permissions; a restart would hand out spent budget again |
+| `stops_level` | the stop is closer than the broker's own minimum distance | widen the stop past `stops_level` |
+| `trade_not_allowed` | the account or the Expert has trading disabled | enable it at the terminal |
+| `volume_unusable:` | a close or scale-out volume is not a finite number above zero, with the value in the payload | retype the volume |
+
+One refusal is PROSE rather than a word, deliberately: `refused: unresolved send
+<client_id>` names a specific in-flight send and cannot be a vocabulary entry.
+The scanner above returns it separately and the test pins it, so a NEW prose
+refusal is looked at by a person instead of quietly joining a list of things
+nothing checks.
+
 
 ## Forbidden claims
 
