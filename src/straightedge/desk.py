@@ -279,6 +279,31 @@ class Desk:
                 return "unknown command. /help"
             return fn()
         except (ValueError, RuntimeError) as exc:
+            # THE RECORD, before the reply. Until #232 this arm returned the
+            # sentence and wrote nothing, so every command that failed this way
+            # was invisible to the one channel an operator can audit and a test
+            # is allowed to assert on, while the chat said something had
+            # happened. A silent degrade with a message attached.
+            #
+            # The CLASS, never the sentence. An exception message can be
+            # authored by a provider or quote a model reply, and a
+            # model-authored sentence in `journal.jsonl` is the defect #216 and
+            # #226 closed; the chat already has the sentence. A clipped detail
+            # field becomes possible when `clip_for_record` reaches `main`
+            # (#226) and is deliberately not hand-rolled here, because a second
+            # clipper would be a second opinion about one bound.
+            #
+            # `measured=false` keeps this out of the `reject` population: a
+            # gate saying no and a desk that could not reach an answer are
+            # different facts, and merging them makes every reason count built
+            # on `reject` unreadable.
+            self._journal_only(
+                "command_error",
+                source="telegram",
+                command=cmd.name,
+                error_type=type(exc).__name__,
+                measured=False,
+            )
             return redact_text(str(exc))
 
     def _quote(self, args: str) -> str:
@@ -749,12 +774,38 @@ class Desk:
             except (ValueError, RuntimeError, OSError):
                 pass
         self.engine.risk.record_advice_turn()
-        advice = self.advisor.ask(
-            question,
-            self.engine.advice_context(),
-            session=session,
-            history=self.engine.advice_history(),
-        )
+        # THE SLOT IS ALREADY SPENT HERE, which is why this failure gets its
+        # own record rather than the generic one above. The cap is counted
+        # before the provider call on purpose (the turn is billed whether or not
+        # it ends in an order, pinned by
+        # `test_the_advice_cap_refuses_before_the_provider_is_billed`), so a
+        # raise from `ask` left a budget slot spent with nothing saying it was
+        # attempted: the operator watches the budget shrink and the record
+        # cannot say why. `turn_spent` is the field no other row can supply.
+        #
+        # The same tuple `handle` catches, deliberately NOT widened. Widening
+        # what is caught is a behaviour change on the money path and belongs in
+        # its own issue rather than in the change that adds a record. The prose
+        # is returned exactly as `handle` would have returned it, so the chat
+        # does not move.
+        try:
+            advice = self.advisor.ask(
+                question,
+                self.engine.advice_context(),
+                session=session,
+                history=self.engine.advice_history(),
+            )
+        except (ValueError, RuntimeError) as exc:
+            self._journal_only(
+                "advice_error",
+                source="advice",
+                stage="provider",
+                provider=self.engine.cfg.advice.provider,
+                error_type=type(exc).__name__,
+                turn_spent=True,
+                measured=False,
+            )
+            return redact_text(str(exc))
         lines = [advice.text]
         if advice.summary:
             lines.append(advice.summary)

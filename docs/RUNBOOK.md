@@ -1262,6 +1262,14 @@ an IPC or bridge fault, not a trading decision; check the terminal link.
 Grep `reject` if it never trades.
 `outside_session` and `no_regime` are the usual reasons.
 `venue_clock` records WHICH CLOCK the desk was on, which no other row says.
+`command_error` and `advice_error` are the rows for a command that FAILED, as
+opposed to one that was refused. A refusal is `reject` with a named reason; a
+failure is one of these two with `measured=false` and the exception class in
+`error_type`. The message the chat showed is NOT in the row, on purpose, so
+read the chat for the sentence and the journal for the fact. `advice_error`
+also carries `turn_spent`: the daily advice budget is counted before the
+provider is called, so a failed turn still costs a slot, and this row is the
+only place that says which slot went where.
 It is journal-only and never pings the chat. One row at `start()`, and one more
 whenever the offset CHANGES: a server-side DST roll or a reconnect that lands on
 a different server, both of which happen with nobody editing anything. An offset
