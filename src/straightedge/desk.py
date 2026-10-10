@@ -224,8 +224,17 @@ class Desk:
             fields["rr"] = signal.rr
         elif symbol:
             # CLIPPED HERE, not at each caller, because this is the single
-            # writer of every `reject` row and a model-chosen symbol can reach
-            # it from any advice path. `_stage_close` passed `advice.symbol`
+            # writer of every MODEL-CHOSEN `reject` symbol, and such a symbol
+            # can reach it from any advice path. Six other sites write a
+            # `reject` row and none of them can: `desk.py` twice through
+            # `_journal_only` with literal constants only, and `engine.py` four
+            # times from `cfg.symbols` by way of `step_all` and `step_symbol`,
+            # so operator-scoped. The earlier wording here said "every `reject`
+            # row", which is false, and a comment claiming a uniqueness the
+            # code does not have hands the next reader this PR's own mistake
+            # with somebody else's authority behind it: a seventh writer gets
+            # added, "single writer" is believed, and nobody checks.
+            # `_stage_close` passed `advice.symbol`
             # raw from three sites and a close is NEVER gated by
             # `advice_allows`, so a 5600 character symbol measured a 5751 byte
             # reject row while the `advice_turn` row beside it was 299 and
