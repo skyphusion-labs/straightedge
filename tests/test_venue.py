@@ -317,6 +317,6 @@ def test_engine_does_not_import_mt5_retcodes() -> None:
     done = OrderResult.unchanged()
     assert done.ok
     assert done.comment == "unchanged"
-    bad = OrderResult.invalid_stops("sl required")
+    bad = OrderResult.invalid_stops("sl_required")
     assert not bad.ok
-    assert bad.comment == "sl required"
+    assert bad.comment == "sl_required"

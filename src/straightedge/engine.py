@@ -2261,7 +2261,7 @@ class Engine:
         sl_n = spec.normalize_price(sl) if sl else 0.0
         tp_n = spec.normalize_price(tp) if tp else 0.0
         if sl_n <= 0:
-            return OrderResult.invalid_stops("sl required")
+            return OrderResult.invalid_stops("sl_required")
         entry = spec.normalize_price(price) if price is not None else order.price
         if order.side.value == "buy" and not (sl_n < entry and (tp_n <= 0 or entry < tp_n)):
             return OrderResult.invalid_stops("buy needs sl < entry < tp")

@@ -387,7 +387,7 @@ class PaperBroker:
         sl = float(request.get("sl", 0) or 0)
         tp = float(request.get("tp", 0) or 0)
         if sl <= 0:
-            return OrderResult(retcode=TRADE_RETCODE_INVALID_STOPS, comment="sl required", request=request)
+            return OrderResult(retcode=TRADE_RETCODE_INVALID_STOPS, comment="sl_required", request=request)
         min_dist = spec.min_stop_distance()
         if abs(price - sl) < min_dist - spec.point / 2:
             return OrderResult(retcode=TRADE_RETCODE_INVALID_STOPS, comment="stops_level", request=request)

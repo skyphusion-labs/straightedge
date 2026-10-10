@@ -153,7 +153,7 @@ is what makes the refusal actionable rather than merely named.
 | `size_exceeds_risk` | the order's worst case exceeds **`min(per_trade, loss_room)`**, the LESSER of the per-trade cap and `loss_room`, which is the money the account may still lose before EITHER halt gate trips, daily loss or drawdown, computed from the persisted snapshot the sizer never sees (#157). Measured that way at both emission sites: `risk.py` on a new order, `engine.py` on a `/replace`. The reason carries NO payload, so it does not say which half bound | **depends on which half bound, and you have to work that out.** Per-trade cap: reduce size. `loss_room`: size is not the problem and halving it refuses again. If DAILY LOSS is the near one, stop and wait for the UTC roll; if DRAWDOWN is, the roll will not help, because peak-to-trough outlives the day. From `/replace` the refusal means specifically that the replacement ADDS risk, since #164 exempts a reduction from the cap entirely, so the action there is a replacement at or below what is already resting and never a smaller version of the increase |
 | `size_zero` | sizing returned zero lots | the stop distance is too wide for the risk budget at min lot; skip it |
 | `sl_not_measured:` | the VENUE reported a stop that cannot be a price (`nan`, `inf`), with the value in the payload | look at the venue; this is not your omission |
-| `sl_required` | no USABLE stop: `unusable_stop` returns this for any `sl <= 0`, so it covers a stop that was never set (the venue encodes that as `0`) AND one set to a negative price, which is set but cannot be a price | set a stop at a real price. A negative value is not a missing stop and is worth re-reading as a sign or units mistake rather than an omission |
+| `sl_required` | **Arrives on TWO channels for one condition (#233):** as `refused: sl_required` from the order and sizing path, and as `sl failed retcode=10016 sl_required` from the working-order modify path and the paper adapter's send guard. One word, one row, deliberately not duplicated into the stop-guard table, because a second row is two places to drift. No USABLE stop: `unusable_stop` returns this for any `sl <= 0`, so it covers a stop that was never set (the venue encodes that as `0`) AND one set to a negative price, which is set but cannot be a price | set a stop at a real price. A negative value is not a missing stop and is worth re-reading as a sign or units mistake rather than an omission |
 | `spec_not_measured:` | the venue never streamed the named sizing fields, which are in the payload | get the symbol into Market Watch; sizing refuses rather than defaulting |
 | `spread_too_wide` | spread exceeds `max_spread_atr_frac` of ATR | wait for the spread to come in |
 | `state_unreadable` | the durable risk state could not be READ | fix the path or permissions; the budgets cannot be trusted without it |
@@ -261,19 +261,24 @@ A `:` suffix means the word is a PREFIX and a measured payload follows it.
 | `stop_exceeds_risk` | the widening's worst case exceeds `risk_pct * max_risk_multiple` of equity, or the remaining daily loss room | tighten instead, or accept the stop that fits; at or beyond breakeven nothing is capped |
 | `stop_removal_refused` | the price would leave a protected position unprotected: at or below zero, or non-finite (`nan`, `inf`) | send a real price; `0` is the venue encoding for "no stop" and `nan` compares False against every bound |
 
-Three comments on this channel are operator PROSE rather than words, and that is
-deliberate: `_modify_pending` refuses a working-order modify with `sl required`,
+TWO comments on this channel are operator PROSE rather than words, and that is
+deliberate: `_modify_pending` refuses a working-order modify with
 `buy needs sl < entry < tp` and `sell needs tp < entry < sl`, which describe an
-ORDERING between three numbers rather than a named condition. The test pins that
-set exactly, so a new comment is either a word that belongs in this table or
-prose that belongs in the pin, and it cannot be neither.
+ORDERING between three numbers rather than a named condition. There is no word
+to converge them on and inventing one would be worse than the asymmetry. The
+test pins that set exactly, so a new comment is one of three things and cannot
+be none of them: a word that belongs in this table, prose that belongs in the
+pin, or a word whose row is in the `refused:` table.
 
-**One meaning has two renderings, one per channel, and this is the record of
-it:** a missing stop is `refused: sl_required` on the order path and
-`sl failed retcode=10016 sl required` on the working-order modify path. Both are
-documented; normalising them would change an operator-visible reply, so it is
-filed as straightedge#233 rather than folded into the change that added this
-gate.
+**A missing stop used to be the third prose comment and is now a WORD on both
+channels (straightedge#233).** `_modify_pending` and the paper adapter's send
+guard answer `sl failed retcode=10016 sl_required`, the same word the order and
+sizing path reports as `refused: sl_required`. **Its single row is in the
+`### Refusal reasons` table and names both channels**, deliberately not copied
+here: a second row would be two places to drift. This gate excludes it on that
+basis and a test proves the row really exists there, because an exclusion with
+no positive check is how a word stops being documented anywhere while two gates
+each believe the other covers it.
 
 ## Confirm and send
 
