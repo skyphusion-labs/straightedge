@@ -228,6 +228,7 @@ def render(
     started_at: str,
     deployed: str,
     breach_rows_lost: int = 0,
+    rotate_deferrals: int = 0,
 ) -> str:
     """The heartbeat file's whole content.
 
@@ -277,6 +278,14 @@ def render(
         # field that only appears when something is wrong is a field no reader
         # learns to expect.
         f"breach_rows_lost={int(breach_rows_lost)}",
+        # straightedge#251. A COUNT, for the same reason the field above is one:
+        # a reader of `journal.jsonl` that never lets go defers EVERY rotation,
+        # so the number is how long it has been going on. Distinct from
+        # `breach_rows_lost`, which reports a HOLE in the audit log; here every
+        # row landed and it is the FILE that is over its 10 MiB bound. Published
+        # unconditionally for the same reason: a field that appears only when
+        # something is wrong is a field no reader learns to expect.
+        f"rotate_deferrals={int(rotate_deferrals)}",
         f"run_id={run_id}",
         f"started_at={started_at}",
         f"deployed={deployed}",

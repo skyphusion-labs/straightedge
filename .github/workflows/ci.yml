@@ -219,6 +219,20 @@ jobs:
   # succeed. Runs with if: always() because a needs-only job is SKIPPED, not
   # failed, when an upstream job fails or is itself skipped -- and skipped
   # is not the red this check exists to produce.
+
+  # RETARGETED by straightedge#259's fragment half: this gate now requires a
+  # `changelog.d/<issue>-<slug>.md` file and a `CHANGELOG.md` edit does NOT
+  # satisfy it. The SUBJECT of this one gate moved rather than a second gate
+  # being written beside it, because two checks asking one question in two
+  # spellings is the rebuilt-consumer defect docs/TESTING.md has an entry about.
+  #
+  # THE OTHER HALF OF THE CONTRACT IS NOT WIRED HERE ON PURPOSE.
+  # `tests/changelog_assemble.py --check` (fragment names, and the invariant
+  # that `## Unreleased` carries no entries) runs through `pytest` in
+  # `ci-matrix`, which is already in this workflow's `ci` needs. Adding a step
+  # for it here would duplicate a check that already gates. docs/RELEASING.md
+  # is the contract in prose.
+  #
   # straightedge#259. A changelog entry was a convention with no trigger: five
   # recent merges fired it in BOTH directions, so the entry/no-entry split was
   # uncorrelated with whether `src/` changed. A rule that is inferred gets
@@ -248,7 +262,7 @@ jobs:
       - name: self-test the gate (positive and negative controls)
         run: python3 tests/changelog_gate.py --self-test
 
-      - name: a src/ change requires a CHANGELOG entry
+      - name: a src/ change requires a changelog.d/ fragment
         if: github.event_name == 'pull_request'
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
