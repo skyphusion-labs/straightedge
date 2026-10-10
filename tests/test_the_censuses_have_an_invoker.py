@@ -50,10 +50,36 @@ import timing_census
 #: a person edits this line deliberately and says why in the commit, which is
 #: the whole difference from a list the tool skips quietly.
 #:
-#: These three are a RAISED FINDING, not an accepted state: each owes one of
-#: the three answers in `docs/TESTING.md` (make a double enter the state,
-#: disclaim the path, or cite a live run). Shrinking this set is the fix.
-KNOWN_BLIND_SEAMS = frozenset({"cancel", "check_working", "working"})
+#: EMPTY as of straightedge#264, which answered the three that were here
+#: (`cancel`, `check_working`, `working`). All three took answer 1 from
+#: `docs/TESTING.md`, make the double enter the state, and the reason they
+#: share one answer is that they share one MECHANISM: all three are
+#: `self._result(self._call(op, ...))` in `Mt4Broker`, and `_call` is the
+#: injected transport whose mailbox bridge raises `BridgeTimeout`. There was
+#: never a case for disclaiming a path that one real exception reaches through
+#: all three.
+#:
+#: What differs, and why it is three tests rather than one parametrised over a
+#: list of method names: the CONSEQUENCE. Measured per seam before choosing.
+#:
+#:   working        a SEND. `inflight.begin()` has already run, so the entry
+#:                  must stay OPEN and the next confirm of the same staged
+#:                  order must be refused as unresolved.
+#:                  tests/test_send_idempotency.py
+#:   check_working  a READ, one call EARLIER. `begin()` has NOT run, so the
+#:                  ledger must stay EMPTY and nothing may be sent. The
+#:                  opposite correct answer to `working`, which is what makes
+#:                  the pair worth having.
+#:                  tests/test_send_idempotency.py
+#:   cancel         a sweep step on the SAFETY path. The order is a survivor,
+#:                  the report is incomplete, and the record must say COULD
+#:                  NOT MEASURE rather than carry a venue retcode.
+#:                  tests/test_flatten.py
+#:
+#: An empty set is not a finished job: it means no seam a double implements is
+#: blind. A seam no double implements at all is invisible to this census, which
+#: is a different question and not one this pin answers.
+KNOWN_BLIND_SEAMS: frozenset[str] = frozenset()
 
 
 def test_every_elapsed_time_assertion_is_marked_timing() -> None:
