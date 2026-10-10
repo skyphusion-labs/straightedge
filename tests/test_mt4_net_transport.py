@@ -90,7 +90,46 @@ BAD_TOKEN = "se73-transport-token-for-tests-only-WRONG01"
 
 #: Short mailbox budget so the timeout tests cost tenths of a second, not
 #: seconds. The production default is `mt4.timeout_ms`, 5000.
+#: The ceiling for a test where NOTHING CAN ANSWER: no stand-in Expert is
+#: running, so the mailbox timeout is certain at any ceiling and this number
+#: only decides how long the suite waits for a foregone conclusion. Kept small
+#: deliberately, and left as the DEFAULT, so the twenty tests in that shape are
+#: unchanged by #258.
 MAILBOX_TIMEOUT = 0.3
+
+#: The ceiling for a test where a stand-in Expert MUST answer. Derived rather
+#: than guessed (#258).
+#:
+#: Those tests were failing on `windows-latest` at a measured ~15% of runs,
+#: `main` included, because 0.3s is not a transport budget there: it is a bet
+#: on a polling thread being SCHEDULED inside 300ms on a loaded two-core runner
+#: with a filesystem filter driver. The stand-in polls every 5ms
+#: (`mt4_transcripts._loop`), so any stall longer than the ceiling makes the
+#: shim answer 504 and the test read a transport fault where the subject was
+#: transport TRANSPARENCY.
+#:
+#: Measured locally, 40 Expert-backed round trips at each ceiling:
+#:
+#:     ceiling=0.3s   p50=27.9ms  p95=30.4ms  max=30.7ms
+#:     ceiling=5.0s   p50=27.8ms  p95=30.1ms  max=30.4ms
+#:
+#: The green path is IDENTICAL, because the bridge returns as soon as `.res`
+#: appears: the budget is a CEILING, not a sleep. Raising a ceiling that is
+#: only reached on failure costs nothing when the test passes, and that is what
+#: makes this removing the race rather than tuning it.
+#:
+#: The race is reproducible, by stalling the stand-in's loop past the ceiling
+#: the way #254 did for its own instance:
+#:
+#:     stall     ceiling=0.3s               ceiling=5.0s
+#:     0.25s     answered                   answered
+#:     0.50s     BridgeTimeout(withdrawn)   answered
+#:     2.00s     BridgeTimeout(withdrawn)   answered
+#:
+#: 5.0s is ~160x the slowest observed round trip. A scheduling stall that long
+#: on a CI runner is a broken runner rather than a loaded one, and it would
+#: take every other leg down with it instead of one.
+ANSWER_BUDGET = 5.0
 
 
 def _mailbox_names(directory: Path) -> list[str]:
@@ -180,8 +219,22 @@ def request_text(
     return "\r\n".join(lines) + "\r\n\r\n" + body
 
 
-def net_broker(url: str, *, token: str = GOOD_TOKEN, **kw: Any) -> Mt4Broker:
-    bridge = HttpBridge(url, token, timeout_sec=MAILBOX_TIMEOUT)
+def net_broker(
+    url: str,
+    *,
+    token: str = GOOD_TOKEN,
+    timeout_sec: float = MAILBOX_TIMEOUT,
+    **kw: Any,
+) -> Mt4Broker:
+    """A desk pointed at the shim.
+
+    `timeout_sec` is the DESK's mailbox budget and it is named explicitly
+    because `**kw` goes to `Mt4Broker`: routing it through there would have put
+    the budget on the broker and left the bridge on the default, which fails
+    silently rather than loudly. A test whose stand-in Expert must answer
+    passes `ANSWER_BUDGET`; everything else keeps the small default.
+    """
+    bridge = HttpBridge(url, token, timeout_sec=timeout_sec)
     return Mt4Broker(bridge.call, magic=770077, **kw)
 
 
@@ -220,6 +273,7 @@ def opener_returning(payload: bytes) -> Any:
 
 
 class TestTheContractSurvivesTheNetwork:
+    @pytest.mark.timing
     def test_every_golden_op_answers_over_http(self, tmp_path: Path) -> None:
         """The whole op table, driven through `Mt4Broker` over a real socket.
 
@@ -228,8 +282,8 @@ class TestTheContractSurvivesTheNetwork:
         mailbox, answered across an HTTP hop, through the same adapter.
         """
         with TranscriptExpert(tmp_path, GOLDEN):
-            with shim(tmp_path) as (url, _):
-                br = net_broker(url)
+            with shim(tmp_path, timeout_sec=ANSWER_BUDGET) as (url, _):
+                br = net_broker(url, timeout_sec=ANSWER_BUDGET)
                 br.connect()
                 acct = br.account()
                 spec = br.symbol("EURUSD")
@@ -247,10 +301,11 @@ class TestTheContractSurvivesTheNetwork:
         assert bars, "no bars survived the network hop"
         assert positions, "no positions survived the network hop"
 
+    @pytest.mark.timing
     def test_a_market_send_survives_the_network(self, tmp_path: Path) -> None:
         with TranscriptExpert(tmp_path, GOLDEN) as ea:
-            with shim(tmp_path) as (url, _):
-                res = net_broker(url).market(
+            with shim(tmp_path, timeout_sec=ANSWER_BUDGET) as (url, _):
+                res = net_broker(url, timeout_sec=ANSWER_BUDGET).market(
                     MarketOrder(
                         symbol="EURUSD", side=Side.BUY, volume=0.1, sl=1.09, tp=1.12
                     )
@@ -260,6 +315,7 @@ class TestTheContractSurvivesTheNetwork:
         # The Expert saw the desk's own request, unmodified by the shim.
         assert "op=market" in ea.request("market")
 
+    @pytest.mark.timing
     def test_the_shim_forwards_the_desks_request_id_untouched(
         self, tmp_path: Path
     ) -> None:
@@ -270,8 +326,8 @@ class TestTheContractSurvivesTheNetwork:
         `test_request_ids_increment_per_call`).
         """
         with TranscriptExpert(tmp_path, {"ping": t_ping()}) as ea:
-            with shim(tmp_path) as (url, _):
-                br = net_broker(url)
+            with shim(tmp_path, timeout_sec=ANSWER_BUDGET) as (url, _):
+                br = net_broker(url, timeout_sec=ANSWER_BUDGET)
                 br.connect()
                 br.connect()
                 br.connect()
@@ -279,6 +335,7 @@ class TestTheContractSurvivesTheNetwork:
         print(f"request ids seen by the Expert over HTTP: {ids}")
         assert ids == ["1", "2", "3"]
 
+    @pytest.mark.timing
     def test_an_expert_refusal_reaches_the_desk_as_a_refusal(
         self, tmp_path: Path
     ) -> None:
@@ -291,14 +348,15 @@ class TestTheContractSurvivesTheNetwork:
         from mt4_transcripts import Transcript, ea_fail
 
         with TranscriptExpert(tmp_path, {"ping": Transcript("ping", ea_fail(1, "no_terminal"))}):
-            with shim(tmp_path) as (url, _):
+            with shim(tmp_path, timeout_sec=ANSWER_BUDGET) as (url, _):
                 with pytest.raises(RuntimeError, match="no_terminal") as exc:
-                    net_broker(url).connect()
+                    net_broker(url, timeout_sec=ANSWER_BUDGET).connect()
         assert not isinstance(exc.value, BridgeTimeout), (
             "an Expert refusal was reported as a timeout, so startup_connect "
             "would retry a diagnosis for the whole budget"
         )
 
+    @pytest.mark.timing
     def test_the_reply_body_is_the_experts_own_bytes(self, tmp_path: Path) -> None:
         """No re-serialization anywhere in the path.
 
@@ -309,7 +367,7 @@ class TestTheContractSurvivesTheNetwork:
 
         expected = ea_ok("time=1758700000", "note=verbatim/text with spaces").format(id=1)
         with TranscriptExpert(tmp_path, {"ping": Transcript("ping", ea_ok("time=1758700000", "note=verbatim/text with spaces"))}):
-            with shim(tmp_path) as (_url, where):
+            with shim(tmp_path, timeout_sec=ANSWER_BUDGET) as (_url, where):
                 status, body = raw(
                     where,
                     request_text(
@@ -355,6 +413,7 @@ class TestTheErrorPartitionSurvivesTheHop:
         )
         _assert_nothing_reached_the_expert(tmp_path, "401 during startup")
 
+    @pytest.mark.timing
     def test_a_504_IS_retried_until_the_expert_appears(self, tmp_path: Path) -> None:
         """The positive control for the test above, on the same harness.
 
