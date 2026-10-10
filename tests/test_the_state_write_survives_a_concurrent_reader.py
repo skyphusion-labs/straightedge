@@ -151,6 +151,17 @@ def test_a_hold_that_outlasts_the_window_STILL_HALTS(tmp_path: Path) -> None:
     genuinely unwritable file.
     """
     rm = _rm(tmp_path)
+    # PERSIST ONCE FIRST, and this line is load-bearing rather than setup.
+    # Without it the destination does not exist, so a mutation that SWALLOWS
+    # the refusal at the deadline still halts: `save_snapshot` continues to
+    # `os.chmod(p, ...)` on a missing file and raises `FileNotFoundError`
+    # instead. The test then passes for the wrong reason and cannot tell
+    # "the retry gave up and raised" from "the retry swallowed and a later
+    # line failed". Measured: with the destination absent, replacing the
+    # `raise` at the deadline with a `return` left this test GREEN.
+    rm.observe(_acct(10_000.0), _now())
+    assert Path(rm.state_path).exists(), "nothing was persisted, so chmod, not the replace, would be the thing that fails"
+
     real = os.replace
 
     def always(src, dst):  # type: ignore[no-untyped-def]
