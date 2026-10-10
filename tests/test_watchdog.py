@@ -258,6 +258,150 @@ def test_stale_heartbeat_drives_the_alarm_red(tmp_path: Path) -> None:
     assert "STALE" in report.text and "reconnect" in report.text
 
 
+#: A heartbeat that says the journal has stopped rotating, hand written for the
+#: same reason every other minimal heartbeat in this file is: these cases are
+#: about `decide`, and the REAL path (a live `Engine`, a refused rotation, the
+#: real heartbeat, and the alert clearing when the holder lets go) is driven
+#: end to end in `tests/test_the_replace_idiom_is_guarded_everywhere.py`.
+def _hb(path: Path, *, now: datetime, blocked: str = "", **fields: object) -> None:
+    lines = [now.isoformat(), f"blocked={blocked}", f"stale_after_s={MT4_STALE}"]
+    lines += [f"{k}={v}" for k, v in fields.items()]
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def test_a_journal_over_its_bound_is_an_alert_and_PAGES(tmp_path: Path) -> None:
+    """straightedge#288. The condition reaches the operator's own channel.
+
+    Not `decide` alone: the finding was arriving-but-unwatched, so the case
+    has to end at the thing that pages. `watch` is the reader, Telegram is the
+    channel, and the exit code is what a scheduled task sees.
+    """
+    cfg = _cfg(tmp_path, mode="mt4")
+    path = watchdog.heartbeat_path_for(cfg.journal_path)
+    now = datetime.now(timezone.utc)
+    _hb(
+        path,
+        now=now,
+        journal_bytes=11_000_000,
+        rotate_bytes=10_485_760,
+        rotate_deferrals=37,
+    )
+    report = watchdog.decide(path, now=now, cfg=cfg)
+    print(f"watchdog: unrotated journal -> {report.state} ({report.reason})")
+    assert report.state == watchdog.STATE_DEGRADED
+    assert report.reason == "rotation_stuck"
+    assert report.exit_code == watchdog.EXIT_DEGRADED
+    assert not report.ok, (
+        "an `ok` report is told once and never repeated, which is the defect "
+        "this change exists to close"
+    )
+    assert "514240 over" in report.text, report.text
+    assert "rotate_deferrals=37" in report.text, report.text
+
+    client, transport = _client()
+    code = watchdog.watch(path, cfg, send=client.send, out=lambda line: None)
+    sent = [body for _, body in transport.sent]
+    assert code == watchdog.EXIT_DEGRADED
+    assert sent, "the watcher sent nothing, so this proves nothing"
+    assert any("STOPPED ROTATING" in str(body) for body in sent), sent
+
+
+def test_a_rotation_failing_for_NO_NAMED_REASON_still_alerts(tmp_path: Path) -> None:
+    """The more general instrument, which is why the count is not the trigger.
+
+    `rotate_deferrals=0` with the file over its bound means the rotation is
+    not being REFUSED by a holder: it is failing, or not being attempted, for
+    something nobody has thought of. An alert keyed on the deferral count
+    would read that as healthy, which is the one case an alert on the cause
+    structurally cannot see.
+    """
+    cfg = _cfg(tmp_path, mode="mt4")
+    path = watchdog.heartbeat_path_for(cfg.journal_path)
+    now = datetime.now(timezone.utc)
+    _hb(path, now=now, journal_bytes=10_485_761, rotate_bytes=10_485_760,
+        rotate_deferrals=0)
+    report = watchdog.decide(path, now=now, cfg=cfg)
+    assert report.state == watchdog.STATE_DEGRADED
+    assert "does not have a name for" in report.text, report.text
+
+
+def test_a_transient_holder_that_let_go_is_NOT_an_alert(tmp_path: Path) -> None:
+    """The false positive this design is shaped to avoid.
+
+    A backup pass that held the journal across one rotation leaves
+    `rotate_deferrals` at 1 for the life of the process, with nothing wrong
+    and nothing for an operator to do. Any threshold on that count fires here
+    and never clears, which is how an alarm gets muted. The file is inside its
+    bound, so the rotation IS happening, so this is a note and not a state.
+    """
+    cfg = _cfg(tmp_path, mode="mt4")
+    path = watchdog.heartbeat_path_for(cfg.journal_path)
+    now = datetime.now(timezone.utc)
+    _hb(path, now=now, journal_bytes=4_096, rotate_bytes=10_485_760,
+        rotate_deferrals=1)
+    report = watchdog.decide(path, now=now, cfg=cfg)
+    print(f"watchdog: a holder that let go -> {report.state}")
+    assert report.state == watchdog.STATE_ARMED
+    assert report.exit_code == watchdog.EXIT_ARMED
+    assert report.ok
+    assert "let go" in report.text, report.text
+
+
+def test_the_rotation_READING_ABSENT_is_not_read_as_healthy(tmp_path: Path) -> None:
+    """A desk too old to publish the pair is UNMEASURED, not fine.
+
+    The same rule the file already applies to `over_budget_ever` and `run_id`:
+    an absent field is the absence of a measurement. `rotate_deferrals` on its
+    own cannot answer this, and saying so is the difference between a watcher
+    that does not know and one that reports a desk it cannot see as healthy.
+    """
+    cfg = _cfg(tmp_path, mode="mt4")
+    path = watchdog.heartbeat_path_for(cfg.journal_path)
+    now = datetime.now(timezone.utc)
+    _hb(path, now=now, rotate_deferrals=0)
+    report = watchdog.decide(path, now=now, cfg=cfg)
+    assert report.state == watchdog.STATE_ARMED, report.text
+    assert "UNMEASURED" in report.text, report.text
+    assert "NOT read as a healthy rotation" in report.text, report.text
+
+    # A bound of zero is the dangerous half of the pair: judged as a number it
+    # would make every nonzero size an alert.
+    _hb(path, now=now, journal_bytes=4_096, rotate_bytes=0, rotate_deferrals=0)
+    zero = watchdog.decide(path, now=now, cfg=cfg)
+    assert zero.state == watchdog.STATE_ARMED, zero.text
+    assert "UNMEASURED" in zero.text, zero.text
+
+
+def test_a_desk_that_WILL_NOT_TRADE_is_the_louder_condition(tmp_path: Path) -> None:
+    """Precedence, asserted rather than left to the order of two `if`s.
+
+    A halted desk with a stuck journal reports the halt, because the halt is
+    the urgent remedy. The rotation reading is not lost: it rides that report
+    as a note, and a NOT_TRADING report is already not `ok`, so `watch`
+    repeats it on the desk's own threshold and the note repeats with it. The
+    only state this can hide behind is one that is already being told.
+    """
+    cfg = _cfg(tmp_path, mode="mt4")
+    path = watchdog.heartbeat_path_for(cfg.journal_path)
+    now = datetime.now(timezone.utc)
+    _hb(path, now=now, blocked="daily_loss", journal_bytes=11_000_000,
+        rotate_bytes=10_485_760, rotate_deferrals=4)
+    report = watchdog.decide(path, now=now, cfg=cfg)
+    assert report.state == watchdog.STATE_NOT_TRADING
+    assert report.reason == "daily_loss"
+    assert not report.ok
+    assert "rotation bound" in report.text, (
+        "the halt hid the rotation reading entirely: " + report.text
+    )
+
+    # And a STALE desk, where the figures are stale too and the note says the
+    # reading, not a verdict.
+    later = now + timedelta(seconds=MT4_STALE + 1)
+    stale = watchdog.decide(path, now=later, cfg=cfg)
+    assert stale.state == watchdog.STATE_STALE
+    assert "rotation bound" in stale.text, stale.text
+
+
 def test_one_second_before_the_threshold_is_still_alive(tmp_path: Path) -> None:
     """The gate is not simply always red: the boundary is the published one."""
     cfg = _cfg(tmp_path, mode="mt4")

@@ -174,6 +174,47 @@ class Journal:
         _chmod600(self.path)
         return False
 
+    def live_bytes(self) -> int:
+        """Size of the LIVE file, and 0 when there is nothing to measure.
+
+        Published on the heartbeat, because it is the ONE reading that says
+        rotation is not happening RIGHT NOW (straightedge#288).
+        `rotate_deferrals` cannot: it is a monotonic per-process count with no
+        clock and no clearing, so a backup agent that held the file once an
+        hour ago leaves it at 1 forever and a holder still attached leaves it
+        at 1 too. Any threshold on that count fires on the transient case and
+        never clears.
+
+        A missing file reads 0 rather than raising. The desk writes this field
+        on every heartbeat, and a heartbeat that fails because the journal has
+        not been created yet would be a monitoring surface taking down the
+        thing it monitors.
+        """
+        try:
+            return self.path.stat().st_size
+        except OSError:
+            return 0
+
+    def rotate_bytes(self) -> int:
+        """The bound the live file is rotated AT, for publishing beside it.
+
+        A METHOD rather than an exported constant, for two reasons. The tests
+        drive rotation by monkeypatching the module global, and a value read
+        at call time follows that while a second name bound at import would
+        not. And the heartbeat publishes the desk's OWN threshold next to the
+        reading judged against it, exactly as `stale_after_s` is published next
+        to the timestamp, so the watcher never has to import this module or
+        hold a copy of the figure: "the desk's number is the one used here"
+        (`watchdog.decide`).
+
+        The invariant that makes the pair an instrument: in healthy operation
+        the live file NEVER exceeds this bound, because `_rotate_if_needed`
+        rotates before the write that would cross it. So `live_bytes` over
+        this figure means a rotation was attempted and did not happen, with no
+        duration to wait out and no count to pick a threshold on.
+        """
+        return _ROTATE_BYTES
+
     def tail(self, n: int = 20) -> list[dict[str, Any]]:
         """Last n live records, redacted AGAIN on the way out.
 
