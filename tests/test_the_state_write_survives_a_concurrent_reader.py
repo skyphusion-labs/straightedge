@@ -42,10 +42,10 @@ import pytest
 from straightedge.config import BotConfig
 from straightedge.models import Account, EquitySnapshot
 from straightedge.risk import RiskManager
+from straightedge.atomic import replace_retrying_on_share_conflict
 from straightedge.state import (
     STATE_REPLACE_RETRY_SECONDS,
     StateUnwritable,
-    _replace_retrying_on_share_conflict,
     save_snapshot,
 )
 
@@ -109,7 +109,7 @@ def test_a_refused_replace_is_retried_until_it_lands(tmp_path: Path) -> None:
 
     os.replace = flaky  # type: ignore[assignment]
     try:
-        _replace_retrying_on_share_conflict(tmp, dest)
+        replace_retrying_on_share_conflict(tmp, dest)
     finally:
         os.replace = real  # type: ignore[assignment]
 
