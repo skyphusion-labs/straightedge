@@ -39,6 +39,8 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
+import pytest
+
 from straightedge.broker.paper import PaperBroker
 from straightedge.config import BotConfig
 from straightedge.engine import Engine
@@ -313,8 +315,32 @@ def test_the_same_reply_through_the_bare_parser_is_also_in_bound(
     engine.stop()
 
 
+#: The close reply, in whichever envelope the provider under test reads.
+#:
+#: ONE payload, two envelopes, because the thing being proven is that the path
+#: is not provider-specific. Two hand-built payloads could drift and the test
+#: would still pass, which is the "consumer that rebuilds what it should call"
+#: shape `docs/TESTING.md` warns about.
+#:
+#: THE `text` KEY ON THE CLAUDE ARM IS LOAD-BEARING. `text` is `required` in
+#: `ADVICE_FORMAT`, so a claude payload without it is a SCHEMA VIOLATION
+#: (`_schema_violations` returns `[("text", "missing")]`), `action` is forced to
+#: `hold`, the close never stages, and NO `reject` row is written at all. Drop
+#: it and this case stops measuring anything on that arm. The grok and computer
+#: paths have no schema gate, so they never noticed it was absent.
+def _close_the_model_asked_for(provider: str) -> dict:
+    tail = {
+        "action": "close", "symbol": "E" * 5600, "ticket": None,
+        "sl": None, "tp": None, "limit": None, "stop": None, "summary": "s",
+    }
+    if provider == "claude":
+        return _claude_reply(dict(tail, text="p"))
+    return {"choices": [{"message": {"content": "p\n" + json.dumps(tail)}}]}
+
+
+@pytest.mark.parametrize("provider", ["claude", "grok"])
 def test_a_close_the_model_asked_for_bounds_every_row_it_writes(
-    tmp_path: Path,
+    tmp_path: Path, provider: str
 ) -> None:
     """The PATH no field derivation could reach, found in review.
 
@@ -335,16 +361,44 @@ def test_a_close_the_model_asked_for_bounds_every_row_it_writes(
     is at `_reject` rather than at the three call sites, because that is the
     single writer of every `reject` row and a fourth site would otherwise
     repeat this.
+
+    PARAMETERISED OVER BOTH PROVIDERS (straightedge#284), because the sentence
+    above claims the vantage is not `grok`-only and only `grok` was driven. A
+    docstring was doing the fixture's job.
+
+    TWO THINGS THE ISSUE ASSUMED THAT MEASUREMENT CONTRADICTS, recorded because
+    both would have produced a worse test.
+
+    **`grok` IS the product default**, so the original case was already driving
+    it: `AdviceConfig.provider` defaults to `"grok"` (`config.py`),
+    `config.example.toml` ships `provider = "grok"`, and the `AI_PROVIDER`
+    fallback is `"grok"`. What reads as a departure from the default is
+    `_engine`'s OWN default of `"claude"`, which is a test-file convenience and
+    not the shipped shape. The claim worth proving was never "drive the
+    default", it was "this is not provider-specific".
+
+    **And the claude arm does NOT need different assertions.** The issue
+    expected the schema gate to force `hold` here, blank the symbol and write no
+    `reject` row, which would have meant two cases. Measured: that happens only
+    when the fixture omits `text`, a `required` property, so the hold was an
+    artifact of an INCOMPLETE PAYLOAD rather than a property of the path. With
+    the payload schema-complete, both arms write one `reject` row, both read
+    `close_needs_ticket`, both carry the identical clipped symbol, and both rows
+    measure 212 bytes. Encoding that difference as two cases would have frozen a
+    fixture bug into the suite as if it were behaviour.
     """
-    engine = _engine(
-        tmp_path,
-        {"choices": [{"message": {"content": "p\n" + json.dumps({
-            "action": "close", "symbol": "E" * 5600, "ticket": None,
-            "sl": None, "tp": None, "limit": None, "stop": None, "summary": "s",
-        })}}]},
-        provider="grok",
-    )
+    engine = _engine(tmp_path, _close_the_model_asked_for(provider), provider=provider)
     engine.handle_command(TgCommand("1", 1, "/ask flatten it", 1))
+
+    turn = _turn(engine)
+    assert turn.get("action") == "close", (
+        "the turn did not reach the close path on provider "
+        + provider
+        + f", so nothing below measures the reject row: action={turn.get('action')!r} "
+        + f"violations={turn.get('violations')!r}. On the claude arm the usual "
+        "cause is a payload missing a `required` schema property, which forces "
+        "action to hold; see _close_the_model_asked_for."
+    )
 
     rejects = _rows_named(engine, "reject")
     assert rejects, "the close never reached the reject path, so this proves nothing"
