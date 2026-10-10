@@ -8,12 +8,11 @@ version = "1.8.0"
 description = "Risk-first MetaTrader desk. Paper by default. No profit guarantee."
 readme = "README.md"
 requires-python = ">=3.12"
-license = { text = "MIT" }
+license = "MIT"
 authors = [{ name = "Conrad Rockenhaus", email = "conrad@skyphusion.org" }]
 keywords = ["metatrader", "mt5", "mt4", "trading", "risk"]
 classifiers = [
   "Development Status :: 5 - Production/Stable",
-  "License :: OSI Approved :: MIT License",
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3.12",
   "Programming Language :: Python :: 3.13",
