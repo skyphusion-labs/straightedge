@@ -221,11 +221,43 @@ class InstanceLockError(RuntimeError):
 #: already hardcoded it. Tests import this, so the documented figure and the
 #: asserted figure cannot drift apart.
 #:
-#: 512 is not arithmetic, it is the observed size of a healthy row plus room:
-#: an ordinary `advice_turn` measures 196 bytes and the widest `recap` about
-#: 300. #119 is why a ceiling exists at all, where one row stored a rendering
-#: of other rows and the payload compounded daily.
-RECORD_ROW_BOUND = 512
+#: DERIVED, not chosen, and the derivation is the contract rather than the
+#: number. 512 was the first figure here and the fixture that justifies this
+#: one measured it wrong before it ever landed: with every `ADVICE_PROPERTIES`
+#: field driven large AT ONCE and all four price fields non-finite, the
+#: `advice_turn` row measures 516 bytes, four over. #250's in-place
+#: `nonfinite:` marker is what made the difference, costing 97 bytes across
+#: those four fields.
+#:
+#:     516   measured worst case: every schema field large at once, all four
+#:           price fields non-finite, the symbol clipped to
+#:           RECORD_STRING_CHARS, and #216's per-field violation classes in
+#:           `degraded`
+#:    + 64   headroom for ONE more non-finite-capable numeric field on the
+#:           row, priced at an 8 character name, longer than any of the four
+#:           today; measured, not allowed for, because such a field costs
+#:           three places at once: the marked value, an entry in the
+#:           `nonfinite` list and a violation class in `degraded`. The
+#:           existing four cost 44, 44, 50 and 53.
+#:    = 580
+#:
+#: WHAT INVALIDATES THIS FIGURE, stated so it cannot go stale in silence:
+#: a SECOND new non-finite-capable numeric field on the row, a field name
+#: longer than 8 characters, a rise in `RECORD_STRING_CHARS`, a per-field
+#: violation class wider than `:not_a_number`, or a longer spelling of
+#: `nonfinite:`. Any of those needs this figure re-derived rather than nudged.
+#:
+#: A field added to `ADVICE_PROPERTIES` alone costs the row NOTHING, measured:
+#: the row's fields are fixed in `desk.py` rather than derived from the schema,
+#: so a schema field is free until somebody journals it. The fixture drives
+#: INPUT; the bound answers for the ROW.
+#:
+#: Stated here and in `docs/CONTRACT.md` rather than only inside a test, and a
+#: test reads the figure back out of that row, so the documented bound and the
+#: asserted bound cannot drift. #119 is why a ceiling exists at all, where one
+#: row stored a rendering of other rows and the payload compounded daily; an
+#: ordinary `advice_turn` still measures 196 bytes against this ceiling.
+RECORD_ROW_BOUND = 580
 
 #: How much of a MODEL-CHOSEN string a row may carry.
 #:

@@ -967,6 +967,53 @@ Three mutations on the round: the reject clip removed reds 3, the signal clip
 removed reds 1, and the clip threshold lowered reds 6 including both controls,
 so the controls can fail.
 
+**The bound itself was four bytes wrong, and the fixture caught it before it
+landed.** #250 landed `nonfinite:` markers in place while this PR was in review,
+and with every schema field driven large AT ONCE and all four price fields
+non-finite the row measures **516 bytes against the 512 this PR proposed**.
+Those four marked values cost 97 bytes where a bare `null` would cost 53.
+
+**`null` is not the repair, and that is a correction to my own lean.** `sl`,
+`tp`, `limit` and `stop` are typed `["number", "null"]`, so `null` is a
+LEGITIMATE value meaning the model supplied no stop. Nulling a non-finite field
+would make "the model gave garbage" byte-identical at the field to "the model
+gave nothing", which is exactly the defect #185 paid for once already with
+`degraded`. #250's in-place marker is therefore not redundant with its
+`nonfinite` list: the list says which fields, the marker makes the FIELD
+self-describing to a consumer that reads `rec["sl"]` and never looks at the
+list. Two different readers.
+
+**So the figure is raised, and DERIVED rather than chosen:**
+
+```
+  516   measured worst case: every ADVICE_PROPERTIES field large at once, all
+        four price fields non-finite, the symbol clipped, #216's per-field
+        violation classes present
++  64   headroom for ONE more non-finite-capable numeric field on the row,
+        priced at an 8 character name, longer than any of the four today,
+        because such a field costs three places at once: the marked value, a
+        `nonfinite` list entry and a `degraded` violation class. The existing
+        four cost 44, 44, 50 and 53.
+=  580
+```
+
+**What invalidates it is stated rather than left implicit**, because a derived
+figure that does not say what breaks it is a magic number with a paragraph
+attached: a SECOND such field, a name longer than 8 characters, a rise in
+`RECORD_STRING_CHARS`, a violation class wider than `:not_a_number`, or a
+longer `nonfinite:` spelling.
+
+**And one measurement worth keeping: a field added to `ADVICE_PROPERTIES` alone
+costs the row NOTHING.** Adding a synthetic `["number","null"]` field to the
+schema and re-running the worst case measured **+0**, because the row's fields
+are fixed in `desk.py` rather than derived from the schema. That is albini's
+review caveat, now a number: the fixture drives INPUT, the bound answers for
+the ROW, and the two are only connected where the desk journals a field.
+
+Three mutations: raising the constant alone reds the drift gate, raising the
+document alone reds it too, and setting the bound below the measured worst case
+reds 6 including every by-construction case. Restored, 11 passed.
+
 ## 1.8.0
 
 ### The worst tick gap this box has seen now outlives the process (issue #153)
