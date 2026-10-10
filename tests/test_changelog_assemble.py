@@ -43,7 +43,7 @@ def test_assembler_self_test_passes_and_reports_its_case_count() -> None:
     out = run("--self-test")
     assert out.returncode == 0, out.stdout + out.stderr
     assert "0 failure(s)" in out.stdout, out.stdout
-    cases = [l for l in out.stdout.splitlines() if l.startswith("  ok ")]
+    cases = [line for line in out.stdout.splitlines() if line.startswith("  ok ")]
     assert len(cases) >= 18, "self-test ran only %d cases:\n%s" % (len(cases), out.stdout)
 
 

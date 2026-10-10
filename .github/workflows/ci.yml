@@ -219,6 +219,7 @@ jobs:
   # succeed. Runs with if: always() because a needs-only job is SKIPPED, not
   # failed, when an upstream job fails or is itself skipped -- and skipped
   # is not the red this check exists to produce.
+
   # RETARGETED by straightedge#259's fragment half: this gate now requires a
   # `changelog.d/<issue>-<slug>.md` file and a `CHANGELOG.md` edit does NOT
   # satisfy it. The SUBJECT of this one gate moved rather than a second gate
