@@ -395,6 +395,73 @@ reproducible, and it is the whole argument: **the failure is not that the
 expression is subtly wrong, it is that its answer is identical in the clean case
 and in the empty case.**
 
+**FIVE distinguishable states, measured, not two.** This entry first named
+ABSENT and PENDING. Seven independent measurements by five seats over one
+evening found three more, and a count is wrong in BOTH directions across them:
+
+| state | what a rollup shows | how a count reads it |
+| --- | --- | --- |
+| ABSENT | the row is not there at all | green, because zero failures |
+| QUEUED | row present, not started | green, same reason |
+| present-but-IN_PROGRESS | row present, running | green, same reason |
+| present-but-PENDING | row present, unfinished, no conclusion | green, same reason |
+| COMPLETED | row present, conclusion set | the only one that is actually green |
+
+The longest measured run of the first state was **twelve consecutive polls
+reading zero failures while `ci` was simply not in the rollup**, roughly four
+minutes. And the opposite reassurance was measured on the same pull request one
+poll earlier: **every row present and none finished**, 12 of 12 not completed,
+which reads as twelve rows of progress rather than as nothing having run.
+
+**So neither a pass count nor a row count is sufficient, and they fail
+differently.** A row count misses ABSENT; a pass count misses all four. That is
+the reason to PRINT the row count as context.
+
+**But do not compare it to a constant, and this is where a first version of
+this entry was wrong.** The row count is a property of the BRANCH's workflow
+file; the required contexts are a property of the RULESET. **Those are different
+objects and only the second one gates.** Measured across the open pull requests
+at one instant: three different row counts were live simultaneously, because
+each branch runs the workflow its own head carries. A branch whose head predates
+a workflow change keeps producing the old count until it currents, and that is
+correct rather than a missing row.
+
+The worked counterexample is a dependency bump whose head carries an older
+`ci.yml` with five jobs: **it legitimately produces TEN rows, so a floor of 14
+rejects it on the count alone, before anything is known about its
+conclusions.** Nothing need be said about whether that branch passes; the
+defect is in the denominator, not in the verdict, and the argument is cleaner
+without one.
+
+**So the criterion is the by-NAME half on its own:** the required contexts
+PRESENT and SUCCESS, the language-specific `Analyze` jobs COMPLETED, and zero
+non-COMPLETED rows. Read which contexts are required from
+`/rules/branches/main` rather than hard-coding them, as above.
+
+**One measured edge on the conclusion half.** A row can be COMPLETED with a
+conclusion that is neither success nor failure: on that same dependency bump,
+`CodeQL` reads `status=completed conclusion=neutral`, measured through
+`repos/{o}/{r}/commits/{sha}/check-runs` rather than off the rollup label. So a
+gate asserting every row is SUCCESS rejects a branch that is fine, while
+`zero non-COMPLETED` accepts it correctly. **Treat `neutral` and `skipped` as
+acceptable conclusions and assert SUCCESS only on the contexts the ruleset
+actually requires.**
+
+That row was first described to this file as a sixth state, `skipping`, present
+and never running. **It is not: it is COMPLETED with a neutral conclusion, and
+the table above stays at five.** Recorded because the measurement is the only
+reason to know that, and a sixth state added on one unmeasured observation
+would have been this entry's own subject.
+
+**And one field that cannot be used as a check in either direction.**
+`closingIssuesReferences` on a pull request is empty for PRs that do close an
+issue (measured: one closed its issue with the field empty), and a populated
+field does not promise the close either, because the squash body is editable at
+merge time. **So neither emptiness nor content is evidence**, and the only
+reliable check is reading the ISSUE state back after the merge. That is the same
+record-versus-artifact distinction as everything else here: the pull request
+object is not the issue.
+
 `repos/{owner}/{repo}/rules/branches/main` needs no elevated scope: it answers
 for a plain collaborator token, which is why reading the rule is preferable to
 hard-coding `ci` and `coverage` into a script that then cannot notice the rule
@@ -584,6 +651,115 @@ Two things it changes about how to write one:
   positive control has observed the real refusal. Then the test cannot pass by
   the conflict never having occurred, and it cannot fail by demanding the
   impossible.
+## A consumer that rebuilds what it should call looks maintained and is not
+
+Six instances in one evening, five from one seat and one independent, and **none
+of them was found by running the suite.** Every one was a correct line of code
+sitting beside another correct line of code that said the same thing, which is
+the shape that survives review: there is nothing wrong to see.
+
+| instance | what looked maintained | what was actually true |
+| --- | --- | --- |
+| a scanner gained a `composed:` output bucket | the gate filtered `("prose: ", "interpolated: ")` and all 20 tests passed | a concatenated refusal was surfaced by the instrument and dropped by the gate |
+| the filter was derived from the declaration | one correct spelling | FOUR call sites each spelled it, so mutating one mutated nothing the others called |
+| the comparison was shared via a helper | the pin and the injection test both called `non_word_sites` | each then built its own comparison against the pin, `==` in one and `!=` in the other |
+| a probe measured an injected line | a delta against the real module | the baseline moved when another case injected into it, so a probe redded on a change it was not about |
+| a verify-before-push script | it reported the in-tree bytecode count | it PRINTED the count and said `VERIFIED` regardless |
+| another seat's pre-apply guard | it printed `SAFE: 0` | the apply ran anyway |
+
+The fifth is the rule proving itself on its author: it was fixed in one script
+and left in its sibling, **instance closed, class open**, on the same evening
+that author was cataloguing the pattern in the gates. The sixth happened
+independently, which is what makes this a mechanism rather than one person's
+habit.
+
+**It took three iterations to fix the first one, and each fix was correct.** The
+filter was derived; then the four spellings became one predicate; then the two
+comparisons became one function. Each closed the instance and left the class one
+level up.
+
+### Scoping is a property of the PAIR, not of either side
+
+The sharpest version, because the same defect appeared in both halves of one
+read/write pair on one night:
+
+- **One gate scoped its WRITER and not its READER.** Its coverage check asked
+  `word not in contract_text`, which passes on a mention anywhere in the file.
+  15 of its 28 words were also named in prose, so deleting a table row left the
+  suite green.
+- **Another scoped its READER and not its WRITER.** Its `table_words` is
+  section-anchored, correctly and for a stated reason, while its control removed
+  a row with a whole-file `re.sub(..., count=1)`. Once a second table documented
+  the same word EARLIER in the document, the removal deleted *that* row, the
+  section kept its own, and the control redded with "the row was not removed"
+  **while nothing was wrong with either table.** Diagnosed by position: rows at
+  two offsets, the section spanning a third range, the deleted one outside it.
+
+**A scope stated on one side of a read/write pair is not a scope.** Both sides
+have to take it from one place, which is this rule again: the second control
+rebuilt the bounds instead of calling the reader's. The repair extracted the
+bounds into a helper, because a second spelling of them would have been the
+same defect a third time.
+
+### Why it survives review: the data is the missing discriminator
+
+**A gate whose subject does not occur in the data cannot be validated by running
+it.**
+
+The `composed:` case took three iterations because **the repository held no
+composed refusal site**, so every version, including the broken ones, behaved
+identically on it. Only an injected site discriminated them. The missing
+discriminator was the data, not the code, and no amount of care running the
+suite could have supplied it.
+
+That explains all six instances, which is why this is one rule rather than six:
+the thing being gated was absent from the repository, or present only in another
+test's injection, or benign on every run that happened.
+
+**The same rule has a second face, pointing the other way.** A gate whose
+subject is NON-DETERMINISTIC cannot be INVALIDATED by running it either: one
+green proves nothing and one red proves nothing, which is exactly why a re-run
+feels like evidence. And a third, measured on this repo's own counts: **a
+denominator whose corpus everyone edits incidentally is stale by default.** A
+repo-wide fenced-block count moved while its own pull request sat, because a
+`CHANGELOG.md` entry landed carrying a fenced block. **Every PR touches that
+file and none of their authors believe they are editing a counted corpus.**
+
+So the instruction is **state the corpus, not the number.** A number needs
+re-deriving by every reader; a corpus definition does not.
+
+### What to do instead
+
+1. **Call the shared body, never rebuild an equivalent one.** A second correct
+   spelling is still a second source of truth, and it diverges silently on the
+   day the subject first appears.
+2. **Derive both halves of a read/write pair from one place.** A
+   section-scoped reader with a whole-file writer is not scoped.
+3. **Measure by injection, not by running the gate.** If the gate's subject is
+   absent from the repository, a green run is not evidence; inject the subject
+   and watch the gate red.
+4. **Assert, do not print.** A step that echoes a number and continues cannot
+   fail. Prefer the invariant you actually need: `before == after` is usually
+   it, not `== 0`, because a zero assertion reds on pre-existing state and
+   tempts a cleanup the harness may refuse anyway.
+5. **State the corpus rather than the count**, for any figure drawn from a
+   corpus that other work edits incidentally.
+
+### The honest reach of this rule
+
+It does not say duplication is always visible. It says a duplicate that
+**diverges** is invisible while a gate **deleted** shows in the diff, and that
+the two want different responses: the first needs a single body, the second
+needs review. Conflating them produces a meta-test, which is another body,
+which is the defect again.
+
+**And the single-body fix has a measured limit.** On the gate above, hand-copying
+the filter inside any shared body reds; a caller that stops calling the chain
+(`drift = ()`) does not, and leaves every test green. That is recorded in the
+docstring rather than closed, because closing it needs the extra body the shared
+one exists to remove. **So the claim is the narrow one: there is no second
+comparison to drift, not that the gate cannot be removed.**
+
 ## Execute the documentation, do not review it
 
 Every procedure in a document rots silently, because reading one cannot tell a
