@@ -47,8 +47,11 @@ from straightedge.engine import Engine
 from straightedge.journal import (
     ADVICE_TURN_ROW_FIELDS,
     CONDITIONAL_ROW_FIELDS,
+    MAXIMAL_ROW_BYTES,
+    ROTATE_DEFERRED_ROW_BYTES,
     ROW_ENVELOPE_FIELDS,
     RECORD_ROW_BOUND,
+    RECORD_ROW_MARGIN,
     RECORD_STRING_CHARS,
     clip_for_record,
 )
@@ -59,6 +62,34 @@ from straightedge.telegram import TgCommand
 #: Taken from the code, not repeated here, so the documented bound and the
 #: asserted bound cannot drift (straightedge#226).
 ROW_BOUND = RECORD_ROW_BOUND
+
+#: The widest a row's `ts` can be, which is what an EXACT measurement of the
+#: maximal row has to be taken against (straightedge#306).
+#:
+#: `datetime.isoformat()` prints six fractional digits unless `microsecond` is
+#: exactly 0, in which case it drops `.ffffff` and the field is SEVEN bytes
+#: shorter. That is the only variable-width value on the maximal row and it
+#: varies only DOWNWARD, so the measurement substitutes this value rather than
+#: reading the live one. Measuring the live one would be an exact gate that
+#: reports 531 about one run in a million, and a bound test that is
+#: occasionally wrong about the worst case teaches its reader to re-run it
+#: instead of believing it.
+_WIDEST_TS = "2026-01-01T00:00:00.000000+00:00"
+
+
+def _measure(row: dict) -> int:
+    """The row's size in bytes, with the one variable-width field at its widest.
+
+    Measured the way every other bound assertion in this suite measures,
+    `json.dumps` with the library's default separators, which is also what
+    `Journal` writes, so the figure is the bytes that reach disk.
+    """
+    assert len(row["ts"]) <= len(_WIDEST_TS), (
+        f"`ts` measured {len(row['ts'])} characters against a worst case of "
+        f"{len(_WIDEST_TS)}, so substituting the widest value UNDERSTATES this "
+        "row. Re-measure the field rather than widening the constant to fit."
+    )
+    return len(json.dumps({**row, "ts": _WIDEST_TS}, sort_keys=True))
 
 
 class FakeTransport:
@@ -492,7 +523,9 @@ def test_the_helper_default_IS_the_shipped_default() -> None:
     )
 
 
-def _maximal_row(tmp_path: Path, monkeypatch) -> dict:  # type: ignore[no-untyped-def]
+def _maximal_row(  # type: ignore[no-untyped-def]
+    tmp_path: Path, monkeypatch, *, defer: bool = True
+) -> dict:
     """The row the bound actually has to answer for: EVERY field at once.
 
     Every schema field driven large, all four price fields non-finite, the
@@ -504,6 +537,12 @@ def _maximal_row(tmp_path: Path, monkeypatch) -> dict:  # type: ignore[no-untype
 
     `_everything_large` is reused rather than rebuilt, so a field added to
     `ADVICE_PROPERTIES` is driven here without anyone editing this file.
+
+    `defer=False` builds the SAME row with the rotation left alone, which is
+    the only way to measure what the conditional field costs without writing a
+    second definition of "worst case" that would fork from this one at copy
+    time (straightedge#306). It is a knob on this helper rather than a sibling
+    helper for exactly that reason.
     """
     from straightedge import journal as journal_mod
 
@@ -516,13 +555,22 @@ def _maximal_row(tmp_path: Path, monkeypatch) -> dict:  # type: ignore[no-untype
     def _refuse(tmp, dest, **kw):  # type: ignore[no-untyped-def]
         raise PermissionError(5, "Access is denied")
 
-    monkeypatch.setattr(journal_mod, "_ROTATE_BYTES", 1)
-    monkeypatch.setattr(journal_mod, "replace_retrying_on_share_conflict", _refuse)
+    if defer:
+        monkeypatch.setattr(journal_mod, "_ROTATE_BYTES", 1)
+        monkeypatch.setattr(
+            journal_mod, "replace_retrying_on_share_conflict", _refuse
+        )
     engine.handle_command(TgCommand("1", 1, "/ask take a view", 1))
     monkeypatch.undo()
 
     row = _turn(engine)
     engine.stop()
+    if not defer:
+        assert "rotate_deferred" not in row, (
+            "no rotation was refused and the row carries the marker anyway, so "
+            f"a delta taken against this row is not the field's cost: {sorted(row)}"
+        )
+        return row
     assert row.get("rotate_deferred") == 1, (
         "the deferral did not fire, so this is not the maximal row and the "
         f"conditional key set below is untested: {sorted(row)}"
@@ -599,6 +647,98 @@ def test_the_rows_fields_are_the_DECLARED_fields_in_both_directions(
         "If one of these is now unreachable from this fixture, the bound is "
         "being asserted on a row smaller than the worst case, which is the "
         "defect #283's field had before it was driven."
+    )
+
+
+def test_the_maximal_row_MEASURES_what_the_derivation_states(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """straightedge#306: the derivation's own figures were prose, and prose
+    cannot go red.
+
+    `RECORD_ROW_BOUND` is read back out of `docs/CONTRACT.md` by a test below,
+    because #226 measured the constant being raisable to 1024 with the whole
+    suite green while the document still said 512. #287 then re-derived that
+    bound as "538 measured for the maximal row plus 42 bytes of flat margin"
+    and handed the derivation two more figures with exactly that property:
+    nothing read either of them, so the maximal row could have grown to 579
+    with every assertion in this file green while three files went on calling
+    the margin 42.
+
+    The ceiling assertions cannot see that, and this is not a second copy of
+    them. `<= RECORD_ROW_BOUND` answers "does the row fit". The derivation
+    claims something stronger, that the row measures 538 and the remaining 42
+    is margin nobody has spent, and an unspent margin is the only reason the
+    next field is safe to add before anybody re-measures.
+
+    So a new row field now reds HERE, with its own cost named, which is the
+    warning `rotate_deferred` never got: it matched no entry on the
+    invalidation list, spent 22 bytes, and the suite stayed green because
+    fitting was all anything asked.
+    """
+    assert MAXIMAL_ROW_BYTES + RECORD_ROW_MARGIN == RECORD_ROW_BOUND, (
+        f"the derivation does not add up: {MAXIMAL_ROW_BYTES} measured plus "
+        f"{RECORD_ROW_MARGIN} margin is {MAXIMAL_ROW_BYTES + RECORD_ROW_MARGIN} "
+        f"and `journal.RECORD_ROW_BOUND` is {RECORD_ROW_BOUND}"
+    )
+    measured = _measure(_maximal_row(tmp_path, monkeypatch))
+    assert measured == MAXIMAL_ROW_BYTES, (
+        f"the maximal row measures {measured} bytes and the derivation of "
+        f"`journal.RECORD_ROW_BOUND` says {MAXIMAL_ROW_BYTES}. The bound is "
+        f"{RECORD_ROW_BOUND}, so the row very likely still FITS: that is not "
+        "what this case asserts. The documented FLAT margin of "
+        f"{RECORD_ROW_MARGIN} bytes is now {RECORD_ROW_BOUND - measured}. "
+        "RE-DERIVE: set `journal.MAXIMAL_ROW_BYTES` to the measured figure, "
+        "decide whether the bound still leaves a margin worth having, and say "
+        "so in `docs/CONTRACT.md`. Never nudge the margin to absorb a field."
+    )
+
+
+def test_rotate_deferred_COSTS_what_the_derivation_prices_it_at(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """What the conditional field CONTRIBUTES, which is the figure #306 filed.
+
+    #283's field was asserted by nothing. The ceiling case that closed the
+    first half of that finding asserts the row carrying it FITS; this asserts
+    what it COSTS, and the cost is what the derivation spends. The two are
+    different claims: a field could cost 60 bytes and the row would still fit,
+    and the margin the next author reads about would be gone.
+
+    Measured as a DELTA between the same row with and without the deferral.
+    Pricing the key here instead would be a second definition of the worst
+    case, and it would fork from `_maximal_row` the moment the row changed.
+
+    Asserted against `len(json.dumps({"rotate_deferred": 1}))` as well as
+    against the constant, because that expression is WHERE 22 comes from: the
+    key, its quotes, the two default separators and the value. Pinning the
+    expression is what makes a RENAME or a widened value red with the new cost
+    named, rather than quietly drawing more margin than the constant admits.
+    """
+    deferred, rotated = tmp_path / "deferred", tmp_path / "rotated"
+    deferred.mkdir()
+    rotated.mkdir()
+    with_field = _maximal_row(deferred, monkeypatch)
+    without = _maximal_row(rotated, monkeypatch, defer=False)
+
+    assert sorted(set(with_field) ^ set(without)) == ["rotate_deferred"], (
+        "the deferral changed more than one key on the row, so the delta "
+        "below is not this field's cost: "
+        f"{sorted(set(with_field) ^ set(without))}"
+    )
+    cost = _measure(with_field) - _measure(without)
+    priced = len(json.dumps({"rotate_deferred": 1}))
+    assert cost == priced, (
+        f"`rotate_deferred` costs {cost} bytes on the row and its key prices "
+        f"at {priced}. Those agree only while the marker is a one character "
+        "value under that exact name, so the field has been renamed or its "
+        "value widened. RE-DERIVE the bound: the cost is what the margin pays."
+    )
+    assert cost == ROTATE_DEFERRED_ROW_BYTES, (
+        f"`rotate_deferred` costs {cost} bytes and "
+        f"`journal.ROTATE_DEFERRED_ROW_BYTES` says {ROTATE_DEFERRED_ROW_BYTES}. "
+        "Update the constant AND re-measure the maximal row; a field whose "
+        "draw nothing reads is a draw nobody subtracts, which is #287."
     )
 
 
@@ -986,6 +1126,42 @@ def test_the_documented_bound_is_the_asserted_bound(tmp_path: Path) -> None:
         f"is {RECORD_ROW_BOUND}; the documented bound and the asserted bound "
         "have drifted"
     )
+
+
+def test_the_documented_DERIVATION_is_the_asserted_derivation() -> None:
+    """The same discipline as the bound's own row, one figure down.
+
+    `docs/CONTRACT.md` states both halves of 580 in prose, and until #306
+    nothing read either half. Anchored to the `Journal row size, the
+    derivation` ROW rather than to the file, for the reason #220 measured: a
+    number mentioned anywhere in the document would satisfy a file-wide
+    search.
+
+    `ROTATE_DEFERRED_ROW_BYTES` is deliberately NOT read out of the document.
+    22 appears there inside a historical sentence about the then-64 byte
+    allowance, which is a statement about what happened rather than about what
+    the field costs now, and gating prose about history would pin the wrong
+    thing. That figure is gated by measurement instead.
+    """
+    text = (Path(__file__).resolve().parents[1] / "docs" / "CONTRACT.md").read_text(
+        encoding="utf-8"
+    )
+    rows = [
+        ln
+        for ln in text.splitlines()
+        if ln.startswith("| Journal row size, the derivation |")
+    ]
+    assert len(rows) == 1, f"expected one derivation row, found {len(rows)}"
+    for figure, name in (
+        (MAXIMAL_ROW_BYTES, "MAXIMAL_ROW_BYTES"),
+        (RECORD_ROW_MARGIN, "RECORD_ROW_MARGIN"),
+    ):
+        assert re.search(rf"(?<!\d){figure} bytes", rows[0]), (
+            f"`journal.{name}` is {figure} and the derivation row in "
+            f"docs/CONTRACT.md does not state `{figure} bytes`, so the "
+            f"documented derivation and the asserted one have drifted: "
+            + rows[0][:160]
+        )
 
 
 def test_an_ordinary_turn_is_byte_for_byte_what_it_was(tmp_path: Path) -> None:
