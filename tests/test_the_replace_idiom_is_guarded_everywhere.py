@@ -298,7 +298,7 @@ def test_a_transient_refusal_still_rotates_and_marks_nothing(
 
     assert double.attempts >= 3, f"no retry happened: {double.attempts}"
     assert Path(str(j.path) + ".1").exists(), "the rotation did not land"
-    rows = [json.loads(x) for x in Path(j.path).read_text().splitlines() if x.strip()]
+    rows = [json.loads(x) for x in Path(j.path).read_text(encoding="utf-8").splitlines() if x.strip()]
     assert rows[-1]["event"] == "after_rotation"
     assert "rotate_deferred" not in rows[-1], rows[-1]
 
@@ -315,12 +315,12 @@ def test_a_refusal_THAT_OUTLASTS_THE_WINDOW_still_records_the_row(
     visible rather than absorbed.
     """
     j = _journal_at_rotation(tmp_path, monkeypatch)
-    before = len(Path(j.path).read_text().splitlines())
+    before = len(Path(j.path).read_text(encoding="utf-8").splitlines())
     _patch(monkeypatch, Refuser(n=None))
     j.write("breach", detail="must survive")
     monkeypatch.undo()
 
-    rows = [json.loads(x) for x in Path(j.path).read_text().splitlines() if x.strip()]
+    rows = [json.loads(x) for x in Path(j.path).read_text(encoding="utf-8").splitlines() if x.strip()]
     assert len(rows) == before + 1, "the row was lost to a failed rotation"
     assert rows[-1]["event"] == "breach"
     assert rows[-1]["detail"] == "must survive"
@@ -336,7 +336,7 @@ def test_a_deferred_rotation_never_clobbers_a_callers_own_key(
     j.write("breach", rotate_deferred="caller_said_this")
     monkeypatch.undo()
 
-    rows = [json.loads(x) for x in Path(j.path).read_text().splitlines() if x.strip()]
+    rows = [json.loads(x) for x in Path(j.path).read_text(encoding="utf-8").splitlines() if x.strip()]
     assert rows[-1]["rotate_deferred"] == "caller_said_this", rows[-1]
 
 
@@ -721,7 +721,7 @@ def test_a_transient_refusal_still_persists_the_offset(
     monkeypatch.undo()
 
     assert double.attempts >= 3, double.attempts
-    assert dest.read_text(encoding="utf-8") == "42", dest.read_text()
+    assert dest.read_text(encoding="utf-8") == "42", dest.read_text(encoding="utf-8")
 
 
 def test_the_offset_write_still_gives_up_after_the_window(
@@ -820,7 +820,7 @@ def test_the_journal_row_lands_once_a_transient_reader_lets_go(
     j.write("after_real_conflict", v=1)
     reader.join(timeout=5.0)
 
-    rows = [json.loads(x) for x in live.read_text().splitlines() if x.strip()]
+    rows = [json.loads(x) for x in live.read_text(encoding="utf-8").splitlines() if x.strip()]
     assert rows[-1]["event"] == "after_real_conflict"
 
 

@@ -72,7 +72,7 @@ def test_session_london_ny() -> None:
 
 
 def test_halt_file(tmp_path: Path) -> None:
-    (tmp_path / "HALT").write_text("stop\n")
+    (tmp_path / "HALT").write_text("stop\n", encoding="utf-8")
     rm = RiskManager(_cfg(tmp_path), halt_dir=tmp_path)
     d = rm.evaluate(
         account=_acct(),
