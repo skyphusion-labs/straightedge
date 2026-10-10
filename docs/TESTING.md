@@ -590,10 +590,23 @@ the fix tells you an old instance exists. The leftover was found by enumerating
 processes, not by remembering.
 
 So the rule is the one `CLAUDE.md` already states for wake channels, and it
-applies to any poller: **enumerate what runs against your own subject, reap it,
-arm exactly one, then verify the count.** Re-arm means REPLACE, not add. **Zero
-armed is a correct state**, and two watchers for one subject is the defect; the
-second is always the one nobody remembers arming.
+applies to any poller: **enumerate what runs against your own subject, reap
+what is watching a subject that is gone, and arm exactly ONE PER SUBJECT.**
+Re-arm means REPLACE, not add.
+
+**"Arm exactly one" is the wrong spelling and the difference is not pedantic.**
+Read as a count, it tells you to reap a live watcher on a DIFFERENT subject in
+order to satisfy the number, which destroys a correct instrument to tidy a
+total. Two watchers on two pull requests is the correct state and reads
+identically to the broken one from a count alone. The defect is two on ONE
+subject, where the stale one reports first.
+
+So the check before arming is not "how many are running" but **"what is each
+running one watching"**. That question also answers the first failure above,
+because a watcher reading the tree cannot tell you its subject at all.
+
+**Zero armed is a correct state** too, once every subject is measured and
+nothing is left to watch.
 
 This sits with the attribution entries rather than with the gate entries. A gate
 that cannot fail is decorative; a monitor measuring the wrong subject is worse,
