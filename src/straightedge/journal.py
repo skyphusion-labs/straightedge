@@ -53,6 +53,16 @@ _ROTATE_BYTES = 10 * 1024 * 1024
 
 class Journal:
     def __init__(self, path: str | Path) -> None:
+        #: How many times a rotation was DEFERRED because a concurrent reader
+        #: refused the replace for longer than the retry window.
+        #:
+        #: A COUNT and not a boolean, for the reason `breach_rows_lost` is a
+        #: count: a persistent holder defers every write, and an operator needs
+        #: to know how many rather than that it happened. The engine publishes
+        #: it on the heartbeat, which is the file the watcher reads; the row
+        #: field is the record of WHICH rows were affected, this is the figure
+        #: that leaves the process.
+        self.rotate_deferrals = 0
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         if self.path.exists():
@@ -95,9 +105,11 @@ class Journal:
         # silent data loss rather than a crash (the shape #217 measured).
         # Rotation bounds a FILE SIZE; the row IS the product. So a refusal
         # that outlasts the retry window defers the rotation and the row still
-        # lands, with the deferral marked IN the row so it is visible rather
-        # than absorbed. The file exceeding its bound is recoverable on the
-        # next write; the row is not recoverable at all.
+        # lands, with the deferral marked IN the row. The file exceeding its
+        # bound is recoverable on the next write; the row is not recoverable at
+        # all. The mark is a RECORD of which rows were written while the file
+        # was over its bound; `Journal.rotate_deferrals` is what leaves this
+        # process and reaches the watcher. See `_rotate_if_needed`.
         deferred = self._rotate_if_needed(len(line.encode("utf-8")))
         if deferred and "rotate_deferred" not in rec:
             # NEVER CLOBBER a caller's key, the discipline the `nonfinite`
@@ -129,11 +141,34 @@ class Journal:
             replace_retrying_on_share_conflict(self.path, dest)
         except PermissionError:
             # A holder that outlasts the window is a CONDITION, not a race, and
-            # `atomic.py` says such a thing must surface rather than be
-            # absorbed in silence. It surfaces as `rotate_deferred` on the row
-            # the caller is about to write, which keeps the audit record AND
-            # says the file is over its bound. Narrow to `PermissionError` on
-            # purpose: every other `OSError` still raises.
+            # `atomic.py` requires such a thing to SURFACE rather than be
+            # absorbed. Two surfaces, and they answer different questions:
+            #
+            #   `rotate_deferred` on the row is the RECORD. It says which rows
+            #   were written while the file was over its bound. Nothing reads
+            #   it; it is for whoever reconstructs the log afterwards.
+            #
+            #   `rotate_deferrals` is the SURFACE. The engine publishes it on
+            #   the heartbeat, which is the file `straightedge-watch` reads
+            #   every cycle, so a persistent holder is visible OFF this process
+            #   instead of only inside the log it is preventing from rotating.
+            #
+            # A row field alone would not have satisfied the doctrine, and an
+            # earlier version of this comment claimed it did. It is a record,
+            # and a record reaches nobody: the rotation it describes is the
+            # thing that is failing, so the log is the worst available channel
+            # for saying so.
+            #
+            # WHAT THIS STILL DOES NOT DO, said plainly rather than implied:
+            # the count is PUBLISHED, not ALERTED. It is not a watchdog
+            # `reason`, so a holder that defers rotation forever is visible to
+            # anyone reading the heartbeat and pages nobody. Choosing a
+            # threshold and an operator action is a watchdog design decision
+            # and is filed as straightedge#288 rather than invented here.
+            #
+            # Narrow to `PermissionError` on purpose: every other `OSError`
+            # still raises.
+            self.rotate_deferrals += 1
             return True
         self.path.touch()
         _chmod600(self.path)

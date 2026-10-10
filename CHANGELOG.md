@@ -85,6 +85,15 @@ consequence.
   carries `rotate_deferred: 1`. If you parse journal rows, that key is new. The
   file may briefly exceed its 10 MiB bound; the next write rotates it. A
   caller's own `rotate_deferred` field is never overwritten.
+- **NEW HEARTBEAT FIELD: `rotate_deferrals=`.** A count of rotations deferred
+  because a reader held the file past the retry window, published on every
+  heartbeat like `breach_rows_lost=` and zero on a healthy desk. If you parse
+  `journal.heartbeat`, that key is new. The row field `rotate_deferred` is the
+  RECORD of which rows were affected; this count is the SURFACE that leaves the
+  process, because the log is the worst channel for reporting that the log
+  cannot rotate. It is PUBLISHED, not ALERTED: it is not a watchdog reason, so
+  a holder that defers rotation forever is visible to a reader and pages
+  nobody. Choosing a threshold is straightedge#288.
 - **`inflight.py`** retries, and still FAILS CLOSED after the window: the
   ledger entry is written before the send, so a raise means the order never
   leaves. That is deliberate and tested.

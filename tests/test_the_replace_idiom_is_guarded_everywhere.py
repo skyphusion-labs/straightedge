@@ -358,6 +358,125 @@ def test_a_non_permission_oserror_in_rotation_still_raises(
     assert boom.attempts == 1, f"a non-PermissionError was retried: {boom.attempts}"
 
 
+# --- 2b. the deferral reaches a channel something WATCHES ------------------
+#
+# The row field is a RECORD and reaches nobody: the rotation it describes is
+# the thing that is failing, so the log is the worst available channel for
+# saying so. `Journal.rotate_deferrals` is the figure that leaves the process,
+# published on the heartbeat, which is the file `straightedge-watch` reads.
+#
+# `breach_rows_lost` is the precedent rather than `over_budget_ever`: both are
+# "journal housekeeping gave up", and both are PUBLISHED for a reader rather
+# than raised as a watchdog `reason`. The last case here pins that limit so it
+# is asserted instead of merely described.
+
+
+def test_a_deferred_rotation_is_counted_on_the_journal(
+    tmp_path: Path, monkeypatch
+) -> None:
+    j = _journal_at_rotation(tmp_path, monkeypatch)
+    assert j.rotate_deferrals == 0, "the seed write must not have deferred"
+    _patch(monkeypatch, Refuser(n=None))
+    j.write("one", v=1)
+    j.write("two", v=2)
+    monkeypatch.undo()
+    assert j.rotate_deferrals == 2, (
+        f"two deferred writes counted as {j.rotate_deferrals}; a COUNT is the "
+        "point, because a persistent holder defers every write"
+    )
+
+
+def test_a_transient_refusal_does_not_count_as_a_deferral(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The count must mean the CONDITION, not the race.
+
+    A retry that lands is the mechanism working. If a race incremented this,
+    the figure an operator reads would be noise and the one thing it is for,
+    telling a persistent holder from a passing one, would be lost.
+    """
+    j = _journal_at_rotation(tmp_path, monkeypatch)
+    _patch(monkeypatch, Refuser(n=2))
+    j.write("retried", v=1)
+    monkeypatch.undo()
+    assert j.rotate_deferrals == 0, (
+        "a refusal the retry absorbed was counted as a deferral"
+    )
+
+
+def test_the_heartbeat_carries_the_deferral_count(tmp_path: Path, monkeypatch) -> None:
+    """The observable: the figure is OFF this process, on the watched file.
+
+    Asserted on the heartbeat file rather than on the attribute, because the
+    attribute being right while nothing published it is precisely the gap this
+    change exists to close.
+    """
+    from straightedge import watchdog
+    from straightedge.config import BotConfig, SessionConfig, TelegramConfig
+    from straightedge.broker.paper import PaperBroker
+    from straightedge.engine import Engine
+    from straightedge import journal as journal_mod
+
+    cfg = BotConfig()
+    cfg.session = SessionConfig(enabled=False)
+    cfg.symbols = ["EURUSD"]
+    cfg.journal_path = str(tmp_path / "journal.jsonl")
+    cfg.risk.halt_file = str(tmp_path / "HALT")
+    cfg.telegram = TelegramConfig(token="t" * 10, chat_id="42")
+    engine = Engine(cfg, PaperBroker(balance=10_000), halt_dir=str(tmp_path))
+    engine.start()
+    # `start()` does not publish one; the heartbeat is written on a tick. Asked
+    # for explicitly so this test does not depend on a tick having run.
+    engine._write_heartbeat()
+
+    hb = watchdog.read(watchdog.heartbeat_path_for(cfg.journal_path))
+    assert hb is not None, "no heartbeat was written, so nothing here measures"
+    fields = hb.fields
+    assert fields["rotate_deferrals"] == "0", (
+        "published UNCONDITIONALLY: a field that appears only when something "
+        "is wrong is a field no reader learns to expect"
+    )
+
+    monkeypatch.setattr(journal_mod, "_ROTATE_BYTES", 1)
+    _patch(monkeypatch, Refuser(n=None))
+    engine.journal.write("forced", v=1)
+    monkeypatch.undo()
+    engine._write_heartbeat()
+
+    hb = watchdog.read(watchdog.heartbeat_path_for(cfg.journal_path))
+    assert hb is not None
+    assert hb.fields["rotate_deferrals"] == "1", hb.fields
+    engine.stop()
+
+
+def test_the_deferral_count_is_published_but_NOT_an_alert(tmp_path: Path) -> None:
+    """The known limit, ASSERTED rather than described in a comment.
+
+    `rotate_deferrals` is not a watchdog `reason`, so a holder that defers
+    rotation forever is visible to a reader of the heartbeat and pages nobody.
+    That is deliberate: choosing a threshold and an operator action is a
+    watchdog design decision and is filed as straightedge#288.
+
+    Pinned here so the limit cannot change silently in either direction. If
+    somebody makes it an alert, this reds and they have to retire #288 and the
+    docs along with it, instead of leaving two statements that disagree.
+    """
+    import inspect
+
+    from straightedge import watchdog
+
+    src = inspect.getsource(watchdog)
+    assert "rotate_deferrals" in src, "the field is not in the watchdog at all"
+    reasons = [
+        line for line in src.splitlines()
+        if "reason=" in line and "rotate_deferrals" in line
+    ]
+    assert reasons == [], (
+        f"rotate_deferrals became a watchdog reason: {reasons}. That is a "
+        "change to the operator alert contract; see straightedge#288."
+    )
+
+
 # --- 3. inflight: a refused write must not let the order leave -------------
 
 
