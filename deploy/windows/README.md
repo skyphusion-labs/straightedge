@@ -43,7 +43,16 @@ live definitions and goes red.
 | `Export-Tasks.ps1` | dumps the LIVE definitions AND their liveness sidecars for the audit | no, read-only |
 | `Install-Supervision.ps1` | registers both from XML, after recording what was there | **yes** |
 | `Deploy-Desk.ps1` | the git deploy executor, see [`docs/DEPLOY.md`](../../docs/DEPLOY.md) | **yes, with `-Apply`** |
+| `DeskDeployLib.ps1` | `Deploy-Desk.ps1`'s helpers, in their own file so a test can reach them without running a deploy (#274) | no, it only defines functions |
+| `Test-DeployScripts.ps1` | the controls for everything in this directory, run by CI under BOTH Windows PowerShell 5.1 and PowerShell 7 | no, it writes only under its own `-WorkRoot` |
 | `assert-config-loads.py` | validates a config through the LOADER before a restart | no, read-only |
+
+**Which shell ran a test here is part of the test.** The box has Windows
+PowerShell 5.1 and no `pwsh`, and 5.1 turns native-command stderr into a
+terminating error where PowerShell 7 does not. A control that runs only under
+`pwsh` cannot see that class of defect at all, which is how #274 passed CI
+while aborting a live deploy. `Test-DeployScripts.ps1` is therefore run twice,
+and the 5.1 leg reproduces the pre-fix abort before asserting the fix.
 
 `python -m straightedge supervision --tasks <dir>` is the audit. With no
 `--tasks` it audits the DECLARED definitions in this directory, which is what
