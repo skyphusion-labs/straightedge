@@ -1,6 +1,6 @@
 # Contract
 
-`docs/TESTING.md` is the companion to this file: this one says what the suite enforces, that one says what a green suite cannot see. Read it before writing a fixture.
+`docs/TESTING.md` is the companion to this file: this one says what the suite enforces, that one says what a green suite cannot see. Read it before writing a fixture or a probe: the failures it records reach a script written to settle a review as readily as they reach the suite, and a probe has no suite behind it.
 
 Code that disagrees with this file is wrong.
 

@@ -39,11 +39,17 @@ the one site that is meant to forward. A new spelling therefore fails there
 rather than passing as covered: the gate cannot read it, and it refuses to
 pretend the read happened.
 
-The remaining hole was a result built WITHOUT the factory
-(`OrderResult(retcode=..., comment="...")`), which `scan_factory_comments`
-cannot see by construction. That is closed structurally rather than excluded:
-`engine.py` builds every result through a factory, zero direct constructions,
-and `test_every_result_is_built_through_a_factory` keeps it that way.
+The remaining hole was a result whose text bypasses the factory, and it is
+closed as a PROPERTY (straightedge#245) rather than as a list of spellings:
+`result_bypasses` reads three rules over the AST (the class name appears only
+as `OrderResult.<factory>(...)`, in an import, or in an annotation; no
+rebuilder such as `replace` or `__setattr__` is handed a `comment`; no
+assignment to `.comment`), with the factory set DERIVED from models.py.
+Nine bypass spellings are checked by `test_the_result_bypass_check_can_see_
+each_spelling` and the same shapes were injected into engine.py when this was
+written. WHAT IT CANNOT SEE: a class reached through `getattr(models,
+"OrderResult")` or `importlib`, and a result mutated through `__dict__`;
+those need a name built at runtime on purpose and this reads names.
 """
 
 from __future__ import annotations
@@ -313,32 +319,181 @@ def test_the_scanners_could_read_every_site() -> None:
     )
 
 
-def test_every_result_is_built_through_a_factory() -> None:
-    """The one hole the comment scan cannot see, closed by structure.
+MODELS = ROOT / "src" / "straightedge" / "models.py"
 
-    `scan_factory_comments` reads `OrderResult.invalid_stops(...)`. A result
-    built with the constructor directly, `OrderResult(retcode=10016,
-    comment="zz")`, would carry a word to the operator through the same render
-    and be invisible to it. Measured on the tree this was written against:
-    `engine.py` contains ZERO direct constructions and reaches every result
-    through `measured`, `unchanged`, `not_sent` or `invalid_stops`, so the hole
-    is closed by keeping that true rather than by writing an exclusion that
-    nothing enforces.
+#: Calls that can rebuild or alter an existing result without naming the class.
+#: `dataclasses.replace(result, comment=...)` and `object.__setattr__(result,
+#: "comment", ...)` are not constructions at all, which is why enumerating
+#: CONSTRUCTION spellings misses them: the property is that a result's text
+#: reaches a caller only by passing a factory, and these two skip it.
+REBUILDERS = frozenset({"replace", "evolve", "copy", "deepcopy", "setattr", "__setattr__"})
+
+
+def result_factories() -> frozenset[str]:
+    """The classmethods of `OrderResult`, DERIVED from models.py, never listed."""
+    tree = ast.parse(MODELS.read_text(encoding="utf-8"))
+    for cls in ast.walk(tree):
+        if isinstance(cls, ast.ClassDef) and cls.name == "OrderResult":
+            return frozenset(
+                node.name
+                for node in cls.body
+                if isinstance(node, ast.FunctionDef)
+                and any(
+                    isinstance(d, ast.Name) and d.id == "classmethod"
+                    for d in node.decorator_list
+                )
+            )
+    raise AssertionError("OrderResult is not defined in models.py")
+
+
+def result_bypasses(source: str, factories: frozenset[str]) -> list[str]:
+    """Every place `source` can produce an OrderResult WITHOUT a factory.
+
+    ONE PROPERTY, not a list of spellings: a result reaches a caller only by
+    passing a factory. Read as three rules over the AST, so a new spelling of
+    the same bypass is caught by the rule rather than by someone adding it to a
+    list:
+
+    1. THE CLASS NAME MAY APPEAR ONLY AS `OrderResult.<factory>(...)`, in an
+       import, or inside an annotation. A bare call, `_m.OrderResult(...)`,
+       `_R = OrderResult`, `OrderResult as OR`, and `type(x)(...)` all hold a
+       reference to the class that is not a factory call, so they fail by being
+       a reference, whatever name they are then called by.
+    2. NO REBUILDER may be handed a `comment`: `replace(...)`, `evolve(...)`,
+       `copy(...)`, `setattr` and `__setattr__`, where the call names the field
+       by keyword or by string constant.
+    3. NO ASSIGNMENT to an attribute called `comment`.
+
+    What it cannot see is stated rather than implied: a class reached by
+    `getattr(models, "OrderResult")` or `importlib`, and a result mutated
+    through `result.__dict__`. Those need someone to build the name at runtime
+    on purpose, and this scan reads names.
     """
-    tree = ast.parse(_source())
-    direct = [
-        node.lineno
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Name)
-        and node.func.id == "OrderResult"
-    ]
-    assert not direct, (
-        f"engine.py builds an OrderResult directly at line(s) {direct!r}. Its "
-        "`comment` reaches the operator through the same `<verb> failed "
-        "retcode=` render as a guard word and is invisible to the comment "
-        "scan, so use a factory or extend the scan."
+    tree = ast.parse(source)
+    parent: dict[int, ast.AST] = {}
+    for holder in ast.walk(tree):
+        for child in ast.iter_child_nodes(holder):
+            parent[id(child)] = holder
+
+    def in_annotation(node: ast.AST) -> bool:
+        cur: ast.AST | None = node
+        while cur is not None:
+            up = parent.get(id(cur))
+            if isinstance(up, ast.arg) and up.annotation is cur:
+                return True
+            if isinstance(up, ast.AnnAssign) and up.annotation is cur:
+                return True
+            if isinstance(up, (ast.FunctionDef, ast.AsyncFunctionDef)) and up.returns is cur:
+                return True
+            cur = up
+        return False
+
+    found: list[str] = []
+    for node in ast.walk(tree):
+        is_ref = (isinstance(node, ast.Name) and node.id == "OrderResult") or (
+            isinstance(node, ast.Attribute) and node.attr == "OrderResult"
+        )
+        if is_ref and not in_annotation(node):
+            up = parent.get(id(node))
+            gp = parent.get(id(up)) if up is not None else None
+            factory_call = (
+                isinstance(up, ast.Attribute)
+                and up.value is node
+                and up.attr in factories
+                and isinstance(gp, ast.Call)
+                and gp.func is up
+            )
+            if not factory_call:
+                found.append(f"line {getattr(node, 'lineno', 0)}: a reference to OrderResult that is not a factory call")
+        if isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                if alias.name == "OrderResult" and alias.asname:
+                    found.append(f"line {getattr(node, 'lineno', 0)}: OrderResult imported under the name {alias.asname!r}")
+        if isinstance(node, ast.Call):
+            func = node.func
+            name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
+            if name in REBUILDERS:
+                keyed = any(k.arg == "comment" for k in node.keywords)
+                named = any(
+                    isinstance(a, ast.Constant) and a.value == "comment" for a in node.args
+                )
+                if keyed or named:
+                    found.append(f"line {getattr(node, 'lineno', 0)}: {name}(...) sets `comment` outside a factory")
+            if isinstance(func, ast.Call) and getattr(func.func, "id", "") == "type":
+                found.append(f"line {getattr(node, 'lineno', 0)}: type(...)(...) rebuilds a result outside a factory")
+        targets: list[ast.expr] = []
+        if isinstance(node, ast.Assign):
+            targets = list(node.targets)
+        elif isinstance(node, (ast.AugAssign, ast.AnnAssign)):
+            targets = [node.target]
+        for tgt in targets:
+            if isinstance(tgt, ast.Attribute) and tgt.attr == "comment":
+                found.append(f"line {getattr(node, 'lineno', 0)}: assignment to `.comment`")
+    return found
+
+
+#: One spelling per way a result's text can bypass a factory, each of which the
+#: bare-name check this test used to be left green (#245, measured by injecting
+#: each into engine.py). Run through the real checker so the control is part of
+#: the suite rather than a thing a reviewer did once.
+BYPASS_SPELLINGS = {
+    "bare constructor": 'def f():\n    return OrderResult(retcode=1, comment="zz")\n',
+    "module attribute": "def f(m):\n    return m.OrderResult(retcode=1, comment=\"zz\")\n",
+    "alias assignment": 'def f():\n    R = OrderResult\n    return R(retcode=1, comment="zz")\n',
+    "import alias": "from straightedge.models import OrderResult as R\n",
+    "dataclasses.replace": 'def f(r):\n    return replace(r, comment="zz")\n',
+    "replace via module": 'def f(r):\n    return dataclasses.replace(r, comment="zz")\n',
+    "object.__setattr__": 'def f(r):\n    object.__setattr__(r, "comment", "zz")\n    return r\n',
+    "type(x)(...)": 'def f(r):\n    return type(r)(retcode=1, comment="zz")\n',
+    "attribute assignment": 'def f(r):\n    r.comment = "zz"\n    return r\n',
+}
+
+#: The same shapes that are FINE, so the checker is not simply refusing
+#: everything that mentions the class.
+CLEAN_SPELLINGS = {
+    "factory call": 'def f():\n    return OrderResult.invalid_stops("zz")\n',
+    "annotation": "def f(r: OrderResult) -> OrderResult | None:\n    return None\n",
+    "plain import": "from straightedge.models import OrderResult\n",
+    "unrelated replace": "def f(s):\n    return s.replace('a', 'b')\n",
+}
+
+
+def test_every_result_is_built_through_a_factory() -> None:
+    """The invariant, over the real `engine.py` (straightedge#245).
+
+    This used to match one spelling, a bare-name `OrderResult(...)` call, and
+    four other ways of putting an unscanned word into a result stayed green when
+    injected. The property is not "no direct construction", it is "a result's
+    text reaches a caller only by passing a factory", and `replace()` and
+    in-place mutation are the two spellings that are not constructions at all.
+    """
+    factories = result_factories()
+    assert {"invalid_stops", "not_sent", "unchanged", "unknown"} <= factories, (
+        f"the factory set derived from models.py looks wrong: {sorted(factories)!r}"
     )
+    found = result_bypasses(_source(), factories)
+    assert not found, (
+        "engine.py produces an OrderResult outside a factory, so its `comment` "
+        "reaches the operator through the same `<verb> failed retcode=` render "
+        f"as a guard word and is invisible to the comment scan: {found!r}"
+    )
+
+
+def test_the_result_bypass_check_can_see_each_spelling() -> None:
+    """POSITIVE CONTROL for the invariant, and its negative half.
+
+    A check that has only ever passed on the real file proves nothing, so each
+    bypass spelling is run through the real checker and must be reported, and
+    each clean spelling must not be.
+    """
+    factories = result_factories()
+    for label, src in BYPASS_SPELLINGS.items():
+        assert result_bypasses(src, factories), f"the check cannot see: {label}"
+    for label, src in CLEAN_SPELLINGS.items():
+        assert not result_bypasses(src, factories), (
+            f"the check refuses a clean spelling: {label}: "
+            f"{result_bypasses(src, factories)!r}"
+        )
 
 
 def test_the_denominator_is_not_empty_and_the_channel_is_still_wired() -> None:

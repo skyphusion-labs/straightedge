@@ -219,9 +219,58 @@ jobs:
   # succeed. Runs with if: always() because a needs-only job is SKIPPED, not
   # failed, when an upstream job fails or is itself skipped -- and skipped
   # is not the red this check exists to produce.
+  # straightedge#259. A changelog entry was a convention with no trigger: five
+  # recent merges fired it in BOTH directions, so the entry/no-entry split was
+  # uncorrelated with whether `src/` changed. A rule that is inferred gets
+  # applied when somebody remembers.
+  #
+  # WIRED INTO `ci`'s `needs` RATHER THAN LEFT AS ITS OWN ROW, because only
+  # `ci` and `coverage` are required contexts on `main`: a new top-level row
+  # would go red visibly and block nothing, which is decoration. Through `ci`
+  # it actually gates.
+  #
+  # NO `if:` ON THE JOB, on purpose. A `needs` job that is SKIPPED reports
+  # `skipped`, not `success`, and the aggregator below compares against
+  # `success`, so an `if: github.event_name == 'pull_request'` here would fail
+  # `ci` on every push to `main`. The job runs always and decides inside.
+  changelog:
+    name: changelog
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # The gate diffs base...head, so a shallow clone cannot see the range.
+          fetch-depth: 0
+
+      # A guard nobody has watched fail is decoration, so the controls run
+      # BEFORE the real verdict and the suite prints its own case count.
+      - name: self-test the gate (positive and negative controls)
+        run: python3 tests/changelog_gate.py --self-test
+
+      - name: a src/ change requires a CHANGELOG entry
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.sha }}
+          # THROUGH THE ENVIRONMENT, never interpolated into the shell. A pull
+          # request body is attacker-controlled text and `${{ }}` substitution
+          # happens before the shell parses the line, so inlining it is command
+          # injection with extra steps.
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: python3 tests/changelog_gate.py
+
+      - name: not a pull request
+        if: github.event_name != 'pull_request'
+        run: |
+          echo "event is ${{ github.event_name }}, not a pull request."
+          echo "Nothing to gate: a push to main carries changes that were"
+          echo "already gated at pull request time. Reported rather than"
+          echo "silently passing an empty range."
+
   ci:
     name: ci
-    needs: [ci-matrix, lint, agent, agent-test, supervision-xml]
+    needs: [ci-matrix, lint, agent, agent-test, supervision-xml, changelog]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 2
@@ -233,11 +282,13 @@ jobs:
           echo "agent-typecheck result: ${{ needs.agent.result }}"
           echo "agent-test result: ${{ needs.agent-test.result }}"
           echo "supervision-xml result: ${{ needs.supervision-xml.result }}"
+          echo "changelog result: ${{ needs.changelog.result }}"
           if [ "${{ needs.ci-matrix.result }}" != "success" ] || \
              [ "${{ needs.lint.result }}" != "success" ] || \
              [ "${{ needs.agent.result }}" != "success" ] || \
              [ "${{ needs.agent-test.result }}" != "success" ] || \
-             [ "${{ needs.supervision-xml.result }}" != "success" ]; then
+             [ "${{ needs.supervision-xml.result }}" != "success" ] || \
+             [ "${{ needs.changelog.result }}" != "success" ]; then
             echo "an upstream job did not succeed; failing the required ci check"
             exit 1
           fi
