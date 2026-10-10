@@ -75,6 +75,13 @@ def _claude_reply(obj: dict) -> dict:
     return {"content": [{"type": "text", "text": json.dumps(obj)}]}
 
 
+#: NOTE the default here is `claude` and the SHIPPED default is `grok`
+#: (`AdviceConfig.provider`, `config.example.toml`, and the `AI_PROVIDER`
+#: fallback all say `grok`). This is a test-file convenience, because most cases
+#: in this file want the structured path. It has already misled one reader into
+#: filing straightedge#284 on the premise that `provider="grok"` was a departure
+#: from the default when it is the shipped value, so it is written down rather
+#: than left to be re-derived.
 def _engine(tmp_path: Path, *payloads: dict, provider: str = "claude") -> Engine:
     cfg = BotConfig()
     cfg.journal_path = str(tmp_path / "j.jsonl")
@@ -315,6 +322,12 @@ def test_the_same_reply_through_the_bare_parser_is_also_in_bound(
     engine.stop()
 
 
+#: The vantages the close case is driven on. Declared once because the pin
+#: below reads it: a second hand-written copy in the parametrize list is the
+#: drift this file already warns about elsewhere.
+PROVIDERS_UNDER_TEST = ("claude", "grok")
+
+
 #: The close reply, in whichever envelope the provider under test reads.
 #:
 #: ONE payload, two envelopes, because the thing being proven is that the path
@@ -338,7 +351,7 @@ def _close_the_model_asked_for(provider: str) -> dict:
     return {"choices": [{"message": {"content": "p\n" + json.dumps(tail)}}]}
 
 
-@pytest.mark.parametrize("provider", ["claude", "grok"])
+@pytest.mark.parametrize("provider", PROVIDERS_UNDER_TEST)
 def test_a_close_the_model_asked_for_bounds_every_row_it_writes(
     tmp_path: Path, provider: str
 ) -> None:
@@ -411,6 +424,30 @@ def test_a_close_the_model_asked_for_bounds_every_row_it_writes(
     )
     _assert_every_row_in_bound(engine)
     engine.stop()
+
+
+def test_the_close_case_covers_the_SHIPPED_default_provider() -> None:
+    """The docstring above says `grok` is the default. Assert it, do not say it.
+
+    straightedge#284 was filed believing the case did not drive the default
+    provider, and the belief was reasonable: `_engine` defaults to `"claude"`,
+    so `provider="grok"` reads as an explicit departure from the default rather
+    than as the shipped value. It is the test file's convenience that differs
+    from the product, not the case.
+
+    Leaving that in prose is the exact defect #284 fixed one level up, where a
+    docstring asserted a vantage the fixture never drove. So the shipped default
+    is read from the config here, and if it ever moves to a provider this case
+    does not drive, this reds and names it.
+    """
+    shipped = BotConfig().advice.provider
+    assert shipped in PROVIDERS_UNDER_TEST, (
+        f"the shipped default provider is {shipped!r}, which this case does not "
+        f"drive (it drives {list(PROVIDERS_UNDER_TEST)}), so the bound on the "
+        "close path is unproven on the configuration customers actually run. "
+        "Add it to PROVIDERS_UNDER_TEST, with its reply envelope in "
+        "_close_the_model_asked_for."
+    )
 
 
 def test_the_signal_path_row_is_bounded_too(tmp_path: Path) -> None:
