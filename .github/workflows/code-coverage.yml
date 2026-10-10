@@ -4,13 +4,28 @@ on:
   push:
     branches: [main]
   pull_request:
+  merge_group:
 
 permissions:
   contents: read
 
 concurrency:
-  group: coverage-${{ github.ref }}
-  cancel-in-progress: true
+  # A pull request SUPERSEDES itself: a newer push replaces the older proposal,
+  # so cancelling the older run is a real saving and loses nothing.
+  #
+  # A push to `main` and a `merge_group` entry do NOT supersede anything. Each is
+  # a distinct state that no other run will ever verify, so a shared group made
+  # every merge cancel the previous merge's verification. Measured before this
+  # change: of 153 commits on `main` with a push run, 18 never had a completed
+  # `ci` run and 12 never had a completed `coverage` one, cancelled rather than
+  # failed, and a cancelled run reads as "not red" everywhere a human looks.
+  # Keying those events on the commit gives each one its own group. See #321.
+  #
+  # For a queued entry this matters more, not less: a cancelled required check is
+  # never reported rather than reported failing, so the entry would sit in the
+  # queue indefinitely instead of failing out of it. See #320.
+  group: coverage-${{ github.ref }}-${{ github.event_name == 'pull_request' && 'pr' || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   coverage:

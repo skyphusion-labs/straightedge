@@ -4,13 +4,28 @@ on:
   push:
     branches: [main]
   pull_request:
+  merge_group:
 
 permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  # A pull request SUPERSEDES itself: a newer push replaces the older proposal,
+  # so cancelling the older run is a real saving and loses nothing.
+  #
+  # A push to `main` and a `merge_group` entry do NOT supersede anything. Each is
+  # a distinct state that no other run will ever verify, so a shared group made
+  # every merge cancel the previous merge's verification. Measured before this
+  # change: of 153 commits on `main` with a push run, 18 never had a completed
+  # `ci` run and 12 never had a completed `coverage` one, cancelled rather than
+  # failed, and a cancelled run reads as "not red" everywhere a human looks.
+  # Keying those events on the commit gives each one its own group. See #321.
+  #
+  # For a queued entry this matters more, not less: a cancelled required check is
+  # never reported rather than reported failing, so the entry would sit in the
+  # queue indefinitely instead of failing out of it. See #320.
+  group: ci-${{ github.ref }}-${{ github.event_name == 'pull_request' && 'pr' || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   ci-matrix:
@@ -266,9 +281,9 @@ jobs:
         if: github.event_name != 'pull_request'
         run: |
           echo "event is ${{ github.event_name }}, not a pull request."
-          echo "Nothing to gate: a push to main carries changes that were"
-          echo "already gated at pull request time. Reported rather than"
-          echo "silently passing an empty range."
+          echo "Nothing to gate: a push to main, or a merge_group entry,"
+          echo "carries changes that were already gated at pull request"
+          echo "time. Reported rather than silently passing an empty range."
 
   ci:
     name: ci
