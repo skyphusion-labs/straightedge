@@ -58,22 +58,92 @@ class _Spy:
 
     def post_json(self, url, body, timeout=None, headers=None):  # noqa: ANN001
         self.headers = dict(headers or {})
-        return {"content": [{"type": "text", "text": "ok"}], "stop_reason": "end_turn"}
+        # BOTH reply shapes from one spy, so one harness serves both providers:
+        # `_claude` reads `content`, `_grok` reads `choices`. A second spy would
+        # be a second thing to keep in step for no gain.
+        return {
+            "content": [{"type": "text", "text": "ok"}],
+            "stop_reason": "end_turn",
+            "choices": [{"message": {"content": "ok"}}],
+        }
 
 
+#: The header each provider sends when it is NOT routed through the gateway.
+#: `claude` is BYOK with `x-api-key`; `grok` is BYOK with `Authorization`.
+DIRECT_HEADER = {"claude": "x-api-key", "grok": "Authorization"}
+
+
+def _cfg_for(provider: str, url: str) -> AdviceConfig:
+    if provider == "claude":
+        return AdviceConfig(provider="claude", claude_url=url, claude_key="THE-TOKEN")
+    return AdviceConfig(provider="grok", grok_url=url, grok_key="THE-TOKEN")
+
+
+@pytest.mark.parametrize("provider", sorted(DIRECT_HEADER))
 @pytest.mark.parametrize("url,expect_gateway,why", CASES, ids=[c[2][:38] for c in CASES])
-def test_the_credential_header_follows_the_parsed_host(url, expect_gateway, why) -> None:
-    spy = _Spy()
-    cfg = AdviceConfig(provider="claude", claude_url=url, claude_key="THE-TOKEN")
-    Advisor(cfg=cfg, transport=spy).ask("q", "ctx")
+def test_the_credential_header_follows_the_parsed_host(
+    provider, url, expect_gateway, why
+) -> None:
+    """ONE body, BOTH providers, the SAME bypass table (#155).
 
+    `grok` was added to this decision and the table was not copied, because a
+    second table is a second thing that can be fixed on one side only: every
+    bypass shape below now has to hold for both providers, and a shape fixed
+    for one is fixed for both. The cases are anthropic-shaped URLs, which is
+    fine and is the point: `_is_cf_gateway` parses the HOST, so the
+    provider-specific path after the gateway id cannot change the answer.
+    """
+    spy = _Spy()
+    Advisor(cfg=_cfg_for(provider, url), transport=spy).ask("q", "ctx")
+
+    direct = DIRECT_HEADER[provider]
     sent_to_gateway = "cf-aig-authorization" in spy.headers
     assert sent_to_gateway is expect_gateway, (
-        f"{why}: expected gateway_auth={expect_gateway}, got {sent_to_gateway} for {url}"
+        f"{provider}: {why}: expected gateway_auth={expect_gateway}, "
+        f"got {sent_to_gateway} for {url}"
     )
     # And the other header must NOT also be present: a credential that goes out
-    # under both names is the same leak wearing a second label.
+    # under both names is the same leak wearing a second label. For the gateway
+    # case this is also the assertion that NO provider key is sent at all,
+    # which is what Unified Billing requires and what a self-hoster must not
+    # get by accident.
     if expect_gateway:
-        assert "x-api-key" not in spy.headers
+        assert direct not in spy.headers, (
+            f"{provider} sent its direct credential to the gateway as well"
+        )
     else:
-        assert "x-api-key" in spy.headers
+        assert direct in spy.headers, (
+            f"{provider} sent no direct credential to a non-gateway host"
+        )
+
+
+def test_a_self_hoster_changing_nothing_keeps_byok_on_both_providers() -> None:
+    """The DEFAULT config must stay direct BYOK for both providers.
+
+    The ruling routes BYOK through the gateway as an option the operator takes
+    by setting a URL, not as a new default. So the shipped defaults are pinned:
+    a self-hoster who changes nothing keeps their own key going straight to the
+    provider, and neither provider acquires a Cloudflare dependency.
+    """
+    for provider in sorted(DIRECT_HEADER):
+        spy = _Spy()
+        # A KEY, AND THE SHIPPED URL. That is the self-hoster being pinned: own
+        # credential, default endpoint. My first version of this fixture set no
+        # key, the advisor short-circuited before calling the transport, and
+        # `spy.headers` was `{}`.
+        #
+        # Which is worth a line, because an empty dict satisfies the
+        # cf-aig-absence assertion VACUOUSLY: had this test asserted only that
+        # the gateway header is absent, it would have passed while measuring
+        # nothing at all. The positive half is what caught it, and the explicit
+        # called-at-all check below is what stops either half passing on an
+        # unmade request.
+        cfg = AdviceConfig(provider=provider, claude_key="K", grok_key="K")
+        Advisor(cfg=cfg, transport=spy).ask("q", "ctx")
+        assert spy.headers, f"{provider} never reached the transport, so nothing was measured"
+        assert "cf-aig-authorization" not in spy.headers, (
+            f"{provider}'s default config routes through the gateway"
+        )
+        assert DIRECT_HEADER[provider] in spy.headers, (
+            f"{provider}'s default config sends no direct credential"
+        )
