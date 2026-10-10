@@ -4,10 +4,22 @@ The bot is the Python process on this computer.
 The desk is Telegram chat commands.
 The agent is the Cloudflare Computer worker.
 The gateway is Cloudflare AI Gateway `mt5-risk-bot`.
-Only `AI_PROVIDER=computer` (the agent) routes through the gateway. The
-default `AI_PROVIDER=grok` and `AI_PROVIDER=claude` are BYOK straight to
-`api.x.ai` and `api.anthropic.com`: no gateway billing, caching, rate
-limit, or observability on either.
+`AI_PROVIDER=computer` (the agent) always routes through the gateway.
+`grok` and `claude` route through it too when you point their URL at it,
+and go straight to `api.x.ai` and `api.anthropic.com` when you do not.
+The URL decides. There is no mode flag.
+
+By default they go direct. Direct means BYOK: your own key, and no
+gateway billing, caching, rate limit or observability. **So by default we
+cannot say how many model calls a week made, what they cost, or on which
+provider.** Set `advice.grok_url` or `advice.claude_url` to your
+Cloudflare AI Gateway URL and the gateway counts them for you.
+
+The counter then lives outside the bot. That matters more than the cost
+figure: a day of zero AI spend on a desk that should call the model every
+bar is a signal, and a counter inside the bot cannot report it, because
+the code that stopped calling the model is the code that would stop
+counting.
 
 You send desk commands from one Telegram chat.
 The bot sizes every order.
@@ -30,7 +42,7 @@ Auto EMA trading is off until `/auto on`.
 | the bot | the Python process on this computer |
 | the desk | Telegram chat commands |
 | the agent | the Cloudflare Computer worker |
-| the gateway | Cloudflare AI Gateway `mt5-risk-bot`. Used only by `AI_PROVIDER=computer`; `grok` and `claude` are direct BYOK, not gatewayed |
+| the gateway | Cloudflare AI Gateway `mt5-risk-bot`. Always used by `AI_PROVIDER=computer`. `grok` and `claude` use it when `advice.grok_url` or `advice.claude_url` points at it, and are direct BYOK when they do not; the URL decides, and direct means no billing, caching, rate limit or observability (#155) |
 | the circuit | halt, daily-loss, and drawdown gates |
 
 ## Install and paper run
