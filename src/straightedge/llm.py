@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from straightedge.atomic import replace_retrying_on_share_conflict
 from straightedge.config import AdviceConfig
 from straightedge.currencies import may_transform_symbol, normalize_model_symbol
 from straightedge.journal import redact_text
@@ -532,7 +533,15 @@ class Advisor:
         tmp = path.with_name(path.name + ".tmp")
         tmp.write_text(payload, encoding="utf-8")
         os.chmod(tmp, 0o600)
-        tmp.replace(path)
+        # NOT a bare `os.replace` (straightedge#251). This is NOT merely a
+        # dropped nicety: `save` is reached from `_remember`, which `ask` calls
+        # AFTER the provider has already answered and been billed, and no call
+        # site wraps it. So a refused replace discards a reply the operator has
+        # already paid for and that `advice.max_turns_per_day` has already
+        # counted. The retry absorbs the race; that the reply is lost at all
+        # when persistence fails is a control-flow question in the advice path,
+        # filed as straightedge#282 rather than changed here.
+        replace_retrying_on_share_conflict(tmp, path)
         os.chmod(path, 0o600)
 
     def _computer(

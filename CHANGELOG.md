@@ -67,6 +67,41 @@ loopback port and used no double at all. The wording now says "no DOUBLE here
 covers" and tells the reader to check for a real-implementation test first. No
 measurement, blind set or exit code changed, and that separation is deliberate:
 a census edited to clear its own finding would be the control validating itself.
+### A refused file replace no longer costs an audit row, a ledger entry or an offset (issue #251)
+
+On Windows `MoveFileEx(..., MOVEFILE_REPLACE_EXISTING)` fails with
+`ERROR_ACCESS_DENIED` while the destination is open in a process that did not
+ask for `FILE_SHARE_DELETE`, and CPython's `open()` does not ask. So any
+concurrent reader can refuse a `write tmp, replace` publish. #242 guarded the
+heartbeat and #257 guarded the risk snapshot; the four remaining sites are now
+guarded too, and the decision is PER SITE because they do not share a
+consequence.
+
+- **`journal.py` rotation: OPERATOR-VISIBLE ROW CHANGE.** Rotation moves the
+  live audit log aside, and a refusal used to raise out of `write`, so a
+  housekeeping failure destroyed an audit record while the run loop caught the
+  error and kept going. Rotation now retries, and a refusal that outlasts the
+  retry window **defers the rotation and still writes the row**, which then
+  carries `rotate_deferred: 1`. If you parse journal rows, that key is new. The
+  file may briefly exceed its 10 MiB bound; the next write rotates it. A
+  caller's own `rotate_deferred` field is never overwritten.
+- **`inflight.py`** retries, and still FAILS CLOSED after the window: the
+  ledger entry is written before the send, so a raise means the order never
+  leaves. That is deliberate and tested.
+- **`llm.py`** retries. A refused replace there discarded an advice reply the
+  operator had already been billed for.
+- **`telegram.py`** retries. Its only caller already swallowed the error, so a
+  lost poll offset was silent; the test asserts the file's contents rather than
+  the absence of an exception.
+- **`broker/mt4_live.py` keeps its own retry loop on purpose.** The mailbox is
+  the interface a customer installs against. A test now pins its spin figure to
+  the shared helper's so the two copies cannot drift.
+- **A census test reads the package as an AST** and fails on any new bare
+  filesystem replace, on anything it cannot classify, and on a guarded site
+  that silently loses its guard. A regex for `os\.replace` was blind to
+  `tmp.replace(dest)`, which is the form most of these sites use, and that
+  blindness is why the population was undercounted twice.
+
 
 ### OPERATOR-VISIBLE REPLY CHANGE: `sl required` is now `sl_required` (issue #233)
 

@@ -18,6 +18,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, TextIO
 
+from straightedge.atomic import replace_retrying_on_share_conflict
+
 # `mailbox_token` is spelled out because the match is exact-key, not substring:
 # "token" alone does not redact a field called "mailbox_token". Nothing journals
 # it today; it is listed so that adding such a field cannot leak one silently.
@@ -86,21 +88,56 @@ class Journal:
                 kept = prior if isinstance(prior, list) else [prior]
                 rec["nonfinite"] = kept + [p for p in nonfinite if p not in kept]
         line = _dump(rec) + "\n"
-        self._rotate_if_needed(len(line.encode("utf-8")))
+        # ROTATION MUST NOT COST THE ROW. `_rotate_if_needed` can be refused by
+        # a concurrent reader (straightedge#251) and it used to raise out of
+        # `write`, so a housekeeping failure destroyed an audit record on a
+        # real-money desk. `__main__` catches and keeps looping, so that was
+        # silent data loss rather than a crash (the shape #217 measured).
+        # Rotation bounds a FILE SIZE; the row IS the product. So a refusal
+        # that outlasts the retry window defers the rotation and the row still
+        # lands, with the deferral marked IN the row so it is visible rather
+        # than absorbed. The file exceeding its bound is recoverable on the
+        # next write; the row is not recoverable at all.
+        deferred = self._rotate_if_needed(len(line.encode("utf-8")))
+        if deferred and "rotate_deferred" not in rec:
+            # NEVER CLOBBER a caller's key, the discipline the `nonfinite`
+            # merge above already had to learn at this exact spot.
+            rec["rotate_deferred"] = 1
+            line = _dump(rec) + "\n"
         with self.path.open("a", encoding="utf-8") as fh:
             fh.write(line)
         _chmod600(self.path)
 
-    def _rotate_if_needed(self, incoming: int) -> None:
+    def _rotate_if_needed(self, incoming: int) -> bool:
+        """Rotate the live file to `.1`. True when a refusal DEFERRED it.
+
+        Returns rather than raises on a refused rotation, because the caller's
+        contract is to record the row: see `write`. Anything that is not a
+        share-mode refusal still propagates, so a full disk or a revoked ACL
+        stays loud.
+        """
         if not self.path.exists():
-            return
+            return False
         size = self.path.stat().st_size
         if size + incoming <= _ROTATE_BYTES:
-            return
+            return False
         dest = self.path.with_name(self.path.name + ".1")
-        self.path.replace(dest)
+        try:
+            # This moves the LIVE file aside, so unlike every other site here
+            # the thing a reader holds open is the SOURCE as well as the
+            # destination. The helper retries the race either way.
+            replace_retrying_on_share_conflict(self.path, dest)
+        except PermissionError:
+            # A holder that outlasts the window is a CONDITION, not a race, and
+            # `atomic.py` says such a thing must surface rather than be
+            # absorbed in silence. It surfaces as `rotate_deferred` on the row
+            # the caller is about to write, which keeps the audit record AND
+            # says the file is over its bound. Narrow to `PermissionError` on
+            # purpose: every other `OSError` still raises.
+            return True
         self.path.touch()
         _chmod600(self.path)
+        return False
 
     def tail(self, n: int = 20) -> list[dict[str, Any]]:
         """Last n live records, redacted AGAIN on the way out.
