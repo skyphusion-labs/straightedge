@@ -147,7 +147,7 @@ def test_a_rejected_send_still_closes_its_entry(tmp_path) -> None:
 
     def rejected(order):
         broker.sends.append(order)
-        return OrderResult.invalid_stops("sl required")
+        return OrderResult.invalid_stops("sl_required")
 
     broker.market = rejected  # type: ignore[assignment]
     engine.start()

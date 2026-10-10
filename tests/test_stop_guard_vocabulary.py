@@ -72,18 +72,37 @@ GUARD_METHODS = ("_stop_guard",)
 #: condition. A contract cannot enumerate them as vocabulary, and forcing them
 #: into a word list would mean inventing three words no code emits.
 #:
-#: `sl required` is a deliberate exception on the record rather than an
-#: oversight: the `refused:` channel documents `sl_required` for the same
-#: condition, so the desk has ONE meaning with TWO renderings, one per channel.
-#: Normalising that is an operator-visible string change on a documented reply,
-#: so it is filed as #233 rather than decided in the change that adds the gate.
+#: `sl required` USED to be a deliberate exception here: the `refused:` channel
+#: documented `sl_required` for the same condition, so one meaning had two
+#: renderings, one per channel. #233 normalised it, so this channel now emits
+#: the WORD `sl_required` and it is no longer prose. The two sentences that
+#: remain are prose on purpose and were deliberately left alone: converging
+#: them would mean inventing words for an ordering between three numbers.
 PINNED_PROSE = frozenset(
     {
-        "sl required",
         "buy needs sl < entry < tp",
         "sell needs tp < entry < sl",
     }
 )
+
+#: Words this channel emits whose ONE row lives in the `refused:` vocabulary
+#: table instead of this section's, because the same condition arrives on both
+#: channels and the ruling on #233 is one row naming both, not a row per table.
+#:
+#: A SECOND row would be two places to drift, which is #220's own defect with a
+#: fresh coat. So the row stays where the word was first documented and this
+#: section does not copy it.
+#:
+#: THE EXCLUSION IS NOT A HOLE, and that is the part that needs the test below:
+#: an exclusion list with no positive check is how a word stops being
+#: documented anywhere while two gates each believe the other covers it.
+#: `test_a_word_documented_elsewhere_really_is_documented_there` asserts the row
+#: exists in that other section, so deleting it reds here.
+DOCUMENTED_IN_THE_REFUSED_TABLE = frozenset({"sl_required"})
+
+#: The section that holds those rows. #220's scan owns it; this is only used to
+#: prove the row is there, never to read vocabulary out of it.
+OTHER_TABLE_HEADING = "### Refusal reasons"
 
 #: The exact heading of the section whose table IS the enumeration. A LEVEL-2
 #: heading on purpose: #220's section scan takes everything from
@@ -465,12 +484,78 @@ def test_prose_comments_are_pinned_rather_than_ignored() -> None:
     pinned set. A new comment is therefore either a guard word that needs a row
     or prose that needs a decision in this pin, and it cannot be neither.
     """
-    extra = channel_comments() - guard_words()
+    extra = channel_comments() - guard_words() - DOCUMENTED_IN_THE_REFUSED_TABLE
     assert extra == PINNED_PROSE, (
         f"the set of non-vocabulary comments on this channel changed: found "
-        f"{sorted(extra)!r}, pinned {sorted(PINNED_PROSE)!r}. A new one is "
-        "either a refusal word that belongs in the table or prose that belongs "
-        "in this pin, and somebody has to say which."
+        f"{sorted(extra)!r}, pinned {sorted(PINNED_PROSE)!r}. A new one is one "
+        "of three things and somebody has to say which: a guard word that "
+        "belongs in this section's table; prose that belongs in PINNED_PROSE; "
+        "or a word whose row already exists in the `refused:` table, which "
+        "belongs in DOCUMENTED_IN_THE_REFUSED_TABLE and must then be proved "
+        "documented there."
+    )
+
+
+def test_a_word_documented_elsewhere_really_is_documented_there() -> None:
+    """An exclusion with no positive check is a hole, so this is the check.
+
+    #233 normalised one condition to one spelling: `_modify_pending` and the
+    paper adapter now emit the WORD `sl_required`, which the `refused:` channel
+    already documented. The ruling is ONE row naming both channels rather than
+    a row in each table, because a duplicated row is two places to drift.
+
+    That leaves this gate excluding a word it can emit, which is only safe
+    while the row actually exists in the other section. Without this test the
+    word could be deleted from there and BOTH gates would stay green, each
+    believing the other covered it. That is the failure mode an exclusion list
+    always has and almost never states.
+
+    Asserted on the ROW, not on a mention: #220 measured that 15 of its 28
+    words were also named in prose, so `word in text` passes on any mention
+    anywhere and would not notice the row going away.
+    """
+    text = CONTRACT.read_text(encoding="utf-8")
+    start = text.find(OTHER_TABLE_HEADING)
+    assert start >= 0, f"{OTHER_TABLE_HEADING!r} is gone, so the row cannot be there"
+    rest = text[start + len(OTHER_TABLE_HEADING) :]
+    end = rest.find("\n## ")
+    section = rest if end < 0 else rest[:end]
+    rows = {m.group(1) for m in TABLE_ROW.finditer(section)}
+    missing = sorted(DOCUMENTED_IN_THE_REFUSED_TABLE - rows)
+    assert not missing, (
+        f"{missing!r} is excluded from this section's table on the grounds that "
+        f"the `refused:` table documents it, and that table has no row for it. "
+        "Either restore the row there or document it here; right now the word "
+        "is documented nowhere and two gates each think the other has it."
+    )
+
+
+def test_the_word_names_both_channels_on_its_single_row() -> None:
+    """One row, and it has to SAY it serves two channels or it is misleading.
+
+    The row lives in the `refused:` table, but the word now also arrives as
+    `sl failed retcode=10016 sl_required`. An operator who meets it on the
+    modify path and finds a row that only mentions `refused:` has been told
+    the wrong thing about where it comes from, which is the defect #233 was
+    filed to remove rather than relocate.
+    """
+    text = CONTRACT.read_text(encoding="utf-8")
+    start = text.find(OTHER_TABLE_HEADING)
+    rest = text[start + len(OTHER_TABLE_HEADING) :]
+    end = rest.find("\n## ")
+    section = rest if end < 0 else rest[:end]
+    row = next(
+        (
+            line
+            for line in section.splitlines()
+            if line.startswith("| `sl_required`")
+        ),
+        None,
+    )
+    assert row is not None, "no `sl_required` row in the refusal table"
+    assert "sl failed" in row, (
+        "the single `sl_required` row does not name the modify channel, so an "
+        "operator meeting it there cannot tell it is the same condition: " + row
     )
 
 
