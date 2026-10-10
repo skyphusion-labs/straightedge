@@ -399,6 +399,43 @@ class InstanceLockError(RuntimeError):
 #: ordinary `advice_turn` still measures 196 bytes against this ceiling.
 RECORD_ROW_BOUND = 580
 
+#: THE MEASURED MAXIMAL ROW, and the FLAT MARGIN over it, as figures something
+#: READS (straightedge#306).
+#:
+#: The derivation above was corrected to "538 measured plus 42 flat" and
+#: neither number was ever read by anything. `RECORD_ROW_BOUND` is pinned
+#: against `docs/CONTRACT.md` by a test, because #226 measured it being
+#: raisable to 1024 with the whole suite green while the contract still said
+#: 512; its own derivation then grew two more figures with exactly that
+#: property. The maximal row could have grown to 579 with every test green
+#: while this comment, `docs/CONTRACT.md` and a changelog fragment all went on
+#: saying the margin was 42, and "re-deriving means measuring the maximal row
+#: again" was an instruction to a reader rather than a gate.
+#:
+#: `RECORD_ROW_BOUND` IS STILL ITS OWN LITERAL ON PURPOSE. Writing it as
+#: `MAXIMAL_ROW_BYTES + RECORD_ROW_MARGIN` would make the sum true by
+#: construction, so the identity could never go red, and a sum that cannot go
+#: red is the decoration this file keeps warning about. Three literals and a
+#: test that measures the row and checks they agree can go red; a derived sum
+#: can only be arithmetically right about a stale measurement.
+MAXIMAL_ROW_BYTES = 538
+RECORD_ROW_MARGIN = 42
+
+#: What `rotate_deferred` costs every row it marks, measured.
+#:
+#: A conditional row field costs the bytes of its KEY, so this figure is
+#: `len(json.dumps({"rotate_deferred": 1}))`, the separators that join it to
+#: the row included, and the test asserts the measured delta against BOTH that
+#: expression and this constant. Pinning it against the expression is what
+#: makes a rename or a widened value red with the new cost named, rather than
+#: silently drawing more of the margin.
+#:
+#: It is a constant rather than a sentence because a 15 character non-numeric
+#: marker drew 22 bytes while matching no entry on the invalidation list above,
+#: and the list went on describing the whole allowance (straightedge#287).
+#: A draw nothing reads is a draw nobody subtracts.
+ROTATE_DEFERRED_ROW_BYTES = 22
+
 #: How much of a MODEL-CHOSEN string a row may carry.
 #:
 #: Long enough that every real instrument name, vendor suffix and all, survives
