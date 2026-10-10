@@ -1076,11 +1076,12 @@ Three mutations: raising the constant alone reds the drift gate, raising the
 document alone reds it too, and setting the bound below the measured worst case
 reds 6 including every by-construction case. Restored, 11 passed.
 
-### Two diagnostic rows are bounded by a documented RATE, not by the 512 byte constant (issue #236)
+### Two diagnostic rows are bounded by a documented RATE, not by the row constant (issue #236)
 
 #226's row bound was never true of two of our own diagnostics:
 `history_preflight` measured 876 bytes and `history_unavailable` 1108 on a
-four-symbol book, against a documented 512. Neither carries model-chosen
+four-symbol book, against the 512 this PR proposed at the time, since raised to
+580 and derived (#226). Neither carries model-chosen
 content and both grow linearly with the operator's book, so the constant was
 the wrong instrument rather than the rows being wrong.
 
