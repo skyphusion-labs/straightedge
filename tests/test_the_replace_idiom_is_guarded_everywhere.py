@@ -477,6 +477,85 @@ def test_the_deferral_count_is_published_but_NOT_an_alert(tmp_path: Path) -> Non
     )
 
 
+def test_a_deferred_rotation_keeps_the_worst_case_row_in_bound(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """`rotate_deferred` is a ROW field, so it lands inside what the bound measures.
+
+    This case exists because the field was asserted by NOTHING. `Journal.write`
+    sets `rec["rotate_deferred"] = 1` and re-serialises, so the field is not
+    only an atomic-write change: it is a new key on a row that
+    `journal.RECORD_ROW_BOUND` answers for. And it appears ONLY when a rotation
+    is refused, which no fixture in the bound suite drives, so with #229 and
+    this change both landed the bound suite is green with the field ABSENT and
+    the larger row is measured by nobody.
+
+    That is the same shape as the reject row measuring 5753 bytes with the
+    whole suite green, which is the defect #226 and #229 exist to close, and
+    the same shape as `telegram`'s "did not raise" passing before its fix
+    existed. A row on a path no fixture reaches cannot have its size asserted.
+
+    Two assertions, and the FIRST is what stops this being decoration: the
+    field must actually be present. Without it this test passes on a build
+    where the deferral never fires, which is exactly the hole it is here to
+    close.
+
+    The worst case is reused rather than rebuilt. `_everything_large` derives
+    from `ADVICE_PROPERTIES`, so a schema field added later is driven here too
+    without anyone editing this file, and a second local definition of "worst
+    case" would fork from it at copy time.
+
+    The deferral is driven by making the helper refuse rather than by the retry
+    loop, because what is under test here is the ROW, not the wait. The retry
+    itself is covered by the cases above, and a real refused replace is covered
+    on the windows-latest leg.
+    """
+    from straightedge import journal as journal_mod
+    from straightedge.journal import RECORD_ROW_BOUND
+    from straightedge.telegram import TgCommand
+    from test_the_advice_row_is_bounded import (
+        _assert_every_row_in_bound,
+        _claude_reply,
+        _engine,
+        _everything_large,
+        _turn,
+    )
+
+    engine = _engine(tmp_path, _claude_reply(_everything_large()))
+    live = Path(engine.journal.path)
+    assert live.exists(), (
+        "no live journal, so `_rotate_if_needed` returns early and the "
+        "deferral branch is unreachable: this would measure nothing"
+    )
+
+    def _refuse(tmp, dest, **kw):  # type: ignore[no-untyped-def]
+        raise PermissionError(5, "Access is denied")
+
+    monkeypatch.setattr(journal_mod, "_ROTATE_BYTES", 1)
+    monkeypatch.setattr(journal_mod, "replace_retrying_on_share_conflict", _refuse)
+    engine.handle_command(TgCommand("1", 1, "/ask take a view", 1))
+    monkeypatch.undo()
+
+    row = _turn(engine)
+    assert row.get("rotate_deferred") == 1, (
+        "the deferral did not fire, so the bound was asserted on a row WITHOUT "
+        f"the field and this case measured nothing: {sorted(row)}"
+    )
+
+    blob = json.dumps(row, sort_keys=True)
+    assert len(blob) <= RECORD_ROW_BOUND, (
+        f"the worst-case advice row carrying rotate_deferred is {len(blob)} "
+        f"bytes against a {RECORD_ROW_BOUND} byte bound. The field costs a "
+        "fixed number of bytes on every row it marks, so this is the bound's "
+        "headroom being spent rather than a clipping failure: re-derive the "
+        "bound rather than nudging it."
+    )
+    # EVERY row the turn wrote, not only `advice_turn`: with the threshold at 1
+    # every write during this turn defers, so every row carries the field.
+    _assert_every_row_in_bound(engine)
+    engine.stop()
+
+
 # --- 3. inflight: a refused write must not let the order leave -------------
 
 
