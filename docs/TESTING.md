@@ -613,6 +613,93 @@ that cannot fail is decorative; a monitor measuring the wrong subject is worse,
 because it actively reports the answer you wanted about something you did not
 ask about.
 
+## An empty answer is the commonest disguise for a broken question
+
+**An instrument that could not have produced a positive answer, reporting a
+negative one.** Six of these in one evening, from five different tools, and in
+every case the tempting reading was that the CLAIM was wrong rather than that
+the QUESTION was.
+
+| instrument | why it returned a confident nothing |
+|---|---|
+| `gh pr diff -- <path>` | returned empty for a path that WAS in the diff |
+| a `grep` | case sensitive against content that differed in case |
+| two `merge-base --is-ancestor` checks | unfetched object, so the ancestor was UNKNOWN, not absent |
+| a sweep pattern | `os\.replace` missed `tmp.replace(dest)` |
+| a mutation harness | printed `changed outcome: 0` while its mutation had FAILED |
+| a dash check using `grep -P` | the flag does not exist on this seat's `grep`, so the check could not run |
+
+The last one is the sharpest, because it was measuring this exact defect. Its
+anchor no longer existed after the commit it was testing, so the mutation phase
+re-ran unmutated code and **compared it with itself**. A zero meaning "I measured
+nothing" presented as a zero meaning "nothing changed", inside a change whose
+whole subject was assertions that pass vacuously.
+
+**The last row is a different animal from the five above it, and the difference
+is the useful part.** Those five are tools asked the wrong question. That one is
+a tool that COULD NOT RUN, whose failure was converted into a pass by the shell
+idiom wrapped around it:
+
+```sh
+check && echo ok || echo none          # never write this around a check
+```
+
+`cmd && echo ok || echo none` renders an unavailable flag, a missing file, a
+typo in the pattern and a genuine clean result **identically**. It is not a
+measurement error; it is an error-handling idiom that turns failure into the
+reassuring branch by construction.
+
+**And it is INVISIBLE FROM THE SEAT THAT WROTE IT.** The same command is a
+working instrument where `grep` resolves to one that supports `-P`, and a
+false-negative generator where it resolves to BSD grep, decided entirely by that
+account's PATH. Measured both ways: on the authoring seat it found a planted
+dash; on the other seat, given a file whose bytes are verifiably `e2 80 94` and
+`e2 80 93`, the same command printed `none`. An author who writes and controls a
+check on their own seat **cannot discover this defect**, because it passes its
+own control exactly where it was written and manufactures passes only for
+whoever inherits it.
+
+So the control has a sharper requirement than "prove the instrument can return a
+positive": **a shared check's control must run on the seat that RUNS it, not on
+the seat that wrote it.** A control proven once by the author proves nothing
+about anybody else's PATH. This is the copied-tool fork with no copy involved;
+the thing that forked is the environment.
+
+Three prescriptions, and they are the same failure at three distances: the
+INSTRUMENT, the TOOL that reports it, and the REVIEWER who accepts it. **Each is
+invisible from the position of the one before it:** a reviewer cannot see a
+vacuous zero, a harness cannot see a reviewer's checklist, and an instrument
+cannot see either. That is why these are one entry and not three unrelated
+cautions.
+
+**1. The instrument.** A negative result is evidence only after you confirm the
+instrument could have produced a positive one. That is already doctrine here;
+what it misses is that **an empty answer is the most comfortable possible
+disguise for a broken question**, because it looks like good news and it costs
+nothing to accept. So the check is adversarial on the INSTRUMENT, never on the
+claim: before accepting a nothing, make the instrument find something you
+already know is there. A scan that cannot find a planted needle is not a clean
+scan.
+
+**2. The tool.** A harness must **REFUSE TO REPORT when its own precondition did
+not hold.** This is stronger than telling readers to check their instruments,
+because **it moves the obligation from the reader to the tool**, and the reader
+is the person least able to discharge it: a vacuous zero is indistinguishable
+from a real one at the point of reading. The repaired harness greps the file to
+prove its mutation landed before it compares anything, and exits rather than
+printing a number it cannot stand behind.
+
+**3. The reviewer.** **A document's payload IS its prescription, so review the
+instruction and not only its hygiene.** Recorded as a review failure on the pull
+request that landed the monitor entry above, because the instance is what makes
+it checkable. Every hygiene check run on that review was the CORRECT check and
+all of them passed: zero dashes, correct siting against the two sections it
+generalises, no retracted wordings, a present-tense claim verified against
+`main`, scope confirmed. **Nothing in that list reads the payload.** The entry
+shipped telling a reader to reap a correct watcher to satisfy a count, and a
+reviewer could run that whole checklist, pass it honestly, and still ship it.
+That is what makes it a gap rather than a lapse.
+
 ## A control beats a second opinion
 
 Two instruments agreeing is CORROBORATION. A control showing the instrument can
