@@ -27,6 +27,8 @@ from __future__ import annotations
 import inspect
 import re
 import sys
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -84,6 +86,77 @@ TIMEOUT = 3.0
 
 def wired(tmp_path: Path, transcripts: dict[str, Transcript], **kw: object) -> TranscriptExpert:
     return TranscriptExpert(tmp_path, transcripts, **kw)  # type: ignore[arg-type]
+
+
+class RenameClaimer:
+    """Claim the shared name the way the real Expert does, deterministically.
+
+    WHY THIS EXISTS RATHER THAN `wired(..., answer_limit=0)`.
+    `TranscriptExpert` models the claim as read-then-`unlink` and deliberately
+    TOLERATES an `unlink` that is refused, because #242 measured
+    `ERROR_ACCESS_DENIED` on exactly that operation on the live Windows box. When
+    the refusal happens the request stays on the shared name, so the bridge's own
+    withdrawal succeeds and reports `withdrawn` -- which is CORRECT, because
+    nothing had claimed it. The test then fails on the withdrawal assertion
+    instead of on the precondition it actually lost, which is why
+    `test_a_request_the_expert_already_claimed_is_reported_as_claimed` failed on
+    the windows leg and never on POSIX.
+
+    The real Expert claims with `FileMove(REQ_NAME, FILE_COMMON, gClaimPath, ...)`
+    (`mt4/Experts/Mt4RiskBot.mq4:313`) BEFORE it reads the body, and `_withdraw`
+    (`src/straightedge/broker/mt4_live.py:555-574`) is written against exactly
+    that: the file being GONE is the claim. So this claims by rename, retries a
+    refusal within a bounded grace, and records whether it ever got the claim.
+
+    `claimed` is the precondition, asserted separately from the behaviour under
+    test, so a lost precondition says so instead of masquerading as a wrong
+    withdrawal.
+    """
+
+    def __init__(self, directory: Path, grace_sec: float = 10.0) -> None:
+        self.directory = directory
+        self.grace_sec = grace_sec
+        self.claimed = False
+        self.refusals = 0
+        self.detail = ""
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def __enter__(self) -> RenameClaimer:
+        self.directory.mkdir(parents=True, exist_ok=True)
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=5.0)
+
+    def _loop(self) -> None:
+        req = self.directory / REQ_NAME
+        claim = self.directory / (REQ_NAME + ".claim")
+        deadline = time.monotonic() + self.grace_sec
+        while not self._stop.is_set() and time.monotonic() < deadline:
+            try:
+                req.replace(claim)
+            except FileNotFoundError:
+                # Not written yet, or already claimed by this loop.
+                time.sleep(0.002)
+                continue
+            except PermissionError:
+                # NTFS refuses while the other side holds the handle. The real
+                # Expert retries its claim for the same reason
+                # (`Mt4RiskBot.mq4:324-331`).
+                self.refusals += 1
+                time.sleep(0.005)
+                continue
+            self.claimed = True
+            return
+        self.detail = (
+            "never claimed %s within %.1fs (%d refusals)"
+            % (REQ_NAME, self.grace_sec, self.refusals)
+        )
 
 
 def broker(tmp_path: Path) -> Mt4Broker:
@@ -771,10 +844,14 @@ class TestReplyMatching:
         that finds nothing there is not a withdrawal, and calling it one would
         turn the ambiguous-money case into a clean bill of health.
         """
-        with wired(tmp_path, GOLDEN, answer_limit=0):
+        with RenameClaimer(tmp_path) as claimer:
             bridge = FileBridge(tmp_path, timeout_sec=0.4)
             with pytest.raises(BridgeTimeout) as caught:
                 bridge.call("market", {"symbol": "EURUSD", "side": "buy", "volume": 0.17})
+        # The PRECONDITION, asserted before the behaviour. A claim that never
+        # happened is a lost setup, not a wrong withdrawal, and conflating the
+        # two is what made this read as a flake rather than as a broken fixture.
+        assert claimer.claimed, "precondition lost: " + claimer.detail
         assert caught.value.withdrawal == "claimed"
         assert caught.value.withdrawn is False
         assert caught.value.may_still_execute is True
