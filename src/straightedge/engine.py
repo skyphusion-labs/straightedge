@@ -9,6 +9,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from straightedge.atomic import (
+    REPLACE_RETRY_SECONDS,
+    replace_retrying_on_share_conflict,
+)
 from straightedge.broker.base import Broker, venue_clock_of
 from straightedge.config import BotConfig
 from straightedge.constants import MT4_SEND_TIMEOUT_UNKNOWN
@@ -197,6 +201,12 @@ VENUE_CLOCK_BAR_SLACK_SEC = 1
 #: built from it must not collide with "nothing recorded".
 _CLOCK_UNRECORDED: tuple[Any, ...] = ("unrecorded",)
 
+#: The heartbeat's retry window. The figure and the reasoning live in
+#: `straightedge.atomic`; this name is kept because the heartbeat's own
+#: tests pin the window against `poll_seconds` from here, and because a
+#: reader of `_write_heartbeat` should find the window named at this level
+#: rather than having to follow an import (straightedge#251).
+HEARTBEAT_REPLACE_RETRY_SECONDS = REPLACE_RETRY_SECONDS
 
 class Engine:
     def __init__(
@@ -2858,7 +2868,10 @@ class Engine:
             encoding="utf-8",
         )
         os.chmod(tmp, 0o600)
-        tmp.replace(dest)
+        # NOT a bare `tmp.replace(dest)`: on Windows a concurrent reader of the
+        # heartbeat makes that fail, which aborted the whole tick
+        # (straightedge#242). The helper says why, and how narrowly.
+        replace_retrying_on_share_conflict(tmp, dest)
 
     def _restore_gap_ever(self, dest: Path) -> None:
         """Carry the worst gap this BOX has seen across a restart. Once.

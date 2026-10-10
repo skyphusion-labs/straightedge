@@ -30,6 +30,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from straightedge.atomic import (
+    REPLACE_RETRY_SECONDS,
+    replace_retrying_on_share_conflict,
+)
 from straightedge.models import EquitySnapshot
 
 SNAPSHOT_VERSION = 2
@@ -120,6 +124,18 @@ def _count(p: Path, data: dict[str, Any], key: str) -> int:
     return v
 
 
+#: The snapshot's retry window. The figure and the reasoning live in
+#: `straightedge.atomic`; this name is kept because the tests pin the
+#: window against `poll_seconds` from here, and because a reader of
+#: `save_snapshot` should find it named at this level (straightedge#251).
+#:
+#: WHAT THIS MODULE ADDS TO THE SHARED CONTRACT: a refused write here is
+#: COULD NOT MEASURE and the money gate fails CLOSED on it, so the helper
+#: re-raising at the deadline is load-bearing rather than incidental. A
+#: hold that outlasts the window MUST still halt the desk, and a test
+#: requires exactly that.
+STATE_REPLACE_RETRY_SECONDS = REPLACE_RETRY_SECONDS
+
 def save_snapshot(path: str | Path, snap: EquitySnapshot) -> Path:
     """Atomically replace the snapshot. Raises StateUnwritable on any OSError."""
     p = Path(path)
@@ -145,7 +161,10 @@ def save_snapshot(path: str | Path, snap: EquitySnapshot) -> Path:
                 fh.write("\n")
                 fh.flush()
                 os.fsync(fh.fileno())
-            os.replace(tmp, p)
+            # NOT a bare `os.replace`: a concurrent reader of this file makes
+            # that fail on Windows, and a failed write here HALTS the desk
+            # (straightedge#251). The helper says how narrowly it retries.
+            replace_retrying_on_share_conflict(tmp, p)
         except BaseException:
             # Covers a failed serialise AND a failed replace. Leaving the temp
             # file behind would leak a 0600 file and litter the journal dir.
