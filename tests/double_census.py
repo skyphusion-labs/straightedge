@@ -71,12 +71,23 @@ def can_raise(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
     return any(isinstance(n, ast.Raise) for n in ast.walk(fn))
 
 
-def main() -> int:
+def collect() -> dict[str, list[tuple[str, str, bool]]]:
+    """Seam method -> [(test file, double class, can_raise)].
+
+    The structured half, so a caller can assert on the data instead of on this
+    module's exit code or its printed text. Only seams that at least one
+    double implements are returned; `main()` prints exactly the same data and
+    adds no measurement of its own.
+
+    Raises `RuntimeError` when no `Protocol` class was found, because a census
+    that measured nothing must never be readable as "nothing is blind".
+    """
     seams = protocol_seams()
     if not seams:
-        print("NOTHING CHECKED: no Protocol classes found in src/.", file=sys.stderr)
-        print("A census that measured nothing is not a clean result.", file=sys.stderr)
-        return 9
+        raise RuntimeError(
+            "NOTHING CHECKED: no Protocol classes found in src/. "
+            "A census that measured nothing is not a clean result."
+        )
     all_methods: set[str] = set()
     for names in seams.values():
         all_methods |= names
@@ -98,13 +109,31 @@ def main() -> int:
                     continue
                 if member.name in all_methods:
                     found[member.name].append((path.name, node.name, can_raise(member)))
+    return {m: rows for m, rows in found.items() if rows}
+
+
+def blind_seams(
+    implemented: dict[str, list[tuple[str, str, bool]]] | None = None,
+) -> set[str]:
+    """Seams a double implements but where NO double can raise."""
+    impl = collect() if implemented is None else implemented
+    return {m for m, rows in impl.items() if not any(r[2] for r in rows)}
+
+
+def main() -> int:
+    try:
+        seams = protocol_seams()
+        found = collect()
+    except RuntimeError as exc:
+        print(exc, file=sys.stderr)
+        return 9
 
     print("Protocol seams read from src/:")
     for cls, names in sorted(seams.items()):
         print(f"  {cls}: {len(names)} methods")
     print()
 
-    implemented = {m: rows for m, rows in found.items() if rows}
+    implemented = found
     print(f"seam methods implemented by a test double: {len(implemented)}")
     blind: list[str] = []
     for m, rows in sorted(implemented.items()):

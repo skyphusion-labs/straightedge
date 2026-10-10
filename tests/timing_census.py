@@ -106,11 +106,19 @@ def clock_names(tree: ast.Module) -> set[str]:
     return out
 
 
-def main() -> int:
+def collect() -> list[tuple[str, str, str, bool]]:
+    """Every elapsed-time assertion, as (file, test, direction, marked).
+
+    The structured half, so a test can assert on the data instead of on this
+    module's exit code. `main()` prints the same rows and adds nothing.
+
+    Raises `RuntimeError` when there are no test files to read, because a
+    census that measured nothing is not a clean result and a caller must not
+    be able to read that as an empty population.
+    """
     files = sorted(TESTS.rglob("test_*.py"))
     if not files:
-        print("NOTHING CHECKED: no test files found.", file=sys.stderr)
-        return 9
+        raise RuntimeError("NOTHING CHECKED: no test files found")
 
     rows: list[tuple[str, str, str, bool]] = []
     for path in files:
@@ -148,6 +156,16 @@ def main() -> int:
                 kind = "BOTH" if low and high else ("FLOOR" if low else "CEILING")
                 rows.append((path.name, fn.name, kind, marked))
                 break
+
+    return rows
+
+
+def main() -> int:
+    try:
+        rows = collect()
+    except RuntimeError as exc:
+        print(exc, file=sys.stderr)
+        return 9
 
     print(f"tests asserting on elapsed wall-clock time: {len(rows)}")
     unmarked = []
