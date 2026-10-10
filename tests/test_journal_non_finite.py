@@ -188,3 +188,63 @@ def test_jq_is_not_handed_a_plausible_finite_number(tmp_path: Path) -> None:
     assert kind == "string", f"jq sees {kind}, so it can still be read as a number: {r.stdout}"
     assert value == "nonfinite:inf", r.stdout
     assert looks_like_a_float is False, f"jq printed something float-shaped: {r.stdout}"
+
+
+def test_a_caller_supplied_marker_is_merged_not_replaced(tmp_path: Path) -> None:
+    """A row about what could not be measured must not drop what a caller said.
+
+    Measured on the first version of this fix: the sanitiser assigned
+    `rec["nonfinite"]` outright, so a caller already using the key had its
+    entry clobbered. It bites only when a caller uses the key AND the same row
+    carries a non-finite value, which is why nothing noticed: with no
+    non-finite value the caller's field survives untouched.
+
+    Asserted as MEMBERSHIP rather than order. Which entry comes first is an
+    implementation detail, and pinning it would make a harmless reordering red
+    a gate, which is how a gate gets disabled by the next person who hits it.
+    """
+    _journal(tmp_path).write(
+        "advice_turn", nonfinite=["caller_said_this"], sl=math.inf
+    )
+    row = json.loads(_lines(tmp_path)[0])
+    assert set(row["nonfinite"]) == {"caller_said_this", "sl"}, row
+    assert row["sl"] == "nonfinite:inf", row
+
+
+def test_a_caller_marker_survives_with_nothing_to_merge(tmp_path: Path) -> None:
+    """CONTROL for the merge: the untouched path must stay untouched.
+
+    This is the case that hid the clobber, so it is pinned: with no non-finite
+    value in the row there is nothing to merge, and the caller's field must
+    come through exactly as given rather than being normalised or dropped by
+    the merge branch.
+    """
+    _journal(tmp_path).write("advice_turn", nonfinite=["only_the_caller"], sl=1.5)
+    row = json.loads(_lines(tmp_path)[0])
+    assert row["nonfinite"] == ["only_the_caller"], row
+    assert row["sl"] == 1.5, row
+
+
+def test_a_nested_non_finite_is_marked_on_a_real_row_shape(tmp_path: Path) -> None:
+    """The nested case on a path that exists in production, not a synthetic one.
+
+    `history_preflight` carries a `symbols` list of per-symbol objects, so
+    `symbols[1].atr` is a real path a non-finite value can occupy. A synthetic
+    `payload` proves the recursion; this proves the recursion on a shape the
+    desk actually writes, which is the difference between a fixture that
+    exercises the code and one that exercises the system.
+    """
+    _journal(tmp_path).write(
+        "history_preflight",
+        symbols=[
+            {"symbol": "EURUSD", "atr": 0.0012},
+            {"symbol": "XAUUSD", "atr": math.nan},
+        ],
+    )
+    raw = (tmp_path / "journal.jsonl").read_text(encoding="utf-8")
+    for token in BARE_TOKENS:
+        assert token not in raw, raw
+    row = json.loads(_lines(tmp_path)[0])
+    assert row["symbols"][0]["atr"] == 0.0012, "a finite neighbour must be untouched"
+    assert row["symbols"][1]["atr"] == "nonfinite:nan", row
+    assert row["nonfinite"] == ["symbols[1].atr"], row

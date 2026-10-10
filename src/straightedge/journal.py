@@ -69,7 +69,22 @@ class Journal:
         # being made is about the BYTES, not about one producer's inputs.
         rec, nonfinite = _mark_nonfinite(rec)
         if nonfinite:
-            rec["nonfinite"] = nonfinite
+            # MERGE, NEVER REPLACE. A caller may already use this key, and
+            # measured on the first version of this fix, it was clobbered:
+            # `write("advice_turn", nonfinite=["caller_said_this"], sl=inf)`
+            # wrote `"nonfinite": ["sl"]` and the caller's entry was gone.
+            #
+            # It bites only when a caller uses the key AND the same row carries
+            # a non-finite value, which is why nothing noticed: with no
+            # non-finite value the caller's field survives untouched. A row
+            # about what could not be measured is the worst place to silently
+            # drop what somebody said could not be measured.
+            prior = rec.get("nonfinite")
+            if prior is None:
+                rec["nonfinite"] = nonfinite
+            else:
+                kept = prior if isinstance(prior, list) else [prior]
+                rec["nonfinite"] = kept + [p for p in nonfinite if p not in kept]
         line = _dump(rec) + "\n"
         self._rotate_if_needed(len(line.encode("utf-8")))
         with self.path.open("a", encoding="utf-8") as fh:
