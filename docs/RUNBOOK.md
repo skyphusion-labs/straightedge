@@ -1221,6 +1221,33 @@ Production live: `doctor --connect` must exit 0 before `run --mode mt5` or `run 
 `trade_mode=2` also needs `--i-accept-risk` at start, or `/live on I-ACCEPT-RISK` in the locked chat.
 Demo (`trade_mode=0`) does not.
 
+### A venue clock that moves BACK stops new entries for about that long
+
+The broker's server clock can move BACK: a DST roll on its own clock, or a reconnect onto a
+server on a different offset.
+After that the auto leg takes no NEW entry for about the size of the move.
+One hour back is about one hour with no new entries.
+Nothing is written while it holds.
+There is no refusal, no halt, no error, and nothing to clear or restart.
+Open positions are still managed, and manual `/buy`, `/sell` and `/close` still work: they
+time off the bot's clock and never off a bar.
+This is the dump-trade guard working as designed, and it is not a fault.
+The auto leg acts on the last bar only when its stamp is NEWER than the last stamp it acted on.
+Bar stamps are the server's own wall clock, so a server clock that moves back moves them back
+with it, and the gate stays shut until stamps climb past their previous high.
+Without that gate, a bar that is not actually newer would be traded as a fresh tick
+(straightedge#172).
+
+Two rolls are coming, both backwards, both one hour:
+- 2026-10-25, when European summer time ends.
+- 2026-11-01, when US daylight time ends.
+Most MT4 and MT5 brokers run their server clock on an EET/EEST basis, so 2026-10-25 is the one
+likely to apply to this desk.
+Confirm that against your own broker rather than assuming it: read the server clock in the
+terminal, or run `doctor --connect` and compare the offset it reports.
+If an armed run spans either date, expect about an hour with no new entries after the roll, and
+read that hour as the guard holding rather than as a dead desk.
+
 ## Journal
 
 `journal.jsonl` is the source of truth for fills the bot observed.
