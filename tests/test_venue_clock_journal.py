@@ -356,6 +356,56 @@ def test_losing_and_regaining_the_clock_is_two_transitions(tmp_path: Path) -> No
     engine.stop()
 
 
+def test_a_missing_previous_offset_is_absent_rather_than_null(tmp_path: Path) -> None:
+    """One parsing rule for the whole row: a key present means a measured value.
+
+    straightedge#225. The row had two conventions for "there is no offset":
+    `offset_sec` was OMITTED when the clock could not be read, while
+    `previous_offset_sec` was written as JSON `null` when the PREVIOUS reading
+    could not be read. Not ambiguous to a reader who notices
+    `previous_unmeasured` on the same row, but this row exists to be parsed
+    later by #37's evidence package, and a parser handles an omitted key with
+    `in` and a nullable one with `is not None`. Those are different tests, and
+    the second one silently misreads a row from a desk that omitted the key.
+    A field that can be absent OR null has two absent states and nothing
+    distinguishes them, which is the version-skew shape #206 documents.
+
+    This is the unmeasured-to-measured transition, the one case where the key
+    appeared with no value; the measured-to-measured cases above still assert
+    the number, because there the previous offset is a fact worth carrying.
+    """
+    broker = _MovingVenue(balance=10_000)
+    engine, clock = _engine(tmp_path, broker)
+
+    def unmeasured(name, *, max_staleness_sec=None):
+        del name, max_staleness_sec
+        return VenueClock.not_measured(
+            "server_time", source="moving venue", detail="the venue went quiet"
+        )
+
+    original = broker.venue_clock
+    broker.venue_clock = unmeasured  # type: ignore[method-assign]
+    engine.start()
+    engine.step_symbol("EURUSD")
+
+    broker.venue_clock = original  # type: ignore[method-assign]
+    _advance_one_bar(broker, clock)
+    engine.step_symbol("EURUSD")
+    row = _rows(engine)[-1]
+
+    # The fixture reached the path, or the assertion below proves nothing.
+    assert row["offset_sec"] == PLUS_3, f"the recovery was not recorded: {row}"
+    assert row["previous_unmeasured"] == ["server_time"], (
+        f"this is not the unmeasured-to-measured transition: {row}"
+    )
+
+    assert "previous_offset_sec" not in row, (
+        "the previous offset was unmeasured, so the key carries no value and "
+        f"must be absent exactly as offset_sec is: {row}"
+    )
+    engine.stop()
+
+
 # --- 3. the exclusions the issue wrote in ---------------------------------
 
 

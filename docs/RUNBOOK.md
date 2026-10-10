@@ -1265,6 +1265,11 @@ is what `start()` sees because it has no previous poll to bound the sample with;
 `previous_offset_sec` and `previous_unmeasured` on a transition, so one row
 states what it moved FROM and a DST roll is legible without diffing two rows;
 `sampled`, `venue`, `symbol` and `measured_at`.
+Read the row by ONE rule: a key that is there carries a measured value. Nothing
+on this row is written as null. If `offset_sec` is missing the desk could not
+read the clock, and `unmeasured` says what it could not read; if
+`previous_offset_sec` is missing there was no previous offset to state, and
+`previous_unmeasured` says what the previous reading was missing.
 Why it matters after the fact: before this the offset was measured, used to
 convert every bar, and discarded, so `journal.jsonl` could say the desk did not
 know what time it was and never that it thought it was UTC+3. Reconcile an order
