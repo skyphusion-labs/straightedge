@@ -2936,7 +2936,7 @@ class Engine:
         # NOT a bare `tmp.replace(dest)`: on Windows a concurrent reader of the
         # heartbeat makes that fail, which aborted the whole tick
         # (straightedge#242). The helper says why, and how narrowly.
-        _replace_retrying_on_share_conflict(tmp, dest)
+        tmp.replace(dest)
 
     def _restore_gap_ever(self, dest: Path) -> None:
         """Carry the worst gap this BOX has seen across a restart. Once.
