@@ -39,6 +39,19 @@ where = ["src"]
 testpaths = ["tests"]
 pythonpath = ["src", "tests"]
 addopts = "--cov=straightedge --cov-report=term-missing --cov-fail-under=80"
+markers = [
+  # straightedge#258. A test carrying this mark is only correct if a wall-clock
+  # budget is MET: something has to be scheduled inside a ceiling for the
+  # assertion to hold. That is a different kind of test from one whose
+  # correctness is independent of timing, and the suite could not tell them
+  # apart, which is why ~15% of windows-latest runs went red on `main` with
+  # nothing wrong. Deselect with `-m "not timing"`.
+  #
+  # The mark is a diagnosis aid, not a licence: a red here is still a red. It
+  # says "suspect the runner before the change", which is the question that
+  # cost an author an hour of proving a red was not theirs.
+  "timing: correctness depends on a wall-clock budget being met",
+]
 
 [tool.coverage.run]
 branch = true

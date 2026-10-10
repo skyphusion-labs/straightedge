@@ -319,7 +319,7 @@ calls apart.
 
 Journal events: `send_unresolved` (a send answered nothing; carries the key, what
 the mailbox did with the request, and any position whose comment matched),
-`send_refused_unresolved` (a second send for the same key was refused),
+`send_refused_unresolved` (a second send for the same key was refused; journal-only like every other refusal, and asserted that way with the event explicitly allowlisted, because `_format_event` rather than the allowlist is what keeps it out of the chat),
 `confirm_unresolved` (the chat path's record of the same), `inflight_unreadable`
 (the ledger file exists and could not be parsed, which must never read as "no open
 sends"). `Engine.start()` re-announces every open record on EVERY start.
@@ -500,9 +500,13 @@ Each `step_all` that reaches `account` writes `journal.heartbeat`.
 Line 1 is an ISO timestamp, and that has not changed since 1.0.0.
 After it, one `key=value` per line: `blocked=`, `mode=`, `stale_after_s=`,
 `tick_budget_s=`, `tick_gap_max_s=`, `over_budget=`, `tick_gap_ever_s=`,
-`over_budget_ever=`, `run_id=`, `started_at=`, `deployed=`.
+`over_budget_ever=`, `breach_rows_lost=`, `run_id=`, `started_at=`,
+`deployed=`.
 (`deployed=` was shipped by 1.6.0 and this list did not name it; corrected
-here rather than left for a reader to find in the renderer.)
+here rather than left for a reader to find in the renderer. **A test now reads
+this list and requires every rendered field to appear in it**, so the next
+addition cannot drift the way that one did: nothing asserted this before, and
+the format was a contract in name only.)
 `run_id=` is one value per desk PROCESS, assigned at construction and never
 reassigned, and `started_at=` is when that process started.
 A reader compares `run_id` across observations to see a RESTART. It is not the
@@ -532,6 +536,17 @@ last restart. It is not a stale reading; it is the one a restart used to erase.
 `tick_gap_ever_s` is a maximum over the heartbeats that SURVIVED, and it is
 never lower than what the live process has itself observed. Deleting
 `journal.heartbeat` resets it, and that is the only way to lose the box history.
+`breach_rows_lost` counts the `tick_gap_breach` rows this PROCESS detected and
+could not write, after a bounded retry. **It is the only surface that reports a
+hole in the audit log, because the channel designed to carry a breach is the
+journal and this field exists for the case where that journal is what failed**
+(straightedge#217). Zero on a healthy desk and published on every heartbeat, so
+it is a field a reader can rely on being present rather than one that appears
+only when something is wrong. A non-zero value means the breach HAPPENED and
+the row does not exist: `tick_gap_ever_s` still answers whether this box has
+ever breached, and the count of occurrences is short by this much. The journal
+row is attempted on up to three ticks before the record is declared lost; an
+unbounded retry would sit in the latency path the record exists to explain.
 A desk too old to publish `over_budget_ever` leaves the box history UNKNOWN. A
 reader says so and does NOT read the missing field as a clean history, the same
 rule this file already states for a missing `stale_after_s`.

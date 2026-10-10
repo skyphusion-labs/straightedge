@@ -25,14 +25,51 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-from mt4_transcripts import TranscriptExpert, ea_kv
-from test_mt4_wire import GOLDEN
+from mt4_transcripts import ea_kv
 
 from straightedge.broker.mt4_live import REQ_NAME, BridgeTimeout, FileBridge, encode
 
 
-def wired(tmp_path: Path, transcripts: dict, **kw: object) -> TranscriptExpert:
-    return TranscriptExpert(tmp_path, transcripts, **kw)  # type: ignore[arg-type]
+class CapturingBridge(FileBridge):
+    """Records what `call()` put on the wire, with no mailbox and no thread.
+
+    NOT TIMING-DEPENDENT, and that is the point of it (#258). The `ttl_ms` a
+    request carries is decided entirely by `budget_for(op)` and `encode()`,
+    both of which run BEFORE `_exchange` is reached, so the wire contract can
+    be read at that seam synchronously.
+
+    What this replaces: the same assertion made by starting a stand-in Expert
+    in another thread, letting both calls time out, and then reading what the
+    Expert had managed to observe. That inferred the contract from the
+    SCHEDULER -- the double polls every 5ms against a 200ms read budget, and
+    the desk withdraws its request when the budget expires, so a stall longer
+    than one budget lost the observation entirely. Measured on
+    `windows-latest, 3.12` and root-caused in #254; reproduced on macOS by
+    stalling the double's loop:
+
+        stall= 0.0s   seen={'tick': '200', 'market': '600'}
+        stall=0.25s   seen={'market': '600'}        <- the CI failure
+
+    The subject was never the scheduler. It is which budget each op is given,
+    and that is now observed where it is decided.
+    """
+
+    def __init__(self, *args: object, **kw: object) -> None:
+        super().__init__(*args, **kw)  # type: ignore[arg-type]
+        self.bodies: list[str] = []
+
+    def _exchange(
+        self, body: str, req_id: int, *, timeout_sec: float | None = None, op: str = ""
+    ) -> str:
+        # `call()` has already chosen the budget and encoded the body, which is
+        # the whole subject. Raising the real type keeps the caller's contract.
+        self.bodies.append(body)
+        raise BridgeTimeout(
+            "captured by the test before any mailbox io",
+            op=op,
+            withdrawal="withdrawn",
+            req_id=req_id,
+        )
 
 
 def _budgets(tmp_path: Path) -> FileBridge:
@@ -103,13 +140,12 @@ class TestEveryRequestCarriesATtl:
         Expert would refuse a request the desk was still waiting on, or execute
         one the desk had already written off.
         """
-        bridge = FileBridge(tmp_path, timeout_sec=0.2, send_timeout_sec=0.6)
-        with wired(tmp_path, GOLDEN, answer_limit=0) as ea:
-            for op, payload in (
-                ("tick", {"symbol": "XAUUSD"}),
-                ("market", {"symbol": "XAUUSD", "side": "buy", "volume": 0.01}),
-            ):
-                with pytest.raises(BridgeTimeout):
-                    bridge.call(op, payload)
-        seen = {ea_kv(b, "op"): ea_kv(b, "ttl_ms") for b in ea.seen}
+        bridge = CapturingBridge(tmp_path, timeout_sec=0.2, send_timeout_sec=0.6)
+        for op, payload in (
+            ("tick", {"symbol": "XAUUSD"}),
+            ("market", {"symbol": "XAUUSD", "side": "buy", "volume": 0.01}),
+        ):
+            with pytest.raises(BridgeTimeout):
+                bridge.call(op, payload)
+        seen = {ea_kv(b, "op"): ea_kv(b, "ttl_ms") for b in bridge.bodies}
         assert seen == {"tick": "200", "market": "600"}, seen

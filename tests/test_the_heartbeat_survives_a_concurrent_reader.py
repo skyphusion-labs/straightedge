@@ -10,6 +10,15 @@ familiar class. On Windows `MoveFileEx(..., MOVEFILE_REPLACE_EXISTING)` fails
 with `ERROR_ACCESS_DENIED` when the destination is open in a process that did
 not ask for `FILE_SHARE_DELETE`, and CPython's `open()` does not ask.
 
+## One seam
+
+The call site writes `tmp.replace(dest)`-shaped code but the shared helper
+in `straightedge.atomic` calls `os.replace`, so **`os.replace` is the one
+seam** and these tests patch it there. Patching `Path.replace` would no
+longer intercept anything: the refusal would never be injected and the
+tests would pass having measured nothing, which is the failure mode this
+file exists to avoid (straightedge#251).
+
 ## What each test here can and cannot prove
 
 **A monkeypatched `replace` that RAISES is not a held handle.** It proves the
@@ -43,11 +52,8 @@ import pytest
 from straightedge import watchdog
 from straightedge.broker.paper import PaperBroker
 from straightedge.config import BotConfig
-from straightedge.engine import (
-    HEARTBEAT_REPLACE_RETRY_SECONDS,
-    Engine,
-    _replace_retrying_on_share_conflict,
-)
+from straightedge.atomic import replace_retrying_on_share_conflict
+from straightedge.engine import HEARTBEAT_REPLACE_RETRY_SECONDS, Engine
 from straightedge.synthetic import generate_bars
 
 
@@ -74,24 +80,25 @@ def test_a_refused_replace_is_retried_until_it_lands(tmp_path: Path) -> None:
     dest.write_text("first", encoding="utf-8")
 
     attempts: list[int] = []
-    real = Path.replace
+    real = os.replace
 
-    def flaky(self: Path, target):  # type: ignore[no-untyped-def]
+    def flaky(src, dst):  # type: ignore[no-untyped-def]
         attempts.append(1)
         if len(attempts) < 3:
             raise PermissionError(5, "Access is denied")
-        return real(self, target)
+        return real(src, dst)
 
-    Path.replace = flaky  # type: ignore[method-assign]
+    os.replace = flaky  # type: ignore[assignment]
     try:
-        _replace_retrying_on_share_conflict(tmp, dest)
+        replace_retrying_on_share_conflict(tmp, dest)
     finally:
-        Path.replace = real  # type: ignore[method-assign]
+        os.replace = real  # type: ignore[assignment]
 
     assert len(attempts) == 3, attempts
     assert dest.read_text(encoding="utf-8") == "second"
 
 
+@pytest.mark.timing
 def test_the_window_is_bounded_and_then_the_tick_is_allowed_to_fail(
     tmp_path: Path,
 ) -> None:
@@ -105,18 +112,18 @@ def test_the_window_is_bounded_and_then_the_tick_is_allowed_to_fail(
     tmp.write_text("x", encoding="utf-8")
     dest.write_text("y", encoding="utf-8")
 
-    real = Path.replace
+    real = os.replace
 
-    def always(self: Path, target):  # type: ignore[no-untyped-def]
+    def always(src, dst):  # type: ignore[no-untyped-def]
         raise PermissionError(5, "Access is denied")
 
-    Path.replace = always  # type: ignore[method-assign]
+    os.replace = always  # type: ignore[assignment]
     started = time.monotonic()
     try:
         with pytest.raises(PermissionError):
-            _replace_retrying_on_share_conflict(tmp, dest, window_s=0.1)
+            replace_retrying_on_share_conflict(tmp, dest, window_s=0.1)
     finally:
-        Path.replace = real  # type: ignore[method-assign]
+        os.replace = real  # type: ignore[assignment]
     elapsed = time.monotonic() - started
     assert 0.1 <= elapsed < 2.0, elapsed
 
@@ -135,18 +142,18 @@ def test_a_non_permission_error_propagates_on_the_first_attempt(
     tmp.write_text("x", encoding="utf-8")
 
     attempts: list[int] = []
-    real = Path.replace
+    real = os.replace
 
-    def boom(self: Path, target):  # type: ignore[no-untyped-def]
+    def boom(src, dst):  # type: ignore[no-untyped-def]
         attempts.append(1)
         raise OSError(28, "No space left on device")
 
-    Path.replace = boom  # type: ignore[method-assign]
+    os.replace = boom  # type: ignore[assignment]
     try:
         with pytest.raises(OSError) as caught:
-            _replace_retrying_on_share_conflict(tmp, dest)
+            replace_retrying_on_share_conflict(tmp, dest)
     finally:
-        Path.replace = real  # type: ignore[method-assign]
+        os.replace = real  # type: ignore[assignment]
 
     assert not isinstance(caught.value, PermissionError)
     assert len(attempts) == 1, f"a non-PermissionError was retried: {attempts}"
@@ -170,19 +177,19 @@ def test_the_heartbeat_write_uses_the_retry_and_not_a_bare_replace(
     first = dest.read_text(encoding="utf-8")
 
     attempts: list[int] = []
-    real = Path.replace
+    real = os.replace
 
-    def flaky(self: Path, target):  # type: ignore[no-untyped-def]
+    def flaky(src, dst):  # type: ignore[no-untyped-def]
         attempts.append(1)
         if len(attempts) == 1:
             raise PermissionError(5, "Access is denied")
-        return real(self, target)
+        return real(src, dst)
 
-    Path.replace = flaky  # type: ignore[method-assign]
+    os.replace = flaky  # type: ignore[assignment]
     try:
         engine._write_heartbeat()
     finally:
-        Path.replace = real  # type: ignore[method-assign]
+        os.replace = real  # type: ignore[assignment]
     engine.stop()
 
     assert len(attempts) >= 2, attempts
@@ -207,6 +214,7 @@ def test_the_retry_window_cannot_delay_a_tick() -> None:
 # --- 3. the real thing, which only one platform can run --------------------
 
 
+@pytest.mark.timing
 @pytest.mark.skipif(
     sys.platform != "win32",
     reason=(

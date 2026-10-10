@@ -9,6 +9,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from straightedge.atomic import (
+    REPLACE_RETRY_SECONDS,
+    replace_retrying_on_share_conflict,
+)
 from straightedge.broker.base import Broker, venue_clock_of
 from straightedge.config import BotConfig
 from straightedge.constants import MT4_SEND_TIMEOUT_UNKNOWN
@@ -192,86 +196,34 @@ VENUE_CLOCK_BAR_DISAGREES = "venue_clock_bar_disagrees"
 #: else.
 VENUE_CLOCK_BAR_SLACK_SEC = 1
 
+#: How many ticks may attempt the `tick_gap_breach` write before the record is
+#: declared lost (straightedge#217).
+#:
+#: BOUNDED, because the one-line fix is wrong. Setting the flag after the write
+#: and leaving it at that retries on every tick for as long as the journal
+#: stays broken, which is an unbounded retry inside the latency path this very
+#: record exists to explain; `_write_heartbeat` already refuses a venue round
+#: trip for exactly that reason.
+#:
+#: Three, because at the default `poll_seconds` that is about 45 seconds of
+#: opportunity, which covers a reader holding the journal open across a
+#: rotation, and because the cost of being wrong is three attempted file opens
+#: rather than one. It is NOT a retry inside `Journal.write`: that would be a
+#: change to every journal write on every path, and the four unguarded
+#: write-tmp-then-replace sites are tracked separately (straightedge#251).
+_HB_BREACH_WRITE_ATTEMPTS = 3
+
 #: No clock has been recorded yet. Distinct from every real state, because
 #: an unmeasured clock legitimately carries `offset_sec=None` and a tuple
 #: built from it must not collide with "nothing recorded".
 _CLOCK_UNRECORDED: tuple[Any, ...] = ("unrecorded",)
 
-#: How long `_write_heartbeat` keeps retrying a `replace` that a concurrent
-#: READER refused, before it gives up and lets the tick fail (straightedge#242).
-#:
-#: Sized by what the TICK can afford, not by how long the conflict lasts. A
-#: reader of this file holds its handle for microseconds, so 0.5s at a 20ms
-#: spin is 25 attempts and generous by orders of magnitude; what it must never
-#: do is delay the next tick, so it stays far below the smallest plausible
-#: `poll_seconds` (a test pins that relationship rather than leaving it to this
-#: comment). A reader that holds the file for longer than this is a DIFFERENT
-#: problem, a scanner pinning the path rather than a read racing a write, and
-#: that one should surface as a `loop_error` rather than be absorbed in silence.
-HEARTBEAT_REPLACE_RETRY_SECONDS = 0.5
-
-#: The spin, matching `broker/mt4_live.py`'s established figure rather than
-#: inventing a second one for the same class of wait.
-_HEARTBEAT_REPLACE_SPIN_SECONDS = 0.02
-
-
-def _replace_retrying_on_share_conflict(
-    tmp: Path, dest: Path, *, window_s: float = HEARTBEAT_REPLACE_RETRY_SECONDS
-) -> None:
-    """`tmp.replace(dest)`, retried while a concurrent reader refuses it.
-
-    straightedge#242, found by a live read of the deployed desk and never by
-    the suite:
-
-        [WinError 5] Access is denied:
-        'C:\\bot-state\\journal.heartbeat.tmp' -> 'C:\\bot-state\\journal.heartbeat'
-
-    THE MECHANISM. On Windows `MoveFileEx(..., MOVEFILE_REPLACE_EXISTING)`
-    fails with `ERROR_ACCESS_DENIED` when the destination is open in a process
-    that did not ask for `FILE_SHARE_DELETE`, and CPython's ordinary `open()`
-    does not ask for it. So ANY concurrent reader of the heartbeat makes this
-    replace fail for as long as it holds the handle, and `watchdog.read` is
-    such a reader. On POSIX a rename over an open file succeeds, which is why
-    no amount of local testing reaches this.
-
-    WHICH READER HELD THE HANDLE IS NOT MEASURED, and this does not claim one.
-    A scheduled `watchdog.read` is the likeliest candidate on the deployed box,
-    but a scanner is equally capable of it and the `.tmp` file is also a scan
-    target. The fix is correct whichever it was, which is the argument for it:
-    it does not depend on identifying the culprit. Do not let a later reader
-    turn this comment into an accusation.
-
-    NARROW ON PURPOSE: `PermissionError` only, never a bare `OSError`, and
-    never a check on the message. `broker/mt4_live.py` already ruled that a
-    retry policy must not depend on error wording, and a bare `OSError` here
-    would absorb a full disk, a vanished directory and a revoked ACL, all of
-    which are states waiting cannot fix. A test drives a non-`PermissionError`
-    through this to prove it propagates on the FIRST attempt.
-
-    THE SAME CLASS IS ALREADY HANDLED ONE MODULE OVER, in
-    `broker/mt4_live.py`'s `_atomic_write` and `_retry_unlink`, in this shape
-    and at this spin. The mailbox path retried and the liveness path did not;
-    this closes that asymmetry rather than inventing a policy. The two loops
-    are deliberately NOT yet unified: the mailbox is the interface a customer
-    installs against, so a shared helper is a separate change with its own
-    reasoning, not a side effect of a heartbeat fix.
-
-    WHAT THIS DOES NOT COVER, said out loud so nobody reads it as covered: the
-    `tmp.write_text` that precedes this call can also meet a `PermissionError`
-    if a scanner holds the `.tmp` path open for writing. That is unobserved,
-    so it is not handled here; a second instance would be evidence, and a
-    retry installed on an unobserved path is a guard nobody can red.
-    """
-    deadline = time.monotonic() + window_s
-    while True:
-        try:
-            tmp.replace(dest)
-            return
-        except PermissionError:
-            if time.monotonic() >= deadline:
-                raise
-            time.sleep(_HEARTBEAT_REPLACE_SPIN_SECONDS)
-
+#: The heartbeat's retry window. The figure and the reasoning live in
+#: `straightedge.atomic`; this name is kept because the heartbeat's own
+#: tests pin the window against `poll_seconds` from here, and because a
+#: reader of `_write_heartbeat` should find the window named at this level
+#: rather than having to follow an import (straightedge#251).
+HEARTBEAT_REPLACE_RETRY_SECONDS = REPLACE_RETRY_SECONDS
 
 class Engine:
     def __init__(
@@ -379,7 +331,33 @@ class Engine:
         #: `straightedge.watchdog`.
         self._hb_last_mono: float | None = None
         self._hb_gap_max_s = 0.0
+        #: THE STDERR WARNING has been printed. Set before the print on
+        #: purpose: a print is not durable, so losing one loses nothing that
+        #: outlives the process, and a repeated warning every 15 seconds would
+        #: be noise rather than information.
         self._hb_over_warned = False
+        #: THE JOURNAL ROW has landed. A SEPARATE flag from the one above, and
+        #: the whole of straightedge#217: the two surfaces have different
+        #: durability, so one flag cannot govern both. This one is set ONLY
+        #: after `journal.write` returns, because a flag set before a durable
+        #: write loses the record precisely when writing is what failed.
+        self._hb_breach_recorded = False
+        #: What the breach MEASURED, captured at detection rather than re-read
+        #: at write time. A retried write must record the breach that was
+        #: detected, not a larger maximum that accumulated while the journal
+        #: was unavailable; those would be the same row reporting a different
+        #: fact.
+        self._hb_breach_pending: dict[str, object] | None = None
+        #: Bounded, because the one-line fix is wrong. Moving the flag after
+        #: the write converts "lose the record once" into "attempt it on every
+        #: tick for as long as the journal stays broken", which is an unbounded
+        #: retry inside the latency path this record exists to explain, and
+        #: `_write_heartbeat` already refuses a venue round trip for exactly
+        #: that reason (straightedge#153, #190).
+        self._hb_breach_attempts = 0
+        #: Published in the heartbeat, because the channel designed to carry
+        #: this is the one that failed. A different FILE with a live reader.
+        self._hb_breach_rows_lost = 0
         #: The worst gap THIS BOX has ever published, carried across restarts.
         #: A DIFFERENT question from `_hb_gap_max_s` one line up, which is why
         #: it is a second field rather than a change to the first;
@@ -2881,10 +2859,33 @@ class Engine:
         # the box's history, so the published figure can never be lower than
         # what this process has itself seen.
         self._hb_gap_ever_s = max(self._hb_gap_ever_s, self._hb_gap_max_s)
-        if self._hb_gap_max_s > budget and not self._hb_over_warned:
+        if self._hb_gap_max_s > budget:
             # The threshold is derived from config and this measurement says the
             # derivation is too tight for this book. Report it; do NOT widen it.
-            self._hb_over_warned = True
+            #
+            # TWO SURFACES, TWO FLAGS, AND THAT IS THE WHOLE OF straightedge#217.
+            # The stderr warning is not durable, so setting its flag before the
+            # print costs nothing if the print is lost. The JOURNAL ROW is
+            # durable, and the flag that governs it was set before the write, so
+            # a failed write lost the record permanently: `Journal.write` has no
+            # exception handling, `__main__` catches `Exception` and keeps
+            # looping, and the loop's own `loop_error` write is swallowed, so the
+            # only trace was a stderr line on a box where stderr goes to a file
+            # nobody reads. One flag could not govern both surfaces, because
+            # losing a print and losing an append-only audit row are not the
+            # same event.
+            if self._hb_breach_pending is None:
+                # CAPTURED AT DETECTION. A retried write records the breach that
+                # was detected, not a larger maximum that accumulated while the
+                # journal was unavailable.
+                self._hb_breach_pending = {
+                    "gap_s": round(self._hb_gap_max_s, 1),
+                    "budget_s": budget,
+                    "symbols": len(self.cfg.symbols),
+                    "run_id": self._hb_run_id,
+                }
+            if not self._hb_over_warned:
+                self._hb_over_warned = True
             # The JOURNAL, not only stdout. stdout on the deployed box goes to a
             # file nobody reads, so before straightedge#153 the only durable
             # trace of a breach was a heartbeat field the next restart
@@ -2899,19 +2900,48 @@ class Engine:
             # very path whose latency this record exists to explain. An
             # instrument must not perturb its own measurement. The symbol list
             # is the half of the book that is config, and therefore free.
-            self.journal.write(
-                "tick_gap_breach",
-                gap_s=round(self._hb_gap_max_s, 1),
-                budget_s=budget,
-                symbols=len(self.cfg.symbols),
-                run_id=self._hb_run_id,
-            )
-            print(
-                f"heartbeat: a gap of {self._hb_gap_max_s:.1f}s between ticks "
-                f"exceeds the derived budget of {budget}s, so the watchdog "
-                "threshold can produce a false STALE. It was not widened.",
-                flush=True,
-            )
+                print(
+                    f"heartbeat: a gap of {self._hb_gap_max_s:.1f}s between "
+                    f"ticks exceeds the derived budget of {budget}s, so the "
+                    "watchdog threshold can produce a false STALE. It was not "
+                    "widened.",
+                    flush=True,
+                )
+            if (
+                not self._hb_breach_recorded
+                and self._hb_breach_attempts < _HB_BREACH_WRITE_ATTEMPTS
+            ):
+                self._hb_breach_attempts += 1
+                try:
+                    self.journal.write(
+                        "tick_gap_breach", **self._hb_breach_pending
+                    )
+                except OSError:
+                    # NARROW, and `OSError` rather than `Exception`, because the
+                    # failure this survives is the file being unavailable: a
+                    # rotation refused by a reader holding the journal open, a
+                    # vanished directory, a full disk. A serialisation defect is
+                    # not a transient and must not be retried into silence;
+                    # #250 made a non-finite value a marked string rather than
+                    # a raise, so the remaining raises here are the filesystem.
+                    if self._hb_breach_attempts >= _HB_BREACH_WRITE_ATTEMPTS:
+                        # GIVING UP IS RECORDED, because the alternative is the
+                        # defect this issue is about one level out: a bounded
+                        # retry that goes quiet is a record lost with nothing
+                        # saying so. Published in the heartbeat, a DIFFERENT
+                        # file with a live reader, since the channel designed to
+                        # carry this is the one that failed.
+                        self._hb_breach_rows_lost += 1
+                        print(
+                            "heartbeat: the tick_gap_breach row could not be "
+                            f"written after {_HB_BREACH_WRITE_ATTEMPTS} "
+                            "attempts and is LOST. The breach happened; the "
+                            "journal did not record it. See "
+                            "breach_rows_lost in the heartbeat.",
+                            flush=True,
+                        )
+                else:
+                    self._hb_breach_recorded = True
         tmp.write_text(
             watchdog.render(
                 ts,
@@ -2929,6 +2959,10 @@ class Engine:
                 # stamp by hand on a running desk should see the repair, and a
                 # file read next to a file write costs nothing.
                 deployed=deployed.describe(self.journal.path),
+                # Published on EVERY heartbeat, not only when non-zero, so the
+                # field is one a reader can rely on being there
+                # (straightedge#217).
+                breach_rows_lost=self._hb_breach_rows_lost,
             ),
             encoding="utf-8",
         )
@@ -2936,7 +2970,7 @@ class Engine:
         # NOT a bare `tmp.replace(dest)`: on Windows a concurrent reader of the
         # heartbeat makes that fail, which aborted the whole tick
         # (straightedge#242). The helper says why, and how narrowly.
-        _replace_retrying_on_share_conflict(tmp, dest)
+        replace_retrying_on_share_conflict(tmp, dest)
 
     def _restore_gap_ever(self, dest: Path) -> None:
         """Carry the worst gap this BOX has seen across a restart. Once.
