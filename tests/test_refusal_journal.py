@@ -5,7 +5,13 @@ prose. Every test here reads a journal.jsonl record and compares the NAMED
 reason string. Two invariants ride along:
 
 - a refusal is journaled and never echoed back into the chat it came from,
-  the precedent PR #40 set for command_rejected;
+  the precedent PR #40 set for command_rejected. That holds for a refusal with
+  no named reason too, and `send_refused_unresolved` is the one of those: it
+  goes through `_emit` rather than `journal.write`, which LOOKS like an
+  exception to this rule and is not one, because `_format_event` returns empty
+  for it and `_emit` notifies only on non-empty text. Asserted in
+  `tests/test_unresolved_send_record.py` (#237), including with the event
+  explicitly allowlisted, so the invariant has no unrecorded exception;
 - COULD NOT MEASURE stays a different event from REFUSED. A stage that could
   not be built is not a rule saying no.
 """
