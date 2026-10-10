@@ -627,6 +627,39 @@ for a backstop, so the docstring says so instead of implying a test stands
 behind it; a test that could only fail by removing the guard first would be
 pinning the guard twice.
 
+**A third round, and the finding is this PR's own shape one row out.** The
+review measured a `reject` row at **5751 bytes** from the same turn whose
+`advice_turn` row was 299 and reported nothing wrong: `_stage_close` wrote
+`advice.symbol` raw from three sites, and a close is NEVER gated by
+`advice_allows`, so the symbol is model-chosen with nothing in front of it.
+`ADVICE_PROPERTIES["symbol"]` carries no `maxLength`, so a 5600 character
+symbol is a valid string, no violation is raised and no hold is forced; this is
+the default shape rather than a `grok`-only vantage. **The row these tests read
+was clean and the row beside it was the defect**, which is #216 bounding a
+field and this PR first bounding one row, a third time.
+
+**Fixed at `_reject` rather than at the three call sites,** because that is the
+single writer of every `reject` row: clipping three callers would have left the
+fourth, and deriving the fixture's fields from the schema could not reach this
+either, since the gap was PATH coverage and no derivation over fields finds a
+row a fixture never writes. The already-clipped `shown` is kept for the CHAT
+and the raw name passed to the record, so a value is clipped once rather than
+producing a marker inside a marker.
+
+**And a mutation found a SECOND unpinned branch in the same writer, which it
+would have been wrong to call an unreachable backstop.** Removing the clip on
+the `Signal` branch left the file green. It is reachable by an operator:
+`/buy <5600 chars> sl=0.9 tp=1.3` with `min_rr` high refuses `rr_below_min` and
+writes that row through the signal branch. The operator typed the symbol rather
+than a model choosing it, which changes who to blame and changes nothing about
+the row, because the bound exists for the machine reading it and a paste
+breaches it as easily as a reply does. Pinned now, with the operator control
+asserting that `EURUSD` still comes back whole from the same writer.
+
+Three mutations on the round: the reject clip removed reds 3, the signal clip
+removed reds 1, and the clip threshold lowered reds 6 including both controls,
+so the controls can fail.
+
 ## 1.8.0
 
 ### The worst tick gap this box has seen now outlives the process (issue #153)

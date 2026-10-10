@@ -248,6 +248,106 @@ def test_the_same_reply_through_the_bare_parser_is_also_in_bound(
     engine.stop()
 
 
+def test_a_close_the_model_asked_for_bounds_every_row_it_writes(
+    tmp_path: Path,
+) -> None:
+    """The PATH no field derivation could reach, found in review.
+
+    `_stage_close` wrote three `reject` rows carrying `advice.symbol` raw, and
+    a close is NEVER gated by `advice_allows`, so that symbol is model-chosen
+    with nothing in front of it. `ADVICE_PROPERTIES["symbol"]` carries no
+    `maxLength`, so a 5600 character symbol is a valid string: no violation, no
+    forced hold, and this is the DEFAULT shape rather than a `grok`-only
+    vantage.
+
+    Measured before the fix: `reject reason=close_needs_ticket` at **5751
+    bytes** with the whole symbol on it, while the `advice_turn` row beside it
+    was 299 bytes and reported nothing wrong. The row this file was reading was
+    clean and the row next to it was the defect, which is the same shape as
+    #216 bounding a field and this PR first bounding one row.
+
+    Driving `action = "close"` with no ticket is what reaches it, and the fix
+    is at `_reject` rather than at the three call sites, because that is the
+    single writer of every `reject` row and a fourth site would otherwise
+    repeat this.
+    """
+    engine = _engine(
+        tmp_path,
+        {"choices": [{"message": {"content": "p\n" + json.dumps({
+            "action": "close", "symbol": "E" * 5600, "ticket": None,
+            "sl": None, "tp": None, "limit": None, "stop": None, "summary": "s",
+        })}}]},
+        provider="grok",
+    )
+    engine.handle_command(TgCommand("1", 1, "/ask flatten it", 1))
+
+    rejects = _rows_named(engine, "reject")
+    assert rejects, "the close never reached the reject path, so this proves nothing"
+    assert rejects[-1]["reason"] == "close_needs_ticket", (
+        f"not the refusal this case is about: {rejects[-1]!r}"
+    )
+    assert "[+5552 chars]" in rejects[-1]["symbol"], (
+        "the reject row does not say what it dropped: "
+        + str(rejects[-1]["symbol"])[:80]
+    )
+    _assert_every_row_in_bound(engine)
+    engine.stop()
+
+
+def test_the_signal_path_row_is_bounded_too(tmp_path: Path) -> None:
+    """The OTHER branch of the same writer, and it is reachable by an operator.
+
+    `_reject` fills `symbol` from a `Signal` when it has one, and that branch
+    was unclipped as well. FOUND BY MUTATION: removing the clip there left the
+    whole file green, so it was a second unpinned branch beside the one the
+    review found, and labelling it an unreachable backstop would have been
+    wrong because it is not unreachable.
+
+    Measured: `/buy <5600 chars> sl=0.9 tp=1.3` with `min_rr` high refuses with
+    `rr_below_min` and writes a `reject` row through the signal branch. The
+    operator typed that symbol rather than a model choosing it, which changes
+    who to blame and changes nothing about the row: the bound exists because
+    the row is machine-read, and a paste can breach it as easily as a reply
+    can.
+    """
+    engine = _engine(tmp_path)
+    engine.cfg.risk.min_rr = 99.0
+    reply = engine.handle_command(
+        TgCommand("1", 1, "/buy " + "E" * 5600 + " sl=0.9 tp=1.3", 1)
+    )
+    assert reply == "refused: rr_below_min", f"not the refusal this case needs: {reply!r}"
+
+    rejects = _rows_named(engine, "reject")
+    assert rejects, "the signal path wrote no reject row, so this proves nothing"
+    assert rejects[-1]["reason"] == "rr_below_min", rejects[-1]
+    assert "[+5552 chars]" in rejects[-1]["symbol"], (
+        "the signal-path row does not say what it dropped: "
+        + str(rejects[-1]["symbol"])[:80]
+    )
+    _assert_every_row_in_bound(engine)
+    engine.stop()
+
+
+def test_an_operator_typed_symbol_is_never_reshaped_on_a_reject_row(
+    tmp_path: Path,
+) -> None:
+    """THE CONTROL for clipping at the writer rather than at one caller.
+
+    `_reject` is reached by the telegram and auto legs too, where the symbol is
+    operator-configured and must come back whole. A clip at the single writer
+    is only safe if that is true, so it is asserted rather than assumed.
+    """
+    engine = _engine(tmp_path)
+    engine.cfg.risk.min_rr = 99.0
+    engine.handle_command(TgCommand("1", 1, "/buy EURUSD", 1))
+    rejects = _rows_named(engine, "reject")
+    assert rejects, "the operator command did not refuse, so nothing is on the record"
+    assert rejects[-1]["symbol"] == "EURUSD", (
+        f"an operator-typed symbol was reshaped: {rejects[-1]['symbol']!r}"
+    )
+    engine.stop()
+
+
 # --- 2. the two fields that were unbounded, each on its own ----------------
 
 
