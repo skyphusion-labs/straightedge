@@ -45,6 +45,9 @@ from straightedge.broker.paper import PaperBroker
 from straightedge.config import BotConfig
 from straightedge.engine import Engine
 from straightedge.journal import (
+    ADVICE_TURN_ROW_FIELDS,
+    CONDITIONAL_ROW_FIELDS,
+    ROW_ENVELOPE_FIELDS,
     RECORD_ROW_BOUND,
     RECORD_STRING_CHARS,
     clip_for_record,
@@ -447,6 +450,116 @@ def test_the_close_case_covers_the_SHIPPED_default_provider() -> None:
         "close path is unproven on the configuration customers actually run. "
         "Add it to PROVIDERS_UNDER_TEST, with its reply envelope in "
         "_close_the_model_asked_for."
+    )
+
+
+def _maximal_row(tmp_path: Path, monkeypatch) -> dict:  # type: ignore[no-untyped-def]
+    """The row the bound actually has to answer for: EVERY field at once.
+
+    Every schema field driven large, all four price fields non-finite, the
+    symbol clipped, #216's per-field violation classes present, AND a deferred
+    rotation marking the row. That last one is what makes this the maximal row
+    rather than merely a large one: `rotate_deferred` is conditional, so a
+    fixture that does not refuse a rotation measures a row that is 22 bytes
+    short of the worst case and cannot see the conditional key at all.
+
+    `_everything_large` is reused rather than rebuilt, so a field added to
+    `ADVICE_PROPERTIES` is driven here without anyone editing this file.
+    """
+    from straightedge import journal as journal_mod
+
+    engine = _engine(tmp_path, _claude_reply(_everything_large()))
+    assert Path(engine.journal.path).exists(), (
+        "no live journal, so `_rotate_if_needed` returns early, the deferral "
+        "branch is unreachable and this would measure a row short of maximal"
+    )
+
+    def _refuse(tmp, dest, **kw):  # type: ignore[no-untyped-def]
+        raise PermissionError(5, "Access is denied")
+
+    monkeypatch.setattr(journal_mod, "_ROTATE_BYTES", 1)
+    monkeypatch.setattr(journal_mod, "replace_retrying_on_share_conflict", _refuse)
+    engine.handle_command(TgCommand("1", 1, "/ask take a view", 1))
+    monkeypatch.undo()
+
+    row = _turn(engine)
+    engine.stop()
+    assert row.get("rotate_deferred") == 1, (
+        "the deferral did not fire, so this is not the maximal row and the "
+        f"conditional key set below is untested: {sorted(row)}"
+    )
+    return row
+
+
+def test_the_rows_fields_are_the_DECLARED_fields_in_both_directions(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """straightedge#287: the hand-kept list moved into the writer, it did not go.
+
+    `docs/CONTRACT.md` claimed a field added to `ADVICE_PROPERTIES` was
+    "covered without anyone remembering to". It contributes **0 bytes**, which
+    this file's own fixture cannot notice, because the fixture derives the
+    INPUT space from the schema while the ROW's fields were enumerated by hand
+    in `desk.py`. The bound answers for the row; nothing connected them.
+
+    This is the connection, and it gates BOTH directions, which is the whole
+    reason it is not just a narrowed sentence:
+
+    * a field JOURNALLED but not declared reds, which is the case that used to
+      ship an unmeasured contribution to the row;
+    * a field DECLARED that nothing journals reds too, because a declaration
+      nobody checks for emptiness decays into a wishlist, which is precisely
+      how the hand-kept list failed.
+
+    Asserted on the MAXIMAL row so the conditional keys are in scope. A fixture
+    without the deferred rotation cannot see `rotate_deferred` at all, and that
+    invisibility is what let a 15 character non-numeric field walk past an
+    invalidation list that enumerated only the numeric family.
+
+    WHAT THIS DOES NOT CLAIM. It gates the `advice_turn` row, which is the row
+    whose fields were hand-kept and the row the bound's derivation is written
+    against. Other events are not covered by it, and the declaration is not a
+    runtime check: a field journalled in production on a path no fixture drives
+    would still reach disk. That is the honest reach of a test-time gate, and
+    it is stated rather than left to be assumed.
+    """
+    row = _maximal_row(tmp_path, monkeypatch)
+    observed = set(row)
+    declared = (
+        ADVICE_TURN_ROW_FIELDS | ROW_ENVELOPE_FIELDS | CONDITIONAL_ROW_FIELDS
+    )
+
+    undeclared = sorted(observed - declared)
+    assert not undeclared, (
+        "these keys are on the advice_turn row and declared NOWHERE:\n  "
+        + "\n  ".join(undeclared)
+        + "\n\nEach one adds bytes to a row `journal.RECORD_ROW_BOUND` answers "
+        "for, so adding it invalidates the bound's derivation. Declare it in "
+        "`journal.ADVICE_TURN_ROW_FIELDS` (or CONDITIONAL_ROW_FIELDS if it is "
+        "only sometimes present), then RE-MEASURE the maximal row and "
+        "re-derive the bound rather than nudging it."
+    )
+
+    missing = sorted((ADVICE_TURN_ROW_FIELDS | ROW_ENVELOPE_FIELDS) - observed)
+    assert not missing, (
+        "these fields are declared as ALWAYS present and the maximal row does "
+        "not carry them:\n  "
+        + "\n  ".join(missing)
+        + "\n\nEither the writer stopped journalling them, in which case the "
+        "bound is now derived against a row that no longer exists, or the "
+        "declaration is aspirational. A declaration nobody empties is the "
+        "hand-kept list this replaced."
+    )
+
+    unreached = sorted(CONDITIONAL_ROW_FIELDS - observed)
+    assert not unreached, (
+        "these fields are declared CONDITIONAL and the maximal row does not "
+        "carry them:\n  "
+        + "\n  ".join(unreached)
+        + "\n\nThe maximal row is supposed to fire every condition at once. "
+        "If one of these is now unreachable from this fixture, the bound is "
+        "being asserted on a row smaller than the worst case, which is the "
+        "defect #283's field had before it was driven."
     )
 
 
