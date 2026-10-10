@@ -3152,6 +3152,24 @@ class Engine:
         if prior is None:
             return
         raw = prior.fields.get("tick_gap_ever_s", "")
+        if raw == watchdog.DAMAGED:
+            # THE OTHER HALF OF straightedge#328, and the half a write-side
+            # refusal alone gets wrong. `damaged` will not parse as a float, so
+            # without this branch it fell into the `except ValueError` below,
+            # the chain restarted from this process's own observation, and ONE
+            # RESTART laundered a damaged box history into a clean one. That is
+            # the shape the issue refused, arrived at by accident instead of on
+            # purpose, and the repin in
+            # `tests/test_the_damaged_box_figure_and_the_both_over_note.py`
+            # caught it.
+            #
+            # Carried as a non-finite figure rather than as a separate flag, so
+            # the existing `max` monotonicity keeps it sticky with no new state
+            # and the write-side `isfinite` check publishes `damaged` again.
+            # Deleting `journal.heartbeat` is still the one way out, because a
+            # process with no prior starts the chain at its own observation.
+            self._hb_gap_ever_s = math.inf
+            return
         if not raw:
             # An older desk published no such field. Its history is genuinely
             # unrecoverable, so the chain starts here. `tick_gap_max_s` is
