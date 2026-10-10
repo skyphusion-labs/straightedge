@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from straightedge.broker.mt4_live import BridgeTimeout
 from straightedge.broker.paper import PaperBroker
 from straightedge.config import BotConfig, SessionConfig
 from straightedge.constants import (
@@ -56,6 +57,10 @@ class SweepBroker:
     close_vanished    ticket -> an SL/TP filled between the read and our close: the
                       position really goes away and we get POSITION_CLOSED back.
     cancel_reject     order ticket -> the cancel is NOT executed.
+    cancel_raise      order ticket -> cancel RAISES, the shape a mailbox timeout
+                      has. Distinct from cancel_reject: a reject is a VERDICT
+                      from the venue, a raise is COULD NOT MEASURE, and the
+                      order may still be resting on the book (#264).
     hide_after        after this many positions() calls, report no positions
                       (a broker whose post-sweep read is wrong).
     raise_after       after this many positions() calls, raise (COULD NOT MEASURE).
@@ -68,6 +73,7 @@ class SweepBroker:
         self.close_raise: set[int] = set()
         self.close_vanished: set[int] = set()
         self.cancel_reject: set[int] = set()
+        self.cancel_raise: set[int] = set()
         self.hide_after: int | None = None
         self.raise_after: int | None = None
         self.positions_calls = 0
@@ -111,6 +117,12 @@ class SweepBroker:
 
     def cancel(self, ticket: int):
         self.cancel_calls.append(ticket)
+        if ticket in self.cancel_raise:
+            # The REAL class the mailbox bridge raises, not a stand-in: the
+            # sweep's arm is `except (RuntimeError, OSError, ValueError)` and
+            # `BridgeTimeout` is a `RuntimeError` subclass, so using the real
+            # one proves the real exception reaches the real handler.
+            raise BridgeTimeout("mt4 bridge timeout")
         if ticket in self.cancel_reject:
             return OrderResult(retcode=TRADE_RETCODE_REJECT, comment="cancel refused")
         return self._inner.cancel(ticket)
@@ -472,6 +484,67 @@ def test_failed_cancel_is_reported(tmp_path: Path) -> None:
     assert len(ev) == 1
     assert ev[0]["order_survivors"] == [order]
     assert "1 working order" in _format_incomplete_text(tmp_path)
+
+
+def test_cancel_that_raises_does_not_abort_the_sweep(tmp_path: Path) -> None:
+    """A cancel that could not be MEASURED is residual exposure. #264.
+
+    The twin of `test_close_that_raises_does_not_abort_the_sweep` for the
+    pending half, and the distinction from `test_failed_cancel_is_reported`
+    one function up is the whole point: a REJECT is a verdict from the venue,
+    so the order is known to still be resting; a RAISE is COULD NOT MEASURE,
+    and the order may or may not have been pulled. The sweep must treat both
+    as survivors, and it must say which happened, because only one of them
+    means the venue was reachable.
+
+    Why this needed a double that can fail: straightedge#264 measured `cancel`
+    as one of three seams whose only doubles could not raise, so the sweep's
+    `except (RuntimeError, OSError, ValueError)` arm around `broker.cancel`
+    was never taken by any test. `flatten` is the SAFETY path, reached by
+    daily-loss and drawdown, and `flatten_incomplete` is the one event in
+    `telegram.ALWAYS_NOTIFY_EVENTS`, so a sweep that silently reported clean
+    here is the worst available failure.
+
+    Two orders, and the raise is on the FIRST, so "did the sweep stop early"
+    is observable rather than assumed.
+    """
+    inner = _paper()
+    broker = SweepBroker(inner)
+    first, second = _pending(inner), _pending(inner)
+    broker.cancel_raise.add(first)
+    engine = _engine(tmp_path, broker)
+    engine.start()
+    broker.arm()
+
+    report = engine.flatten("daily_loss")
+    print("DENOMINATOR:", _denominator(report))
+
+    assert broker.cancel_calls == [first, second], (
+        f"the sweep stopped at the raising cancel: {broker.cancel_calls}"
+    )
+    assert report.orders_requested == 2
+    assert report.orders_confirmed_cancelled == 1, (
+        "the second order was reachable and must still be counted cancelled"
+    )
+    assert report.order_survivors == (first,)
+    assert not report.complete, (
+        "a cancel nobody could measure was reported as a clean sweep"
+    )
+    assert engine.halted, "an exception mid-sweep must still stop new entries"
+
+    failed = _events(tmp_path, "cancel_failed")
+    assert len(failed) == 1, f"cancel_failed rows: {failed}"
+    row = failed[0]
+    assert row["ticket"] == first
+    # COULD NOT MEASURE carries the exception; a VERDICT carries a retcode.
+    # Keying the operator's record on which arm ran is what separates "the
+    # venue refused" from "we never heard back".
+    assert row.get("error"), f"the raise left no error on the record: {row}"
+    assert "retcode" not in row, (
+        "a cancel that raised reported a retcode, which claims a venue verdict "
+        "that never arrived"
+    )
+    assert len(_events(tmp_path, "flatten_incomplete")) == 1
 
 
 # --- 7. the clean path still records its denominator -----------------------
