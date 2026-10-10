@@ -39,6 +39,8 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
+import pytest
+
 from straightedge.broker.paper import PaperBroker
 from straightedge.config import BotConfig
 from straightedge.engine import Engine
@@ -76,6 +78,13 @@ def _claude_reply(obj: dict) -> dict:
     return {"content": [{"type": "text", "text": json.dumps(obj)}]}
 
 
+#: NOTE the default here is `claude` and the SHIPPED default is `grok`
+#: (`AdviceConfig.provider`, `config.example.toml`, and the `AI_PROVIDER`
+#: fallback all say `grok`). This is a test-file convenience, because most cases
+#: in this file want the structured path. It has already misled one reader into
+#: filing straightedge#284 on the premise that `provider="grok"` was a departure
+#: from the default when it is the shipped value, so it is written down rather
+#: than left to be re-derived.
 def _engine(tmp_path: Path, *payloads: dict, provider: str = "claude") -> Engine:
     cfg = BotConfig()
     cfg.journal_path = str(tmp_path / "j.jsonl")
@@ -316,8 +325,38 @@ def test_the_same_reply_through_the_bare_parser_is_also_in_bound(
     engine.stop()
 
 
+#: The vantages the close case is driven on. Declared once because the pin
+#: below reads it: a second hand-written copy in the parametrize list is the
+#: drift this file already warns about elsewhere.
+PROVIDERS_UNDER_TEST = ("claude", "grok")
+
+
+#: The close reply, in whichever envelope the provider under test reads.
+#:
+#: ONE payload, two envelopes, because the thing being proven is that the path
+#: is not provider-specific. Two hand-built payloads could drift and the test
+#: would still pass, which is the "consumer that rebuilds what it should call"
+#: shape `docs/TESTING.md` warns about.
+#:
+#: THE `text` KEY ON THE CLAUDE ARM IS LOAD-BEARING. `text` is `required` in
+#: `ADVICE_FORMAT`, so a claude payload without it is a SCHEMA VIOLATION
+#: (`_schema_violations` returns `[("text", "missing")]`), `action` is forced to
+#: `hold`, the close never stages, and NO `reject` row is written at all. Drop
+#: it and this case stops measuring anything on that arm. The grok and computer
+#: paths have no schema gate, so they never noticed it was absent.
+def _close_the_model_asked_for(provider: str) -> dict:
+    tail = {
+        "action": "close", "symbol": "E" * 5600, "ticket": None,
+        "sl": None, "tp": None, "limit": None, "stop": None, "summary": "s",
+    }
+    if provider == "claude":
+        return _claude_reply(dict(tail, text="p"))
+    return {"choices": [{"message": {"content": "p\n" + json.dumps(tail)}}]}
+
+
+@pytest.mark.parametrize("provider", PROVIDERS_UNDER_TEST)
 def test_a_close_the_model_asked_for_bounds_every_row_it_writes(
-    tmp_path: Path,
+    tmp_path: Path, provider: str
 ) -> None:
     """The PATH no field derivation could reach, found in review.
 
@@ -338,16 +377,44 @@ def test_a_close_the_model_asked_for_bounds_every_row_it_writes(
     is at `_reject` rather than at the three call sites, because that is the
     single writer of every `reject` row and a fourth site would otherwise
     repeat this.
+
+    PARAMETERISED OVER BOTH PROVIDERS (straightedge#284), because the sentence
+    above claims the vantage is not `grok`-only and only `grok` was driven. A
+    docstring was doing the fixture's job.
+
+    TWO THINGS THE ISSUE ASSUMED THAT MEASUREMENT CONTRADICTS, recorded because
+    both would have produced a worse test.
+
+    **`grok` IS the product default**, so the original case was already driving
+    it: `AdviceConfig.provider` defaults to `"grok"` (`config.py`),
+    `config.example.toml` ships `provider = "grok"`, and the `AI_PROVIDER`
+    fallback is `"grok"`. What reads as a departure from the default is
+    `_engine`'s OWN default of `"claude"`, which is a test-file convenience and
+    not the shipped shape. The claim worth proving was never "drive the
+    default", it was "this is not provider-specific".
+
+    **And the claude arm does NOT need different assertions.** The issue
+    expected the schema gate to force `hold` here, blank the symbol and write no
+    `reject` row, which would have meant two cases. Measured: that happens only
+    when the fixture omits `text`, a `required` property, so the hold was an
+    artifact of an INCOMPLETE PAYLOAD rather than a property of the path. With
+    the payload schema-complete, both arms write one `reject` row, both read
+    `close_needs_ticket`, both carry the identical clipped symbol, and both rows
+    measure 212 bytes. Encoding that difference as two cases would have frozen a
+    fixture bug into the suite as if it were behaviour.
     """
-    engine = _engine(
-        tmp_path,
-        {"choices": [{"message": {"content": "p\n" + json.dumps({
-            "action": "close", "symbol": "E" * 5600, "ticket": None,
-            "sl": None, "tp": None, "limit": None, "stop": None, "summary": "s",
-        })}}]},
-        provider="grok",
-    )
+    engine = _engine(tmp_path, _close_the_model_asked_for(provider), provider=provider)
     engine.handle_command(TgCommand("1", 1, "/ask flatten it", 1))
+
+    turn = _turn(engine)
+    assert turn.get("action") == "close", (
+        "the turn did not reach the close path on provider "
+        + provider
+        + f", so nothing below measures the reject row: action={turn.get('action')!r} "
+        + f"violations={turn.get('violations')!r}. On the claude arm the usual "
+        "cause is a payload missing a `required` schema property, which forces "
+        "action to hold; see _close_the_model_asked_for."
+    )
 
     rejects = _rows_named(engine, "reject")
     assert rejects, "the close never reached the reject path, so this proves nothing"
@@ -360,6 +427,30 @@ def test_a_close_the_model_asked_for_bounds_every_row_it_writes(
     )
     _assert_every_row_in_bound(engine)
     engine.stop()
+
+
+def test_the_close_case_covers_the_SHIPPED_default_provider() -> None:
+    """The docstring above says `grok` is the default. Assert it, do not say it.
+
+    straightedge#284 was filed believing the case did not drive the default
+    provider, and the belief was reasonable: `_engine` defaults to `"claude"`,
+    so `provider="grok"` reads as an explicit departure from the default rather
+    than as the shipped value. It is the test file's convenience that differs
+    from the product, not the case.
+
+    Leaving that in prose is the exact defect #284 fixed one level up, where a
+    docstring asserted a vantage the fixture never drove. So the shipped default
+    is read from the config here, and if it ever moves to a provider this case
+    does not drive, this reds and names it.
+    """
+    shipped = BotConfig().advice.provider
+    assert shipped in PROVIDERS_UNDER_TEST, (
+        f"the shipped default provider is {shipped!r}, which this case does not "
+        f"drive (it drives {list(PROVIDERS_UNDER_TEST)}), so the bound on the "
+        "close path is unproven on the configuration customers actually run. "
+        "Add it to PROVIDERS_UNDER_TEST, with its reply envelope in "
+        "_close_the_model_asked_for."
+    )
 
 
 def _maximal_row(tmp_path: Path, monkeypatch) -> dict:  # type: ignore[no-untyped-def]
