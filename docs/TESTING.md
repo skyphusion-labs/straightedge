@@ -305,6 +305,127 @@ This is the same argument this file makes for tests, one level up, and it
 applies to verification of any kind. If your evidence is "I checked it two
 ways", ask what either way would have printed had the thing been true.
 
+## A substitute that cannot fail the way the real thing does
+
+Every other section here is about a check that cannot go red. This is the other
+side of that family, and it is the one that cost the most: a **double** that
+cannot fail the way the thing it replaces fails. The suite is green, every
+assertion is real, and an entire class of defect is unreachable because the
+stand-in cannot enter the state where it lives.
+
+Measured, straightedge#232. `Desk.handle()` ended in
+`except (ValueError, RuntimeError): return redact_text(str(exc))`. The operator
+got a sentence; the journal got nothing. On the advice path
+`record_advice_turn()` fires BEFORE `advisor.ask()`, deliberately, so a turn
+that then raised had been charged against the operator's daily cap with no
+record it was ever attempted: a budget that shrinks with nothing to point at,
+in the money lane.
+
+**1457 tests were green and none of them could see it.** Not because they were
+weak. Because every transport double in the suite RETURNS A PAYLOAD, and a
+payload cannot be an HTTP 502. The defect lived in the error class, not in a
+value, so the entire suite exercised the parse-and-decide path and nothing
+exercised the path where the parse never happens. It was found by a live run
+against a real Worker under `wrangler dev`, which is the whole argument for
+the live run being part of done rather than ceremony.
+
+### The question to ask, which is not the one that comes naturally
+
+The instinct is to ask whether the double is REALISTIC. That question is
+unbounded and has no answer. Ask instead:
+
+> **For each failure path a test claims to cover, can the double actually
+> ENTER that state?**
+
+Bounded, and answerable in a minute: read the real implementation, list what it
+does when it fails, then check which of those your double can produce. From
+#232, `UrlLibTransport.post_json`:
+
+| mode | real failure | what it raises |
+| --- | --- | --- |
+| 1 | HTTP non-2xx | `TelegramError(f"telegram http {status}", status=, retry_after=)` |
+| 2 | `URLError` (refused, DNS, timeout) | `TelegramError("telegram http failed")` |
+| 3 | body is not JSON | `TelegramError("telegram non-json")` |
+| 4 | provider returned an error field | `RuntimeError(str(data["error"]))` |
+| 5 | reply empty | `RuntimeError("computer empty")` |
+
+A double raising bare `RuntimeError` reproduces 4 and 5 exactly, because those
+genuinely are bare `RuntimeError`s raised in `llm.py`. It only APPROXIMATES
+1, 2 and 3: the real class is `TelegramError`, a `RuntimeError` **subclass**
+carrying `status` and `retry_after`. Close enough to pass, and it proves the
+handler journals when something raises **without** proving the handler is
+reachable by the thing that actually raises. Those are different claims.
+
+The repair needed no double at all: point the real `UrlLibTransport` at a real
+closed loopback port, bound and released so it is certainly closed, and mode 2
+happens for real inside real urllib. Offline, immediate, and the exception is
+the real class (measured: `TelegramError`, mro
+`TelegramError -> RuntimeError -> Exception`, message `telegram http failed`).
+**When the real thing can be made to fail cheaply, that beats any double.**
+
+### Three honest answers, and only three
+
+When a double cannot enter a failure path:
+
+1. **Make it enter the state** -- ideally by using the real implementation, as
+   above, since a closed port and a bad payload are usually free.
+2. **Disclaim the path in the test** -- say which modes are covered and which
+   are not. A named gap is a finding; an unnamed one is a false claim.
+3. **Cite a live run** -- a recorded run against the real thing is a peer of a
+   test here, not a lesser substitute, and for some paths it is the only
+   instrument.
+
+What is not an answer is leaving the claim unqualified. The suite must not
+claim coverage of a path no double in it can reach.
+
+### The mechanism, and exactly how far it reaches
+
+`tests/double_census.py`. It reads the seam names from the `Protocol` classes
+in `src/` (so adding a method to `Broker` or `Transport` widens the census
+rather than silently leaving a new seam uncounted), finds every class in
+`tests/` implementing one, and reports which of those doubles contain a `raise`
+at any depth.
+
+```
+$ python3 tests/double_census.py
+seam methods implemented by a test double: 14
+   post_json              doubles= 21  can_raise=  4
+ * working                doubles=  3  can_raise=  0
+...
+SEAMS WITH NO FAILING DOUBLE (3):
+  cancel, check_working, working
+```
+
+Exit 1 when some seam has doubles but none that can fail, 0 when every
+implemented seam has at least one, and **9 when it found no `Protocol` classes
+at all**, because a census that measured nothing is not a clean result.
+
+A double with no `raise` is **not** automatically a defect. Most tests
+exercise a happy path and should. What the census makes checkable is the
+CLAIM: if no double for a seam can fail, the suite covers no failure path
+through that seam, and one of the three answers above is owed.
+
+**Now the limit, stated because this document is about claims that outlive
+their evidence and a mechanism shipped with an unverified claim would be this
+file committing its own subject.** The census would **not** have caught #232.
+Measured: `post_json` already had four raising doubles at the time
+(`test_desk.py:Boom`, `test_telegram.py:FakeTransport`, `SeqTransport`,
+`Boom`), so the seam was not blind by this census's definition. What was
+missing was narrower: no test drove the desk's error path and asserted the
+record. So this census detects a strictly weaker condition than the defect
+that motivated it -- a seam where NO double can fail -- and it is necessary,
+not sufficient.
+
+Catching #232's exact shape mechanically would need the CLAIM to be
+machine-readable: a test that covers a failure path through a seam would have
+to declare which mode it covers, and the census would then check that a double
+can enter each declared mode. That is a real design and it is not built,
+because it needs suite-wide adoption rather than one file. Until then the
+question at the top of this section is applied by the author, and the census
+only catches the blind-seam case. **Three seams are blind today**
+(`cancel`, `check_working`, `working`), which is a finding this file is
+raising, not one it has fixed.
+
 ## Execute the documentation, do not review it
 
 Every procedure in a document rots silently, because reading one cannot tell a
@@ -324,17 +445,30 @@ branch:
 
 | domain | command naming the domain | files | with fenced blocks | blocks |
 | --- | --- | --- | --- | --- |
-| `docs/*.md` plus `README.md` | `git ls-files 'docs/*.md' README.md` | 11 | 5 | 38 |
-| `**/*.md` across the repo | `git ls-files '*.md'` | 18 | 11 | 57 |
+| `docs/*.md` plus `README.md` | `git ls-files 'docs/*.md' README.md` | 11 | 6 | 41 |
+| `**/*.md` across the repo | `git ls-files '*.md'` | 18 | 12 | 64 |
 
-**Those figures are pinned to `main` at `f98984b`, and the pin is the only
-reason they are quotable.** This file is not in them yet: it carries 2 fenced
-blocks and changes no other document, so merging it adds 2 to both `blocks`
-columns (38 to 40, 57 to 59) and one to both `with fenced blocks` columns (5 to
-6, 11 to 12), since on `main` this file holds none. Past that, do
-not read the number, run the command, because **both rows count THIS file, so
-both move when it does.** That is the controls table's self-inclusion one
-domain wider.
+**Those figures are MEASURED AT THE TIP THAT CARRIES THEM, not predicted for a
+future merge, and that change is deliberate.** Earlier versions of this
+paragraph pinned the counts to a `main` that did not yet contain this file and
+then stated the delta merging it would produce. That design has now rotted
+three times in a row, so the table states what the commit it ships in actually
+contains, and there is no arithmetic left to go stale.
+
+**The three readings are worth keeping, because together they are the argument
+for the rule rather than an anecdote.** At `f98984b` the row read 18/11/57 and
+predicted 59 after this file merged. It merged, and the repo-wide figure was
+**62**. While the pull request adding the section above was open, #240 landed
+and it became **64**. The `docs/` row, meanwhile, hit its predicted 40 exactly
+and has only moved by this file's own additions. So the broad domain moved
+three times without this file changing at all, and the narrow one never moved
+except when it did: **a markdown commit may move the count and may not, which
+means you can infer neither staleness from the fact that documentation changed
+nor freshness from the fact that this file did not.** Re-derive, or quote a ref.
+
+Past that, do not read the number, run the command, because **both rows count
+THIS file, so both move when it does.** That is the controls table's
+self-inclusion one domain wider.
 
 **An unpinned corpus count is stale by default, and this one went stale twice
 while the pull request was open.** An earlier version of this row read 56,
