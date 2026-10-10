@@ -66,9 +66,9 @@ def test_check_fails_when_an_entry_is_written_straight_into_the_changelog(tmp_pa
     clean, never that the check can see the defect.
     """
     (tmp_path / "changelog.d").mkdir()
-    (tmp_path / "changelog.d" / "1-a-fragment.md").write_text("### A fragment\n\n- x\n")
+    (tmp_path / "changelog.d" / "1-a-fragment.md").write_text("### A fragment\n\n- x\n", encoding="utf-8")
     (tmp_path / "CHANGELOG.md").write_text(
-        "# Changelog\n\n## Unreleased\n\n### A stray entry\n\n- x\n\n## 1.0.0\n\n### Old\n"
+        "# Changelog\n\n## Unreleased\n\n### A stray entry\n\n- x\n\n## 1.0.0\n\n### Old\n", encoding="utf-8"
     )
     out = run("--check", "--root", str(tmp_path))
     assert out.returncode == 1, out.stdout
@@ -77,8 +77,8 @@ def test_check_fails_when_an_entry_is_written_straight_into_the_changelog(tmp_pa
 
 def test_a_release_refuses_to_assemble_a_malformed_fragment(tmp_path) -> None:
     (tmp_path / "changelog.d").mkdir()
-    (tmp_path / "changelog.d" / "Bad_Name.md").write_text("### x\n\n- y\n")
-    (tmp_path / "CHANGELOG.md").write_text("# Changelog\n\n## Unreleased\n\n## 1.0.0\n\n### Old\n")
+    (tmp_path / "changelog.d" / "Bad_Name.md").write_text("### x\n\n- y\n", encoding="utf-8")
+    (tmp_path / "CHANGELOG.md").write_text("# Changelog\n\n## Unreleased\n\n## 1.0.0\n\n### Old\n", encoding="utf-8")
     out = run("--version", "9.9.9", "--root", str(tmp_path))
     assert out.returncode == 1, out.stdout
     assert "does not match" in out.stdout, out.stdout
@@ -93,16 +93,16 @@ def test_a_release_assembles_in_issue_order_and_clears_the_directory(tmp_path) -
     """
     d = tmp_path / "changelog.d"
     d.mkdir()
-    (d / "217-later-issue.md").write_text("### Later issue (issue #217)\n\n- later\n")
-    (d / "9-earlier-issue.md").write_text("### Earlier issue (issue #9)\n\n- earlier\n")
+    (d / "217-later-issue.md").write_text("### Later issue (issue #217)\n\n- later\n", encoding="utf-8")
+    (d / "9-earlier-issue.md").write_text("### Earlier issue (issue #9)\n\n- earlier\n", encoding="utf-8")
     (tmp_path / "CHANGELOG.md").write_text(
-        "# Changelog\n\n## Unreleased\n\n## 1.0.0\n\n### Old entry\n\n- old\n"
+        "# Changelog\n\n## Unreleased\n\n## 1.0.0\n\n### Old entry\n\n- old\n", encoding="utf-8"
     )
 
     out = run("--version", "1.1.0", "--apply", "--root", str(tmp_path))
     assert out.returncode == 0, out.stdout + out.stderr
 
-    text = (tmp_path / "CHANGELOG.md").read_text()
+    text = (tmp_path / "CHANGELOG.md").read_text(encoding="utf-8")
     assert "## 1.1.0" in text
     assert "## Unreleased" in text, "the empty Unreleased heading must survive"
     assert "### Old entry" in text, "the released section must be untouched"
@@ -114,14 +114,14 @@ def test_a_release_assembles_in_issue_order_and_clears_the_directory(tmp_path) -
 def test_a_dry_run_changes_nothing(tmp_path) -> None:
     d = tmp_path / "changelog.d"
     d.mkdir()
-    (d / "1-only.md").write_text("### Only (issue #1)\n\n- x\n")
+    (d / "1-only.md").write_text("### Only (issue #1)\n\n- x\n", encoding="utf-8")
     cl = tmp_path / "CHANGELOG.md"
-    cl.write_text("# Changelog\n\n## Unreleased\n\n## 1.0.0\n\n### Old\n")
-    before = cl.read_text()
+    cl.write_text("# Changelog\n\n## Unreleased\n\n## 1.0.0\n\n### Old\n", encoding="utf-8")
+    before = cl.read_text(encoding="utf-8")
 
     out = run("--version", "2.0.0", "--root", str(tmp_path))
     assert out.returncode == 0, out.stdout
-    assert cl.read_text() == before, "a dry run must not write"
+    assert cl.read_text(encoding="utf-8") == before, "a dry run must not write"
     assert list(d.glob("*.md")) != [], "a dry run must not delete"
     assert "## 2.0.0" in out.stdout, "a dry run must SHOW what it would write"
 
@@ -130,7 +130,7 @@ def test_a_dry_run_changes_nothing(tmp_path) -> None:
 def test_accepted_names(tmp_path, name: str) -> None:
     d = tmp_path / "changelog.d"
     d.mkdir()
-    (d / name).write_text("### Heading\n\n- x\n")
-    (tmp_path / "CHANGELOG.md").write_text("# Changelog\n\n## Unreleased\n\n## 1.0.0\n\n### Old\n")
+    (d / name).write_text("### Heading\n\n- x\n", encoding="utf-8")
+    (tmp_path / "CHANGELOG.md").write_text("# Changelog\n\n## Unreleased\n\n## 1.0.0\n\n### Old\n", encoding="utf-8")
     out = run("--check", "--root", str(tmp_path))
     assert out.returncode == 0, out.stdout

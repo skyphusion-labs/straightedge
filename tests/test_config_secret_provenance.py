@@ -407,7 +407,7 @@ def test_the_start_record_carries_the_provenance(tmp_path: Path) -> None:
     engine.start()
     engine.stop()
 
-    rows = [json.loads(x) for x in Path(cfg.journal_path).read_text().splitlines() if x.strip()]
+    rows = [json.loads(x) for x in Path(cfg.journal_path).read_text(encoding="utf-8").splitlines() if x.strip()]
     start = [r for r in rows if r.get("event") == "start"]
     assert start, "no start row was written: the assertions below would be vacuous"
     assert start[0]["settings_from_file"] == ["telegram.token"]
