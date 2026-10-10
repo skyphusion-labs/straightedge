@@ -414,12 +414,53 @@ poll earlier: **every row present and none finished**, 12 of 12 not completed,
 which reads as twelve rows of progress rather than as nothing having run.
 
 **So neither a pass count nor a row count is sufficient, and they fail
-differently.** A row count misses ABSENT; a pass count misses all four. The
-reading that separates the end state from every other is `rows >= <the required
-set>` **and** zero non-COMPLETED **and** the required contexts present BY NAME.
-Read the floor off the rollup rather than from a message, too: a floor told to
-you can be stale by one merge, and the presence or absence of a newly added row
-is itself the evidence for which floor applies.
+differently.** A row count misses ABSENT; a pass count misses all four. That is
+the reason to PRINT the row count as context.
+
+**But do not compare it to a constant, and this is where a first version of
+this entry was wrong.** The row count is a property of the BRANCH's workflow
+file; the required contexts are a property of the RULESET. **Those are different
+objects and only the second one gates.** Measured across the open pull requests
+at one instant: three different row counts were live simultaneously, because
+each branch runs the workflow its own head carries. A branch whose head predates
+a workflow change keeps producing the old count until it currents, and that is
+correct rather than a missing row.
+
+The worked counterexample is a dependency bump whose head carries an older
+`ci.yml` with five jobs: **it legitimately produces TEN rows, so a floor of 14
+rejects it on the count alone, before anything is known about its
+conclusions.** Nothing need be said about whether that branch passes; the
+defect is in the denominator, not in the verdict, and the argument is cleaner
+without one.
+
+**So the criterion is the by-NAME half on its own:** the required contexts
+PRESENT and SUCCESS, the language-specific `Analyze` jobs COMPLETED, and zero
+non-COMPLETED rows. Read which contexts are required from
+`/rules/branches/main` rather than hard-coding them, as above.
+
+**One measured edge on the conclusion half.** A row can be COMPLETED with a
+conclusion that is neither success nor failure: on that same dependency bump,
+`CodeQL` reads `status=completed conclusion=neutral`, measured through
+`repos/{o}/{r}/commits/{sha}/check-runs` rather than off the rollup label. So a
+gate asserting every row is SUCCESS rejects a branch that is fine, while
+`zero non-COMPLETED` accepts it correctly. **Treat `neutral` and `skipped` as
+acceptable conclusions and assert SUCCESS only on the contexts the ruleset
+actually requires.**
+
+That row was first described to this file as a sixth state, `skipping`, present
+and never running. **It is not: it is COMPLETED with a neutral conclusion, and
+the table above stays at five.** Recorded because the measurement is the only
+reason to know that, and a sixth state added on one unmeasured observation
+would have been this entry's own subject.
+
+**And one field that cannot be used as a check in either direction.**
+`closingIssuesReferences` on a pull request is empty for PRs that do close an
+issue (measured: one closed its issue with the field empty), and a populated
+field does not promise the close either, because the squash body is editable at
+merge time. **So neither emptiness nor content is evidence**, and the only
+reliable check is reading the ISSUE state back after the merge. That is the same
+record-versus-artifact distinction as everything else here: the pull request
+object is not the issue.
 
 `repos/{owner}/{repo}/rules/branches/main` needs no elevated scope: it answers
 for a plain collaborator token, which is why reading the rule is preferable to
