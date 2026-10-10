@@ -148,6 +148,17 @@ STATE_UNKNOWN = "UNKNOWN"
 #: value the desk published.
 _UNKNOWN_RUN = "unknown"
 
+#: What the BOX figures publish when the stored value is not a measurement.
+#:
+#: `damaged` and NOT `unmeasured`, which this file already uses for `deployed`.
+#: "no history yet" and "history destroyed" lead an operator to different
+#: actions: the first says start the chain here, the second says the figure in
+#: this file cannot be trusted and the only way to clear it also destroys the
+#: box history straightedge#190 exists to preserve. Collapsing them to reuse an
+#: existing constant would hide the thing the field exists to convey
+#: (straightedge#328).
+DAMAGED = "damaged"
+
 #: Exit codes. Distinct per state on purpose: a scheduled task, a batch file or
 #: a human can branch on the state without parsing prose, and collapsing
 #: "ticking but disarmed" into either 0 or 1 is the conflation this module
@@ -277,7 +288,35 @@ def render(
     # again; `over_budget_ever` is this BOX and must not be erasable by a
     # restart (straightedge#153). `Engine._restore_gap_ever` carries the
     # design note and the one thing the pair cannot see.
-    over_ever = 1 if tick_gap_ever_s > tick_budget_s else 0
+    # REFUSED AT THE WRITE, and said on the surface rather than silently
+    # dropped. straightedge#328, which is two shapes on purpose because they
+    # close different directions.
+    #
+    # A non-finite box figure reaches here from a DAMAGED heartbeat:
+    # `inf`, `Infinity` and `1e400` all parse, all survive `max`, and before
+    # this branch all published `tick_gap_ever_s=inf over_budget_ever=1`,
+    # which is a breach claim NO PROCESS OBSERVED, repeated to the operator by
+    # `decide`, and sticky because every later write folds it with `max`. Only
+    # deleting the heartbeat cleared it, and that also destroys the box history
+    # straightedge#190 exists to preserve, so the only remedy destroyed the
+    # thing being remedied.
+    #
+    # Refusing it at the RESTORE instead was rejected: that converts a damaged
+    # file into a clean box history, and reading absence as clean is the one
+    # thing straightedge#190 refuses everywhere else. Refusing it HERE also
+    # catches a non-finite arriving from a future code path rather than only
+    # from a file, which is the symmetry straightedge#231 took for the journal.
+    #
+    # `over_budget_ever` goes `damaged` too, and that is the point rather than
+    # tidiness: a figure that is not a measurement cannot answer whether the
+    # box breached, and publishing either `1` or `0` from it would be inventing
+    # the answer in one direction or the other.
+    if math.isfinite(tick_gap_ever_s):
+        ever_gap = f"{tick_gap_ever_s:.1f}"
+        ever_over = "1" if tick_gap_ever_s > tick_budget_s else "0"
+    else:
+        ever_gap = DAMAGED
+        ever_over = DAMAGED
     lines = [
         ts.isoformat(),
         f"blocked={blocked}",
@@ -286,8 +325,8 @@ def render(
         f"tick_budget_s={int(tick_budget_s)}",
         f"tick_gap_max_s={tick_gap_max_s:.1f}",
         f"over_budget={over}",
-        f"tick_gap_ever_s={tick_gap_ever_s:.1f}",
-        f"over_budget_ever={over_ever}",
+        f"tick_gap_ever_s={ever_gap}",
+        f"over_budget_ever={ever_over}",
         # straightedge#217. A COUNT and not a boolean, because "the journal
         # could not take a breach row" can happen more than once and an
         # operator reconstructing a week needs to know how many occurrences are
@@ -570,7 +609,23 @@ def decide(path: str | Path, *, now: datetime, cfg: Any = None) -> Report:
             "STALE. It was NOT widened automatically."
         )
     ever = hb.fields.get("over_budget_ever", "")
-    if ever == "1" and hb.fields.get("over_budget") != "1":
+    if ever == DAMAGED:
+        # Neither of the two notes below is sayable here, and that is the whole
+        # reason this field has a third state. "this BOX has breached" would be
+        # a claim no process observed, and the no-field note would read the
+        # damage as an upgrade gap and tell the operator to start the chain
+        # here, which is the clean-history reading straightedge#190 refuses.
+        notes.append(
+            "NOTE: this box's history is UNREADABLE. The stored "
+            f"tick_gap_ever_s was not a measurement, so it is published as "
+            f"{DAMAGED} rather than as a number, and whether this box has ever "
+            "breached its budget cannot be answered from this file. The "
+            "per-process figures above are unaffected and still measure this "
+            "process. Clearing it means deleting journal.heartbeat, which also "
+            "discards the box history, so do that deliberately and not as "
+            "routine cleanup."
+        )
+    elif ever == "1" and hb.fields.get("over_budget") != "1":
         # The reading straightedge#153 is about. A desk restarted after a bad
         # episode publishes its cleanest possible history, so the per-process
         # figure alone reassures an operator at exactly the moment it is least

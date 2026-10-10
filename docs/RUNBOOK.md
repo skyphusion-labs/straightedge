@@ -374,8 +374,15 @@ Ask `tick_gap_ever_s` if this box has EVER been slow.
 `over_budget_ever=1` with `over_budget=0` means a breach before the restart.
 Report that too.
 The book did not get smaller because the desk restarted.
+`tick_gap_ever_s=damaged` with `over_budget_ever=damaged` means the stored
+box figure was not a measurement, so this file cannot say whether the box has
+ever breached.
+It is not a breach and it is not a clean history. It is unreadable.
+The per-process pair above it is still good. Read that for the live process.
 Do not delete `journal.heartbeat`.
 That file carries the box history. Deleting it resets `tick_gap_ever_s`.
+That is also the only way to clear `damaged`, so clearing it costs you the box
+history. Do that deliberately, and not as routine cleanup.
 An older desk writes no `over_budget_ever`.
 Then `watch` says it cannot report the box history.
 It does NOT read the missing field as clean.
