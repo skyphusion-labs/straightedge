@@ -1,0 +1,126 @@
+name: main-run-watch
+
+# Surfaces a commit on `main` whose required run did not succeed.
+#
+# WHY THIS IS A SEPARATE WORKFLOW RATHER THAN A STEP IN `ci.yml`
+# A cancelled run cannot report its own cancellation: the reporting step is
+# cancelled with everything else. `workflow_run` with `types: [completed]`
+# fires whatever the conclusion, which is the only way to observe the case that
+# accounted for 18 of the 21 unverified commits on `main` before #329.
+#
+# WHY IT HAS A `workflow_dispatch` PATH
+# A `workflow_run` workflow only ever runs from the default branch, so it cannot
+# be exercised from a pull request, and letting `main` actually fail to test a
+# detector is not acceptable. The dispatch path drives this real workflow red on
+# demand with a synthetic conclusion, so its alarm has been watched to fire
+# before anyone relies on its silence. Synthetic output is labelled in the ISSUE
+# TITLE and lands on a separate tracker, so it can never be mistaken for a real
+# alert or pollute the real one.
+
+on:
+  workflow_run:
+    workflows: [ci, code-coverage]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      conclusion:
+        description: Synthetic conclusion to exercise this notifier with
+        required: true
+        default: cancelled
+        type: choice
+        options:
+          - cancelled
+          - failure
+          - timed_out
+          - success
+
+# Minimum scope, named explicitly. A workflow that inherits the token's full
+# scope is the same shape as a ruleset with no `ref_name`: it reads as
+# configured and bounds nothing.
+permissions:
+  contents: read
+  issues: write
+
+# The one case where serialising is correct rather than wasteful. `ci` and
+# `code-coverage` can both complete for the same sha, so two runs of this
+# workflow can race to create the SAME tracking issue and produce two. One
+# group with no cancellation makes them queue instead. Note `cancel-in-progress`
+# is false on purpose: cancelling an observer is how the observation is lost,
+# which is the defect this workflow exists to report.
+concurrency:
+  group: main-run-watch
+  cancel-in-progress: false
+
+jobs:
+  surface:
+    name: surface
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+
+      # A guard nobody has watched fail is decoration, so the controls run
+      # before the verdict and the suite prints its own case count.
+      - name: self-test the gate (positive and negative controls)
+        run: python3 tests/run_outcome_gate.py --self-test
+
+      - name: decide whether this run is worth surfacing
+        id: decide
+        env:
+          WR_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+          WR_NAME: ${{ github.event.workflow_run.name }}
+          WR_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          WR_SHA: ${{ github.event.workflow_run.head_sha }}
+          WR_URL: ${{ github.event.workflow_run.html_url }}
+          DISPATCH_CONCLUSION: ${{ inputs.conclusion }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" = "workflow_dispatch" ]; then
+            # Synthetic. Branch is forced to main so the gate evaluates rather
+            # than short-circuiting, and --synthetic is what labels the output.
+            out=$(python3 tests/run_outcome_gate.py \
+              --conclusion "$DISPATCH_CONCLUSION" \
+              --workflow "workflow_dispatch synthetic" \
+              --branch main \
+              --sha "${GITHUB_SHA}" \
+              --url "$RUN_URL" \
+              --synthetic)
+          else
+            out=$(python3 tests/run_outcome_gate.py \
+              --conclusion "$WR_CONCLUSION" \
+              --workflow "$WR_NAME" \
+              --branch "$WR_BRANCH" \
+              --sha "$WR_SHA" \
+              --url "$WR_URL")
+          fi
+          printf '%s\n' "$out" | jq -r .reason
+          printf 'alert=%s\n' "$(printf '%s\n' "$out" | jq -r .alert)" >> "$GITHUB_OUTPUT"
+          printf '%s\n' "$out" | jq -r .title > alert-title.txt
+          printf '%s\n' "$out" | jq -r .body  > alert-body.md
+
+      - name: open or update the single tracking issue
+        if: steps.decide.outputs.alert == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          title=$(cat alert-title.txt)
+          # Exact-title match, not a fuzzy search: a near match would comment on
+          # somebody else's issue. One tracker updated, never one per occurrence,
+          # because a burst that floods the channel is how a notifier gets muted.
+          # Title passed through `jq --arg` rather than interpolated into the
+          # filter, so no quoting in the title can reshape the expression.
+          num=$(gh issue list --state open --limit 100 --json number,title \
+                  | jq -r --arg t "$title" \
+                      'map(select(.title == $t)) | .[0].number // empty')
+          if [ -n "$num" ]; then
+            gh issue comment "$num" --body-file alert-body.md
+            echo "updated existing tracker #$num"
+          else
+            gh issue create --title "$title" --body-file alert-body.md \
+              --assignee skyphusion-strummer
+            echo "opened a new tracker"
+          fi
