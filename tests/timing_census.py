@@ -123,7 +123,7 @@ def collect() -> list[tuple[str, str, str, bool]]:
     rows: list[tuple[str, str, str, bool]] = []
     for path in files:
         try:
-            tree = ast.parse(path.read_text())
+            tree = ast.parse(path.read_text(encoding="utf-8"))
         except SyntaxError:
             continue
         bound = clock_names(tree)

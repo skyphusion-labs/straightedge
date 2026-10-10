@@ -39,7 +39,7 @@ def protocol_seams() -> dict[str, set[str]]:
     seams: dict[str, set[str]] = {}
     for path in sorted(SRC.rglob("*.py")):
         try:
-            tree = ast.parse(path.read_text())
+            tree = ast.parse(path.read_text(encoding="utf-8"))
         except SyntaxError:
             continue
         for node in ast.walk(tree):
@@ -98,7 +98,7 @@ def collect() -> dict[str, list[tuple[str, str, bool]]]:
         if path.name == pathlib.Path(__file__).name:
             continue
         try:
-            tree = ast.parse(path.read_text())
+            tree = ast.parse(path.read_text(encoding="utf-8"))
         except SyntaxError:
             continue
         for node in ast.walk(tree):
