@@ -28,7 +28,13 @@ from straightedge.broker.paper import PaperBroker
 from straightedge.config import BotConfig
 from straightedge.engine import Engine
 from straightedge.constants import TRADE_RETCODE_REJECT
-from straightedge.models import MarketOrder, OrderResult, SignalKind
+from straightedge.models import (
+    MarketOrder,
+    OrderResult,
+    Signal,
+    SignalKind,
+    WorkingOrder,
+)
 from straightedge.synthetic import generate_bars
 from straightedge.telegram import TgCommand
 
@@ -44,11 +50,22 @@ class InFlightBroker(PaperBroker):
 
     `fill_after` lets a test put the fill on the book at a chosen attempt, to
     show that the refusal does not depend on being able to see it.
+
+    `working()` is the SAME shape for a pending order, and it is here because
+    this docstring used to claim the raised shape was covered while only
+    `market` implemented it. straightedge#264 measured that: `working` was one
+    of three seams with no double that could fail, so `_place_pending`'s
+    `except BaseException` arm, which is what keeps the ledger entry open, had
+    nothing exercising it. Both methods raise the REAL `BridgeTimeout` rather
+    than a stand-in `RuntimeError`, because the engine's arms are typed
+    (`except (RuntimeError, OSError, ValueError)` in the sweep) and a
+    stand-in would prove the handler journals without proving the real
+    exception reaches it.
     """
 
     def __init__(self, balance: float, *, timeouts: int = 1, fill_after: int | None = None) -> None:
         super().__init__(balance=balance)
-        self.sends: list[MarketOrder] = []
+        self.sends: list[MarketOrder | WorkingOrder] = []
         self.timeouts = timeouts
         self.fill_after = fill_after
 
@@ -61,6 +78,43 @@ class InFlightBroker(PaperBroker):
                 super().market(order)
             raise BridgeTimeout("mt4 bridge timeout")
         return super().market(order)
+
+    def working(self, order: WorkingOrder):  # type: ignore[override]
+        self.sends.append(order)
+        if self.timeouts > 0:
+            self.timeouts -= 1
+            raise BridgeTimeout("mt4 bridge timeout")
+        return super().working(order)
+
+
+class CheckTimeoutBroker(PaperBroker):
+    """The pre-trade CHECK times out, so nothing is ever sent.
+
+    The other half of the asymmetry `InFlightBroker` covers, and the reason
+    both live in this file: `_place_pending` calls `check_working` BEFORE
+    `inflight.begin()` and `working` AFTER it. So a raise from the first must
+    leave NO ledger entry, and a raise from the second must leave one OPEN.
+    Those are opposite correct answers, and straightedge#264 found neither
+    pinned because no double for either seam could raise.
+
+    `check_working` is a READ (`sends=False` in the MT4 adapter, and
+    `constants.py` says the Expert returns a verdict without touching the
+    book), so a timeout here cannot have changed anything. `working` is a
+    SEND, so a timeout there is genuinely ambiguous.
+    """
+
+    def __init__(self, balance: float) -> None:
+        super().__init__(balance=balance)
+        self.sends: list[WorkingOrder] = []
+
+    def check_working(self, order: WorkingOrder):  # type: ignore[override]
+        raise BridgeTimeout("mt4 bridge timeout")
+
+    def working(self, order: WorkingOrder):  # type: ignore[override]
+        # Records so a test can assert NOTHING was sent. A check that timed out
+        # must not be followed by a send.
+        self.sends.append(order)
+        return super().working(order)
 
 
 def _engine(tmp_path, broker) -> Engine:
@@ -101,6 +155,94 @@ def test_a_confirm_whose_send_timed_out_is_never_transmitted_twice(tmp_path) -> 
         f"the same staged order reached the broker {len(broker.sends)} times; "
         f"first reply {first!r}, second reply {second!r}; orders {_sent(broker)}"
     )
+
+
+def _buy_limit() -> Signal:
+    return Signal(
+        kind=SignalKind.BUY,
+        symbol="EURUSD",
+        entry=1.0900,
+        sl=1.0850,
+        tp=1.1025,
+        atr=0.0030,
+        reason="test",
+        pending_kind="limit",
+    )
+
+
+def test_a_pending_send_that_timed_out_is_never_transmitted_twice(tmp_path) -> None:
+    """The `market` guarantee above, for the WORKING-order path. #264.
+
+    `_place_pending` has its own `inflight.begin()` and its own
+    `except BaseException` arm, and until #264 no double for the `working`
+    seam could raise, so that arm was never taken. The ledger exists to stop a
+    second transmission of one staged order, and a pending order is committed
+    exposure the moment it rests on the book (#107), so the pending path needs
+    the guarantee as much as the market path.
+
+    The key is passed explicitly because that is what the desk does: it mints
+    the key when it STAGES, so the same key survives a `/confirm` whose send
+    timed out.
+    """
+    broker = InFlightBroker(balance=10_000)
+    engine = _engine(tmp_path, broker)
+    key = "staged-pending-1"
+
+    with pytest.raises(BridgeTimeout):
+        engine.submit(_buy_limit(), 0.10, key)
+
+    assert key in engine.inflight.open_entries(), (
+        "the ledger entry was closed by a send that produced no verdict, so "
+        "the next confirm of the same staged order would transmit again"
+    )
+    assert not broker.orders(magic=engine.cfg.risk.magic), (
+        "the pending order must NOT be visible: that is the case under test"
+    )
+
+    second = engine.submit(_buy_limit(), 0.10, key)
+
+    assert len(broker.sends) == 1, (
+        f"the same staged pending order reached the broker {len(broker.sends)} "
+        f"times; second reply {second.comment!r}"
+    )
+    assert not second.ok
+    assert not second.measured, (
+        "an unresolved earlier send is COULD NOT MEASURE, not a rejection: "
+        "filing it as a verdict is what #232 and the unknown-send work "
+        "removed from this path"
+    )
+
+
+def test_a_check_that_timed_out_leaves_no_ledger_entry_and_sends_nothing(
+    tmp_path,
+) -> None:
+    """The opposite correct answer, one call earlier. #264.
+
+    `check_working` runs BEFORE `inflight.begin()`, so a timeout there must
+    leave the ledger EMPTY: there is no ambiguity to carry, because a check is
+    a read and nothing was transmitted. Leaving an entry open here would
+    refuse the operator's next perfectly good attempt for a send that never
+    happened, which is the mirror defect of closing one that did.
+
+    This is the assertion that makes the pair meaningful. Either test alone
+    reads as "the engine does something sensible with an exception"; together
+    they pin that WHERE the exception comes from decides which answer is
+    correct.
+    """
+    broker = CheckTimeoutBroker(balance=10_000)
+    engine = _engine(tmp_path, broker)
+
+    with pytest.raises(BridgeTimeout):
+        engine.submit(_buy_limit(), 0.10, "staged-pending-2")
+
+    assert engine.inflight.open_entries() == {}, (
+        "a check that never sent anything left an in-flight entry behind, so "
+        "the next attempt for this order would be refused as unresolved"
+    )
+    assert broker.sends == [], (
+        "the send ran after its own pre-trade check had timed out"
+    )
+    assert not broker.orders(magic=engine.cfg.risk.magic)
 
 
 def test_the_refusal_is_not_the_already_in_symbol_rule(tmp_path) -> None:

@@ -17,10 +17,21 @@ automatically instead of silently leaving the new seam uncounted.
 
 A double with no `raise` is NOT automatically a defect: most tests exercise a
 happy path and should. What the census makes checkable is the CLAIM. If no
-double for a seam can raise, then any claim that the suite covers a failure
-path through that seam is false, and the three honest answers are: make the
-double enter that state, have the test disclaim the path, or point at a live
-run. Exit codes say which situation you are in; they do not say you are wrong.
+double for a seam can raise, then no DOUBLE in this suite covers a failure
+path through that seam, and the three honest answers are: make the double
+enter that state, have the test disclaim the path, or point at a live run.
+Exit codes say which situation you are in; they do not say you are wrong.
+
+WHAT THIS CANNOT SEE, stated because the reading is reassuring either way.
+It measures test-file doubles, by looking for a `raise` inside a method whose
+name matches a seam. A failure path covered by making the REAL implementation
+fail is INVISIBLE to it and reads as blind: `docs/TESTING.md` prefers exactly
+that ("when the real thing can be made to fail cheaply, that beats any
+double"), and #232's own repair pointed a real transport at a closed loopback
+port and needed no double at all. So a blind seam here means "no double can
+fail", never "nothing covers the failure"; check for a real-implementation
+test before concluding a path is uncovered. Narrowed in #264, where the
+previous wording claimed the stronger thing.
 """
 
 from __future__ import annotations
@@ -150,10 +161,12 @@ def main() -> int:
             where = ", ".join(sorted({f"{f}:{c}" for f, c, _ in found[m]}))
             print(f"  {m}  -- implemented by {where}")
         print()
-        print("No double for these seams can raise, so the suite covers no")
-        print("failure path through them. That is a finding about the CLAIM:")
-        print("make a double enter the state, disclaim the path, or cite a")
-        print("live run. See docs/TESTING.md.")
+        print("No double for these seams can raise, so no DOUBLE here covers")
+        print("a failure path through them. Check whether a test makes the REAL")
+        print("implementation fail, which this census cannot see, before")
+        print("reading that as uncovered. If nothing does, that is a finding")
+        print("about the CLAIM: make a double enter the state, disclaim the")
+        print("path, or cite a live run. See docs/TESTING.md.")
         return 1
     print("every implemented seam has at least one double that can fail")
     return 0
