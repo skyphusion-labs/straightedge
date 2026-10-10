@@ -10,6 +10,7 @@ import json
 import math
 import os
 import re
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -63,6 +64,18 @@ class Advice:
     stop: float | None = None
     ticket: int | None = None
     summary: str = ""
+    #: The CLASS of the exception that stopped the conversation memory being
+    #: persisted on this turn, empty when it persisted (straightedge#282).
+    #:
+    #: Set by `Advisor.ask` from its own measurement, never parsed out of the
+    #: reply, exactly like `degraded`: a model cannot write it.
+    #:
+    #: THE CLASS AND DELIBERATELY NOT THE MESSAGE, which is the rule
+    #: `docs/CONTRACT.md` already states for `advice_error` and the channel
+    #: #216 and #226 closed. The full message, path and all, goes to stderr
+    #: where nothing external reads it; the class is what the chat and the
+    #: journal carry.
+    memory_error: str = ""
 
 
 CF_GATEWAY_HOST = "gateway.ai.cloudflare.com"
@@ -490,6 +503,10 @@ class Advisor:
         #: call; declared here so a caller reaching a provider method
         #: directly cannot hit an unset attribute (straightedge#185).
         self._last_violations: list[str] = []
+        #: The class of the exception that stopped the LAST turn's memory
+        #: being persisted, empty when it persisted (straightedge#282).
+        #: Same ownership and same clearing discipline as `_last_violations`.
+        self._last_memory_error: str = ""
         self.load()
 
     def ask(
@@ -512,6 +529,11 @@ class Advisor:
         # which is the stale-marker shape straightedge#119 was: the only
         # writer sets it from scratch each time rather than updating it.
         self._last_violations = []
+        # CLEARED for the same reason and on the same line of reasoning. A
+        # persistence failure that outlived its turn would attach to a turn
+        # that saved fine, and the record would be confidently wrong rather
+        # than merely silent (straightedge#282).
+        self._last_memory_error = ""
         if self.cfg.provider == "computer":
             raw = self._computer(question, context, session, history or [])
         elif self.cfg.provider == "claude":
@@ -526,12 +548,51 @@ class Advisor:
         advice.degraded = "; ".join(self._last_violations)
         self._remember("user", question)
         self._remember("assistant", advice.text or raw)
+        # Whatever `_remember` could not persist, carried out on the Advice so
+        # the desk can journal it and tell the operator (straightedge#282).
+        advice.memory_error = self._last_memory_error
         return advice
 
     def _remember(self, role: str, content: str) -> None:
         self._memory.append({"role": role, "content": redact_text(content)})
         self._memory = self._memory[-KEEP_TURNS:]
-        self.save()
+        # PERSISTENCE IS BEST EFFORT HERE AND NOWHERE ELSE (straightedge#282).
+        #
+        # `ask` calls this AFTER the provider has answered and been billed, and
+        # after `Desk._ask` has already spent a slot of
+        # `advice.max_turns_per_day`. A `save()` that raised took `ask` with it
+        # and the reply was discarded on the way out, so a failure of the
+        # CONVENIENCE destroyed the PRODUCT: the operator paid for an answer
+        # and received an exception. Measured on the real filesystem, the
+        # OSError also escaped `Desk._ask`'s `(ValueError, RuntimeError)`
+        # handler entirely, so the operator got no sentence either.
+        #
+        # The catch is HERE rather than around the two `_remember` calls in
+        # `ask`, which is the narrower of the two shapes the issue offered and
+        # the only correct one: wrapping both calls together would skip the
+        # second APPEND when the first SAVE failed, and the in-process memory
+        # would lose the assistant turn as well as the file. Appending always
+        # happens; only the write is best effort.
+        #
+        # `save()` itself still raises, so a direct caller is unchanged.
+        #
+        # TypeError is deliberately NOT caught. The payload is `str` by
+        # construction (`redact_text` returns one and the roles are literals),
+        # so a TypeError out of `json.dumps` would be a defect in this file
+        # rather than a disk problem, and swallowing it would hide that.
+        try:
+            self.save()
+        except (OSError, ValueError, RuntimeError) as exc:
+            self._last_memory_error = type(exc).__name__
+            # The full message, path and all, goes HERE and only here. On the
+            # deployed box stderr lands in a file nobody reads, which is why
+            # the journal row and the chat line exist too, but a real disk
+            # problem deserves the detail somewhere.
+            print(
+                "advice memory not saved: "
+                + redact_text(f"{type(exc).__name__}: {exc}")[:200],
+                file=sys.stderr,
+            )
 
     def load(self) -> None:
         path = self.persist_path

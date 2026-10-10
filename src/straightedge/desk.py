@@ -911,6 +911,43 @@ class Desk:
         elif advice.action == "close":
             staged = True
             lines.append(self._stage_close(advice))
+        # straightedge#282. The reply surviving a failed memory write is the
+        # fix; this is the half that stops best-effort meaning silent. A full
+        # disk or a revoked ACL under the state directory is a real problem on
+        # a real-money box, and `journal.jsonl` is the surface anyone
+        # reconstructing a demo week reads.
+        #
+        # ITS OWN EVENT rather than a field on the `advice_turn` row below, and
+        # that is a deliberate trade rather than laziness: that row's key set
+        # is DECLARED in `journal.ADVICE_TURN_ROW_FIELDS`, asserted in both
+        # directions, and governed by `journal.RECORD_ROW_BOUND`, so widening
+        # it for a diagnostic is a contract change rather than a fix.
+        # `advice_error` already sets the precedent for a separate advice-path
+        # event, and this row carries `turn_spent` for the same reason it does:
+        # the slot was spent before the provider call, so only this field can
+        # say the operator paid for the turn.
+        #
+        # The CLASS and not the message, which is the rule `docs/CONTRACT.md`
+        # states for `advice_error`. `measured` is absent on purpose: this is
+        # not a gate declining anything, so there is no decision to label.
+        if advice.memory_error:
+            self._journal_only(
+                "advice_memory_unsaved",
+                source="advice",
+                stage="memory",
+                provider=getattr(self.advisor.cfg, "provider", ""),
+                session=session,
+                error_type=advice.memory_error,
+                turn_spent=True,
+            )
+            # THE OPERATOR is the one who loses the context, and not now: this
+            # process's `_memory` still holds the turn, so the wording names
+            # the DISK and the restart rather than claiming the turn is gone.
+            lines.append(
+                "note: advice memory was not saved to disk "
+                f"({advice.memory_error}); a restart will not remember "
+                "this turn"
+            )
         # Closes the turn: what the model decided, never what either side said.
         # The question and the reply stay out of the journal on purpose, so the
         # redaction surface does not grow and advice_history stays prose-free.
