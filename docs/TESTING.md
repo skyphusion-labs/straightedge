@@ -700,6 +700,83 @@ shipped telling a reader to reap a correct watcher to satisfy a count, and a
 reviewer could run that whole checklist, pass it honestly, and still ship it.
 That is what makes it a gap rather than a lapse.
 
+## The diff a reviewer opens is not the change, when a branch was recreated rather than merged
+
+**A pull request's diff view is rendered against the PR's own base. It is not rendered against
+`main`.** If a branch was recreated or rebased from a stale base, the view shows one change while
+the branch contains several.
+
+This is adjacent to "An empty answer is the commonest disguise for a broken question" above, and it
+is not the same claim. That entry is about an INSTRUMENT answering the wrong question. This entry is
+about an ARTIFACT that shows a reviewer one change while it contains three, with every instrument
+working correctly.
+
+**Measured.** #277 and #278 merged. `@dependabot rebase` on #279 and #280 then produced new heads
+from a stale base, so each branch tree carried the pre-merge values:
+
+```
+main:                  requires = ["setuptools>=84.0.0"]   dev = [... "ruff>=0.16.10" ...]
+both rebased branches: requires = ["setuptools>=68"]       dev = [... "ruff>=0.16.9"  ...]
+
+grep for main's values in either branch:
+  ruff>=0.16.10        0 occurrences
+  setuptools>=84.0.0   0 occurrences
+```
+
+Merging either PR would have reverted two merged PRs alongside its own one-line change.
+
+### Why no instrument was wrong
+
+The diff view showed each PR as exactly one line. That is what each PR is, relative to its base.
+The reversions exist only in the comparison against `main`, and a reviewer of a dependency bump
+does not reach for that comparison.
+
+The review method was thorough: the diff, the changelog gate, version existence, the wheel matrix,
+and a real `pip install -v -e .` build. **Not one of those compares the branch against `main`.**
+Nothing the reviewer ran was broken or misapplied. The fix is a different reading, not more care.
+
+### Why nothing catches it downstream
+
+**Reverting a `>=` floor bump breaks no test.** The floor changes nothing that `pip` installs. A
+clean merge would have gone green across the full matrix, with an honest approval behind it.
+
+**The only protection was a merge conflict nobody designed.** The four PRs edited `pyproject.toml`
+at lines 2, 25, 25 and 26. Two shared a line and a third landed in the same hunk. Had the pins sat
+further apart, the merges would have been clean and the reversions silent.
+
+**The conflict also carried a trap.** The obvious way to clear a conflict on a dependency bump is to
+take the incoming side. That is exactly the resolution that lands the reversions.
+
+### What to read instead
+
+For any PR whose branch may have been recreated or rebased rather than merged (Dependabot PRs
+especially), diff the branch against `main` and not only against its own base. The question is not
+"what does this PR change". The question is "what will `main` contain afterwards that it does not
+contain now, and what will it stop containing".
+
+Two readings make that checkable:
+
+```sh
+git diff --name-only origin/main <head>     # what the merge will alter, in both directions
+git show <head>:<file> | grep <value>       # whether a value main already has survives
+```
+
+The second reading is the one that caught it here. It is the content-not-ancestry rule, pointed at
+a file instead of a commit.
+
+### Not claimed
+
+**No defect in Dependabot is asserted.** Why the rebase used a stale base was not established. It
+may come from sibling PRs touching one file, from a rebase racing a merge, or from something else.
+The branch content was established, and it was enough to close both PRs. It was not enough to file
+upstream.
+
+**Nothing here says the reviewer should have caught it.** The view the reviewer reads was the wrong
+view. The fix is a different reading, not more care.
+
+#303 proposes stopping floor-bump PRs at the source, which would remove this whole class. This entry
+is owed whether or not that lands.
+
 ## A control beats a second opinion
 
 Two instruments agreeing is CORROBORATION. A control showing the instrument can
