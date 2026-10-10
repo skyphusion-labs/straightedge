@@ -71,6 +71,12 @@ Example: `python -m straightedge --config config.toml run`.
    `export XAI_API_KEY=...`
 8. Run tests.
    `pytest`
+   That whole-suite run is the one that gates, and it exits 0. Narrowing it is
+   what trips people: the 80% coverage floor lives in `addopts`, so it applies
+   to a subset too, and `pytest tests/test_sizing.py` exits 1 with every test in
+   it passing. That is the floor, not a failure. On a subset add `--no-cov` and
+   the number means what you expect again: `pytest tests/test_sizing.py --no-cov`
+   exits 0.
 9. Run doctor.
    `python -m straightedge doctor`
 10. Start the paper loop only if doctor exits 0.
