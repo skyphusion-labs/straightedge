@@ -38,10 +38,11 @@ rule saying no.
 from __future__ import annotations
 
 import json
+import socket
 from pathlib import Path
 
 from straightedge.broker.paper import PaperBroker
-from straightedge.config import BotConfig
+from straightedge.config import AdviceConfig, BotConfig
 from straightedge.engine import Engine
 from straightedge.llm import Advisor
 from straightedge.synthetic import generate_bars
@@ -49,7 +50,18 @@ from straightedge.telegram import TgCommand
 
 
 class RaisingTransport:
-    """Raises the way a real HTTP hop does, and only on the provider call."""
+    """Raises whatever it was GIVEN, and only on the provider call.
+
+    The wording matters and used to overstate. This double raises the
+    exception the test handed it, which in every case below is a bare
+    `RuntimeError` or `ValueError`. The real hop raises `TelegramError`, a
+    `RuntimeError` SUBCLASS carrying `status` and `retry_after`, so these cases
+    reproduce the SHAPE of a failed hop and not its CLASS. That is enough for
+    every assertion here, because each one is about the row rather than the
+    exception, and it is NOT enough to show the handler is reachable by the
+    thing that actually raises. `test_the_real_transport_failing_is_recorded`
+    at the bottom of this file covers that, with no double at all.
+    """
 
     def __init__(self, exc: Exception) -> None:
         self.exc = exc
@@ -254,4 +266,81 @@ def test_a_refusal_is_still_a_refusal(tmp_path: Path) -> None:
     assert reply == "refused: max_advice_turns_per_day", reply
     assert _rows(engine, "reject"), "the refusal stopped being recorded as a refusal"
     assert not _rows(engine, "advice_error"), "a refusal was recorded as a crash"
+    engine.stop()
+
+
+# --- 4. the real transport, with no double at all --------------------------
+#
+# Everything above hands the desk an exception. This hands the desk nothing and
+# makes the SHIPPED transport raise its own, because a stub cannot produce the
+# failure mode of the thing it stands in for. Ported from the branch closed in
+# favour of #240, rewritten against the merged `advice_error` vocabulary.
+#
+# WHAT `UrlLibTransport.post_json` REALLY DOES WHEN IT FAILS, read off the code
+# rather than recalled, with what each case here can reach:
+#
+#   1. HTTP non-2xx      -> TelegramError(f"telegram http {status}", status=,
+#                           retry_after=)                     NOT COVERED
+#   2. URLError          -> TelegramError("telegram http failed")   COVERED
+#      (refused, DNS, timeout)                                   by this case
+#   3. body is not JSON  -> TelegramError("telegram non-json")  NOT COVERED
+#   4. provider error    -> RuntimeError(str(data["error"]))       covered by
+#   5. reply empty       -> RuntimeError("computer empty")      RaisingTransport
+#
+# Modes 1 and 3 are NOT covered, and that is named rather than quietly implied:
+# reaching them needs a local HTTP server answering with a chosen status and a
+# chosen body, which is a bigger fixture than this file carries. Naming the two
+# that are missing is what makes the three that are reached worth anything, and
+# a suite must not claim coverage of a path its double cannot enter.
+
+
+def _closed_port() -> int:
+    """A port nothing is listening on, bound and released so it is certainly free."""
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+def test_the_real_transport_failing_is_recorded(tmp_path: Path) -> None:
+    """The real class reaches the row, which no case above can show.
+
+    `error_type` is the field that makes this testable rather than rhetorical:
+    every case above produces `RuntimeError` or `ValueError` because that is
+    what the double was handed, and this one produces **TelegramError**, which
+    only the shipped transport can raise. If the handler were somehow not on
+    the real failure path, this is the case that notices.
+
+    Offline and immediate: a refused connection to a closed loopback port needs
+    no network and returns at once.
+    """
+    port = _closed_port()
+    cfg_advice = AdviceConfig(
+        provider="computer",
+        computer_url=f"http://127.0.0.1:{port}/ask",
+        computer_token="not-a-real-token",
+    )
+    engine = _engine(tmp_path)
+    engine.cfg.advice = cfg_advice
+    advisor = Advisor(cfg_advice, persist_path=tmp_path / "a.json")
+    engine.advisor = advisor
+    engine.desk.advisor = advisor
+
+    reply = engine.handle_command(TgCommand("1", 1, "/ask take a view", 1))
+
+    rows = _rows(engine, "advice_error")
+    assert len(rows) == 1, rows
+    row = rows[0]
+    assert row["error_type"] == "TelegramError", (
+        "the row did not carry the class the SHIPPED transport raises: " + str(row)
+    )
+    assert row["turn_spent"] is True
+    assert row["measured"] is False
+    assert row["stage"] == "provider"
+    assert row["source"] == "advice"
+
+    # The same discipline the rest of the file enforces, on a real exception:
+    # the class is the record and the sentence is the chat's.
+    blob = json.dumps(row, sort_keys=True)
+    assert "telegram http" not in blob, "the transport sentence reached the row: " + blob
+    assert "telegram http" in reply, reply
     engine.stop()
