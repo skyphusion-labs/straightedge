@@ -269,3 +269,98 @@ def scan_decision_reasons(source: str) -> ReasonScan:
         forwarded=tuple(sorted(collector.forwarded)),
         unresolved=tuple(sorted(collector.unresolved)),
     )
+
+
+#: The `OrderResult` factory that carries OUR OWN refusal word on the modify
+#: path. `OrderResult.invalid_stops(<comment>)` is rendered to the operator as
+#: `<verb> failed retcode=<n> <comment>`, so whatever is passed to it is
+#: operator-visible text and not an internal field.
+STOPS_FACTORY = "invalid_stops"
+
+
+def scan_method_reasons(
+    source: str, *, class_name: str, method_names: tuple[str, ...]
+) -> ReasonScan:
+    """Every word the named METHODS of `class_name` can return.
+
+    Needed because the scanners above are keyed on `RiskDecision` or on the
+    literal `refused: ` prefix, and `_stop_guard` is neither: it returns a bare
+    word that `_modify` hands to `OrderResult.invalid_stops`, which the desk
+    renders as `sl failed retcode=<n> <word>`. A word on that channel is as
+    operator-visible as one after `refused: ` and was invisible to every
+    scanner in this module (#228).
+
+    `return ""` is the guard's PASS and names no reason, so `_Collector`
+    dropping the empty string is the behaviour this relies on. A return it
+    cannot read lands in `unresolved` rather than being skipped, and a method
+    that is not found lands there too, because a renamed method would otherwise
+    shrink the denominator in silence while every caller stayed green.
+    """
+    tree = ast.parse(source)
+    collector = _Collector(_module_string_constants(tree))
+    seen: set[str] = set()
+    for cls in ast.walk(tree):
+        if not isinstance(cls, ast.ClassDef) or cls.name != class_name:
+            continue
+        for node in ast.walk(cls):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            if node.name not in method_names:
+                continue
+            seen.add(node.name)
+            for ret in ast.walk(node):
+                if isinstance(ret, ast.Return) and ret.value is not None:
+                    if isinstance(ret.value, ast.Constant) and ret.value.value is None:
+                        continue
+                    collector.visit(ret.value)
+    for wanted in method_names:
+        if wanted not in seen:
+            collector.unresolved.add(f"method not found: {class_name}.{wanted}")
+    return ReasonScan(
+        names=frozenset(collector.names),
+        prefixes=frozenset(collector.prefixes),
+        forwarded=tuple(sorted(collector.forwarded)),
+        unresolved=tuple(sorted(collector.unresolved)),
+    )
+
+
+def scan_factory_comments(source: str, *, factory: str = STOPS_FACTORY) -> ReasonScan:
+    """Every comment passed to `OrderResult.<factory>(...)` in `source`.
+
+    THE POPULATION, where `scan_method_reasons` gives the VOCABULARY. The two
+    are different questions and the gap between them is the point: a comment
+    here that is not a word the guard returns is operator PROSE, and the caller
+    reconciles the difference rather than pattern-matching the text. That is
+    why this returns everything it can read instead of deciding what counts.
+
+    `invalid_stops(reason)` names nothing here and lands in `forwarded`, which
+    is correct and load-bearing: it is the site where the guard's words enter
+    this channel, so a caller can assert the wiring still exists rather than
+    assuming it.
+
+    A factory call with no positional argument lands in `unresolved`; so does
+    a factory name that appears nowhere, for the same reason as above.
+    """
+    tree = ast.parse(source)
+    collector = _Collector(_module_string_constants(tree))
+    found = False
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if not isinstance(func, ast.Attribute) or func.attr != factory:
+            continue
+        found = True
+        if node.args:
+            collector.visit(node.args[0])
+        else:
+            line = getattr(node, "lineno", 0)
+            collector.unresolved.add(f"line {line}: {factory} with no comment")
+    if not found:
+        collector.unresolved.add(f"factory not found: {factory}")
+    return ReasonScan(
+        names=frozenset(collector.names),
+        prefixes=frozenset(collector.prefixes),
+        forwarded=tuple(sorted(collector.forwarded)),
+        unresolved=tuple(sorted(collector.unresolved)),
+    )
