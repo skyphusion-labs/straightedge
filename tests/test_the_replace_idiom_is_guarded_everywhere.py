@@ -449,32 +449,142 @@ def test_the_heartbeat_carries_the_deferral_count(tmp_path: Path, monkeypatch) -
     engine.stop()
 
 
-def test_the_deferral_count_is_published_but_NOT_an_alert(tmp_path: Path) -> None:
-    """The known limit, ASSERTED rather than described in a comment.
+#: A rotation bound a test can actually cross, and one that keeps the invariant
+#: the alert reads: the live file never exceeds the bound BECAUSE a single row
+#: fits inside it comfortably. A bound of 1 byte, which the cases above use to
+#: force the rotation branch, would leave every write over the bound and the
+#: condition would look permanent; this suite needs it to CLEAR.
+_SMALL_ROTATE_BYTES = 4096
+#: Enough padded rows to carry the live file past that bound with the rotation
+#: refused. Asserted rather than assumed, because a row that got smaller would
+#: quietly stop creating the condition.
+_PAD = "x" * 200
+_PAD_ROWS = 24
 
-    `rotate_deferrals` is not a watchdog `reason`, so a holder that defers
-    rotation forever is visible to a reader of the heartbeat and pages nobody.
-    That is deliberate: choosing a threshold and an operator action is a
-    watchdog design decision and is filed as straightedge#288.
 
-    Pinned here so the limit cannot change silently in either direction. If
-    somebody makes it an alert, this reds and they have to retire #288 and the
-    docs along with it, instead of leaving two statements that disagree.
+def _refuse_the_rotation(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """Refuse the JOURNAL's replace only.
+
+    Patching `os.replace`, which `_patch` above does, also refuses the
+    heartbeat's own atomic replace, and the heartbeat is the channel under test
+    here. Each module imports the helper into its own namespace, so this is the
+    one seam that stops the rotation without taking down the file that reports
+    it: a monitor that shares the fate of what it monitors is not a monitor.
     """
-    import inspect
+    from straightedge import journal as journal_mod
 
-    from straightedge import watchdog
+    def _refuse(src_path, dest, **kw):  # type: ignore[no-untyped-def]
+        raise PermissionError(5, "Access is denied")
 
-    src = inspect.getsource(watchdog)
-    assert "rotate_deferrals" in src, "the field is not in the watchdog at all"
-    reasons = [
-        line for line in src.splitlines()
-        if "reason=" in line and "rotate_deferrals" in line
-    ]
-    assert reasons == [], (
-        f"rotate_deferrals became a watchdog reason: {reasons}. That is a "
-        "change to the operator alert contract; see straightedge#288."
+    monkeypatch.setattr(
+        journal_mod, "replace_retrying_on_share_conflict", _refuse
     )
+
+
+def test_a_rotation_THAT_STOPPED_is_an_alert_and_it_CLEARS(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """straightedge#288, and the retirement of the pin that used to live here.
+
+    That pin asserted `rotate_deferrals` was NOT a watchdog `reason`, and said
+    whoever made it one had to retire #288 and the docs with it rather than
+    leave two statements that disagree. This is that retirement.
+
+    WHAT IS ALERTED ON IS NOT THE COUNT. `rotate_deferrals` is a monotonic
+    per-process count with no clock and no clearing: a backup agent that held
+    the journal once an hour ago leaves it at 1 forever, and a holder still
+    attached leaves it at 1 too, so from ONE heartbeat no threshold on it can
+    tell those apart, and the deployed shape IS one heartbeat (`watch` with no
+    `--loop`, from a scheduled task). The desk publishes `journal_bytes` beside
+    `rotate_bytes` instead, and in healthy operation the live file never
+    exceeds that bound because `_rotate_if_needed` rotates before the write
+    that would cross it. One comparison, no duration, and no threshold this
+    watcher invented.
+
+    BOTH DIRECTIONS IN ONE CASE, deliberately. An alert that cannot clear is
+    the next defect along: the operator mutes it, and a muted alarm is worse
+    than none. So the holder lets go here and the same desk goes back to
+    ARMED, with the count still at 1 and a note saying something held the file
+    and released it.
+    """
+    from datetime import datetime, timezone
+
+    from straightedge import journal as journal_mod
+    from straightedge import watchdog
+    from straightedge.broker.paper import PaperBroker
+    from straightedge.config import BotConfig, SessionConfig, TelegramConfig
+    from straightedge.engine import Engine
+
+    cfg = BotConfig()
+    cfg.session = SessionConfig(enabled=False)
+    cfg.symbols = ["EURUSD"]
+    cfg.journal_path = str(tmp_path / "journal.jsonl")
+    cfg.risk.halt_file = str(tmp_path / "HALT")
+    cfg.telegram = TelegramConfig(token="t" * 10, chat_id="42")
+    engine = Engine(cfg, PaperBroker(balance=10_000), halt_dir=str(tmp_path))
+    engine.start()
+    hb_path = watchdog.heartbeat_path_for(cfg.journal_path)
+
+    monkeypatch.setattr(journal_mod, "_ROTATE_BYTES", _SMALL_ROTATE_BYTES)
+    real_replace = journal_mod.replace_retrying_on_share_conflict
+    _refuse_the_rotation(monkeypatch)
+    for n in range(_PAD_ROWS):
+        engine.journal.write("pad", n=n, blob=_PAD)
+    engine._write_heartbeat()
+
+    hb = watchdog.read(hb_path)
+    assert hb is not None, "no heartbeat was written, so nothing here measures"
+    # The PAIR. The reading means nothing with one half of it.
+    assert int(hb.fields["rotate_bytes"]) == _SMALL_ROTATE_BYTES, hb.fields
+    assert int(hb.fields["journal_bytes"]) > _SMALL_ROTATE_BYTES, (
+        "the live journal did not grow past its bound, so the condition under "
+        f"test was never created and this case measures nothing: {hb.fields}"
+    )
+    assert int(hb.fields["rotate_deferrals"]) >= 1, hb.fields
+
+    report = watchdog.decide(hb_path, now=datetime.now(timezone.utc), cfg=cfg)
+    assert report.state == watchdog.STATE_DEGRADED, report.text
+    assert report.reason == "rotation_stuck"
+    assert report.exit_code == watchdog.EXIT_DEGRADED
+    # `ok` is what makes the operator hear about it MORE THAN ONCE: `watch`
+    # repeats a not-ok report on the desk's own threshold, and a report that
+    # stayed `ok` would be told once and then never again. That is precisely
+    # how this field came to be published and watched by nobody.
+    assert not report.ok
+    assert report.key != (watchdog.STATE_ARMED, "")
+    assert "handle64" in report.text, "the alert names no operator action"
+    assert "rotate_deferrals=" in report.text, (
+        "the count is not read at all, so the alert cannot say whether a "
+        "holder is refusing the replace or the rotation is failing for a "
+        "reason nobody has a name for"
+    )
+
+    # THE HOLDER LETS GO. Nothing restarts and nothing is re-armed.
+    monkeypatch.setattr(
+        journal_mod, "replace_retrying_on_share_conflict", real_replace
+    )
+    engine.journal.write("after", v=2)
+    engine._write_heartbeat()
+    hb = watchdog.read(hb_path)
+    assert hb is not None
+    assert int(hb.fields["journal_bytes"]) <= _SMALL_ROTATE_BYTES, (
+        "the rotation did not resume when the holder let go, so the clearing "
+        f"direction is untested: {hb.fields}"
+    )
+
+    cleared = watchdog.decide(hb_path, now=datetime.now(timezone.utc), cfg=cfg)
+    assert cleared.state == watchdog.STATE_ARMED, cleared.text
+    assert cleared.exit_code == watchdog.EXIT_ARMED
+    assert engine.journal.rotate_deferrals >= 1, (
+        "the count is per process and must NOT be cleared by a recovery: it is "
+        "the record of how many rows were written while the file was over its "
+        "bound"
+    )
+    assert "let go" in cleared.text, (
+        "a recovered desk says nothing about the episode, so an operator who "
+        f"missed the alert cannot see that it happened: {cleared.text}"
+    )
+    engine.stop()
 
 
 def test_a_deferred_rotation_keeps_the_worst_case_row_in_bound(
