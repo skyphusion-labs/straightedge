@@ -16,6 +16,10 @@ updates:
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
+    # straightedge#303: only edit a pyproject floor when the latest release no
+    # longer satisfies it. Without this, every >= floor below latest opens a PR
+    # that changes nothing pip installs, and the PRs collide in pyproject.toml.
+    versioning-strategy: increase-if-necessary
     commit-message:
       prefix: deps
     groups:
