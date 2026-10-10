@@ -1207,7 +1207,7 @@ A pending fill writes `open` with `fill=true`.
 A vanished ticket writes `close` with `fill=true`.
 The venue holds the live book. It is not the fill log.
 
-JSONL, one event per line: `start`, `open`, `close`, `modify`, `reject`, `halt`, `order_check_fail`, `pending`, `recap`, `reconnect`, `loop_error`, `confirm_stage`, `confirm_cancel`, `confirm_sent`, `approve_always`, `approve_off`, `auto_on`, `auto_off`, `live_on`, `live_off`, `live_not_restored`, `risk_state_error`, `advice_turn`, `advice_circuit_block`, `advice_stage_failed`, `flatten`, `flatten_incomplete`, `close_failed`, `close_partial`, `cancel_failed`, `positions_read_failed`, `orders_read_failed`, `account_read_failed`, `send_unresolved`, `send_refused_unresolved`, `confirm_unresolved`, `inflight_unreadable`, `notify_truncated`, `venue_clock`, `stop`.
+JSONL, one event per line: `start`, `open`, `close`, `modify`, `reject`, `halt`, `order_check_fail`, `pending`, `recap`, `reconnect`, `loop_error`, `confirm_stage`, `confirm_cancel`, `confirm_sent`, `approve_always`, `approve_off`, `auto_on`, `auto_off`, `live_on`, `live_off`, `live_not_restored`, `risk_state_error`, `advice_turn`, `advice_circuit_block`, `advice_stage_failed`, `flatten`, `flatten_incomplete`, `close_failed`, `close_partial`, `cancel_failed`, `positions_read_failed`, `orders_read_failed`, `account_read_failed`, `send_unresolved`, `send_refused_unresolved`, `confirm_unresolved`, `inflight_unreadable`, `notify_truncated`, `venue_clock`, `advance_held`, `stop`.
 `reject` is written by every gate that refuses, on every path, and it is the
 record to grep when the bot will not trade.
 It carries the NAMED `reason`, plus `source` (`auto`, `telegram`, or `advice`)
@@ -1306,6 +1306,31 @@ leg's advance gate rather than this record: bar stamps move back with the
 server, and `step_symbol` returns until they climb past their previous high. The
 row states what the desk measured when it next ACTED, which is the only instant
 it has evidence for.
+`advance_held` is what the record says WHILE that gate is shut, and it is the
+row to look for when the auto leg has gone quiet. It is journal-only and never
+pings the chat. One row per symbol when that symbol's bar stamps go BACKWARDS,
+which is the measured footprint of a westward move, and nothing more while they
+climb back.
+Fields: `symbol`; `behind_sec`, how far back the stamps went, which is also
+about how much longer the auto leg takes no new entry; `bar_time`, the stamp
+now; and `previous_bar_time`, the high it has to climb past.
+An ordinary poll inside one bar writes NOTHING, which is nearly all of them: at
+the default `engine.poll_seconds` of 15 on an H1 timeframe the gate returns
+about 240 times an hour per symbol with the stamp unchanged, about 960 across
+four symbols, and `config.example.toml` ships 1 second. A row on each would bury
+the one row that means something, so a quiet market stays quiet in the file.
+It states the STAMPS and not the clock, on purpose. The clock is read on the
+ACTING path only, so the `venue_clock` row for a westward move lands when the
+gate OPENS, at the end of the held window: it cannot be what tells you the
+window is open. Read `advance_held` while it holds, and `venue_clock` afterwards
+for what the offset moved from and to.
+What it does NOT cover: a venue that STALLS the top of its series across the
+roll, keeping the last bar at its old stamp instead of re-stamping its history
+lower. That state is identical to a quiet market in everything the gate can
+see, so nothing is written and the operator reading is the one in `Live desk
+limits`.
+The gate itself is unchanged and nothing on this path can alter it: no entry, no
+refusal and no halt, exactly as before (straightedge#212).
 `venue_clock_unmeasured` means the venue could not state its UTC offset, so
 the auto leg cannot know WHEN it is and refuses every signal. The record
 carries `unmeasured` and `detail`, and `unmeasured` names which of three

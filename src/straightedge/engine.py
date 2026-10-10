@@ -267,6 +267,30 @@ class Engine:
         #: instruments because it can be false is not a bound
         #: (straightedge#182 review).
         self._last_poll_mono: dict[str, float] = {}
+        #: How far this symbol's bar stamps had gone BACK when the advance gate
+        #: last said so, in seconds, keyed by symbol.
+        #:
+        #: TWO STATES REACH THAT GATE AND THEY ARE NOT ALIKE. `step_symbol`
+        #: returns on `last_t <= prev`, where `==` is an ordinary poll inside
+        #: one bar, which is nearly every poll, and `<` is the venue's stamps
+        #: having gone BACKWARDS, which is the measured footprint of a
+        #: westward server clock move: a broker DST roll, or a reconnect onto
+        #: a server on a different offset. The second one holds the gate for
+        #: about the size of the move and used to emit nothing, so an hour of
+        #: it was indistinguishable from a quiet market (straightedge#212).
+        #:
+        #: THIS IS THE CARDINALITY GUARD, which is the only hard part of
+        #: saying so. A row on every suppressed poll would be about 240 an
+        #: hour per symbol at the default `engine.poll_seconds` of 15, about
+        #: 960 across the four in `[symbols]`, and `config.example.toml` ships
+        #: 1 second, which is fifteen times worse; that buries the signal the
+        #: row exists to produce and is the per-tick volume shape #119 exists
+        #: to forbid. So the deficit that was STATED is remembered here, the
+        #: row is written once when stamps go back, and nothing is written
+        #: again while they climb: inside one held window `prev - last_t` only
+        #: shrinks, so a strictly deeper deficit is a NEW backwards move and
+        #: earns its own row. The key is dropped when the gate opens.
+        self._advance_held_sec: dict[str, int] = {}
         #: The venue clock state this process has already RECORDED, as the
         #: comparable part of it (offset, unmeasured fields, source). A
         #: sentinel rather than None, so the first reading is always a change.
@@ -1189,13 +1213,72 @@ class Engine:
             self.last_bar_time[symbol] = last_t
             return
         if last_t <= prev:
+            # OBSERVATION ONLY, and the gate still returns on the next line.
+            # Nothing below this call reaches the venue, no branch is taken on
+            # its result, and the commonest state here (an unchanged stamp
+            # inside one bar) stays as silent as it was.
+            self._note_held_advance(symbol, last_t, prev)
             return
         self.last_bar_time[symbol] = last_t
+        # The gate is open, so whatever held it is over and the next backwards
+        # move is a new one to state.
+        self._advance_held_sec.pop(symbol, None)
         # The gate above is what makes the bound below true, and the two have
         # to stay together: a bar advanced since the previous poll, so a tick
         # arrived inside `since_last_poll`, so the venue's stamp is no older
         # than that. Remove the advance gate and this bound becomes a guess.
         self._act(symbol, bars, max_staleness_sec=since_last_poll)
+
+    def _note_held_advance(self, symbol: str, last_t: int, prev: int) -> None:
+        """Journal that the advance gate is held by stamps that went BACK.
+
+        straightedge#212. The gate in `step_symbol` is correct and is
+        untouched: it is #172's dump-trade guard, and it is what makes the
+        staleness bound beside it true. What it was not was LEGIBLE. A
+        westward venue clock move carries bar stamps back with it, so the gate
+        stays shut until they climb past their previous high, which takes
+        about the size of the move. No entry, no refusal, no halt, and until
+        this row nothing that told that hour apart from a quiet market.
+
+        WHAT IS MEASURED IS THE STAMP DEFICIT, NOT THE CLOCK, and that is the
+        one design call here worth reading. `_record_venue_clock` does hold
+        the move once it has recorded one, but on a westward move it cannot be
+        what triggers this row: the venue clock is read in `_bar_instant`,
+        which is reached through `_act`, which this gate returns BEFORE. So
+        the `venue_clock` row for a westward move lands when the gate OPENS,
+        at the END of the held window (`tests/test_venue_clock_journal.py`
+        measures exactly that, asserting the row arrives 2 and 4 bars late),
+        and a row conditioned on it would fire once the hold was already over
+        or never at all. `prev - last_t` is already on this branch, it EQUALS
+        the move at the first poll after the roll, and for the rest of the
+        window it is the better number: it is how much further stamps must
+        climb, so it is how much longer the gate holds.
+
+        ONE ROW PER SYMBOL PER BACKWARDS MOVE, never one per poll. The bound
+        and its reasoning live on `_advance_held_sec`.
+
+        It cannot alter a gate. The caller returns whatever happens here, this
+        takes no branch on its own result, and it writes one row on the same
+        terms as every other record in this file.
+        """
+        if last_t >= prev:
+            # The ordinary poll inside one bar, which is nearly all of them.
+            # News about none of it, and the quiet market stays quiet.
+            return
+        behind = int(prev - last_t)
+        stated = self._advance_held_sec.get(symbol)
+        if stated is not None and behind <= stated:
+            return
+        self._advance_held_sec[symbol] = behind
+        self._emit(
+            "advance_held",
+            symbol=symbol,
+            # How far back the stamps went, so also about how much longer the
+            # auto leg takes no new entry.
+            behind_sec=behind,
+            bar_time=last_t,
+            previous_bar_time=prev,
+        )
 
     def replay_symbol(self, symbol: str, bars: list[Bar]) -> None:
         """Act on bars handed in directly. The backtest and test seam.
@@ -3220,6 +3303,15 @@ def _format_event(event: str, fields: dict[str, Any]) -> str:
         # (straightedge#186). The LOUD clock events already exist: a refusal
         # journals `venue_clock_unmeasured` and `doctor --connect` prints the
         # reading on demand.
+        return ""
+    if event == "advance_held":
+        # Journal-only, and deliberately not a chat ping (straightedge#212).
+        # The gate being held is a STATE an operator reads while wondering why
+        # nothing has opened, which is what `docs/RUNBOOK.md` answers; pushing
+        # it would be a message per symbol per clock roll for a desk that is
+        # behaving exactly as designed. Stated rather than left to the empty
+        # default below, so the row cannot become a ping by someone changing
+        # what an unnamed event does.
         return ""
     if event == "history_preflight":
         # Journal-only. The all-clear is a denominator, not news.
