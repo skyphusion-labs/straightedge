@@ -6,6 +6,172 @@ See README.md and docs/CONTRACT.md.
 
 ## Unreleased
 
+### OPERATOR-VISIBLE REPLY CHANGE: `sl required` is now `sl_required` (issue #233)
+
+**A reply an operator reads has changed text.** The working-order modify path
+answered `sl failed retcode=10016 sl required` and now answers
+`sl failed retcode=10016 sl_required`. The paper adapter's send guard changes
+the same way. This is not an internal tidy; if you grep your scrollback or
+parse that reply, update it.
+
+One condition, "no usable stop", had two renderings: the order and sizing path
+reported the word `sl_required` and the modify path reported the prose
+`sl required`. An operator who learned one could not find the other, and the
+refusal table documented only the word.
+
+- **The word now arrives on both channels and has ONE row**, in the
+  `### Refusal reasons` table, naming both channels. Deliberately not
+  duplicated into the stop-guard table: a second row is two places to drift.
+- **The stop-guard gate gained a third bucket rather than an exclusion.** A
+  comment it emits is now one of a guard word with a row here, prose in its
+  pin, or a word whose row lives in the other table. The third case is paired
+  with a test that the row really exists there, because an exclusion with no
+  positive check is how a word stops being documented anywhere while two gates
+  each believe the other covers it.
+- **The new test asserts the PROPERTY, not the string.** It asks all three
+  channels what they call the condition and requires the answers to be equal,
+  derived from each rather than compared against a literal. Three hardcoded
+  copies of the word would pass on three channels that had drifted apart
+  again, which is how one condition acquired two spellings in the first place.
+  A second test requires the shared value to be word-shaped, since converging
+  all three on `sl required` would satisfy equality and defeat the point.
+- The other two `invalid_stops` comments are untouched on purpose. They
+  describe an ordering between three numbers, so there is no word to converge
+  on and inventing one would be worse than the asymmetry.
+
+### A breach record is no longer lost when the journal write fails (issue #217)
+
+`_hb_over_warned = True` was set BEFORE the `tick_gap_breach` journal write, so
+a write that raised lost the row for the life of the process: `Journal.write`
+has no exception handling, the run loop catches `Exception` and keeps going,
+and the loop's own `loop_error` write is swallowed. **A flag set before a
+durable write loses the record precisely when writing is what failed.**
+
+- **Two surfaces, two flags.** The stderr warning is not durable, so its flag
+  is still set before the print. The journal row is, so its flag is set only
+  after the write returns. One flag could not govern both, because losing a
+  print and losing an append-only audit row are not the same event.
+- **The retry is BOUNDED**, at three ticks, roughly 45 seconds at the default
+  `poll_seconds`. Moving the flag after the write and stopping there would
+  retry on every tick for as long as the journal stayed broken, which is an
+  unbounded retry inside the latency path the record exists to explain.
+- **The figures are captured at DETECTION**, so a retried write records the
+  breach that was detected rather than a larger maximum that accumulated while
+  the journal was unavailable.
+- **Giving up is recorded.** The heartbeat now carries `breach_rows_lost=`, a
+  count of breaches this process detected and could not write. It is the only
+  surface that reports a hole in the audit log, because the channel designed to
+  carry a breach is the journal and this field exists for when the journal is
+  what failed. Zero on a healthy desk and published on every heartbeat.
+- **The heartbeat format is now pinned to its documentation.** Nothing
+  asserted that `docs/CONTRACT.md`'s field list matched what the renderer
+  emits, so the two could drift; a test reads the list out of the paragraph
+  that enumerates it and compares both directions.
+### `grok` can route through the AI Gateway, so its calls can be counted (issue #155)
+
+`AI_PROVIDER=computer` was the only path the gateway saw, so for the two
+providers most likely to be live we had no call count, no token count and no
+cost. `claude` already routed by URL; `grok` did not, and sent
+`Authorization: Bearer` unconditionally.
+
+- **`grok` now routes by HOST, calling the same `_is_cf_gateway` the `claude`
+  path calls.** Point `advice.grok_url` at a Cloudflare AI Gateway and it
+  authenticates with `cf-aig-authorization` and sends no xAI key, because
+  Unified Billing supplies the provider credential. Point it at `api.x.ai` and
+  it stays direct BYOK. The predicate is CALLED rather than re-spelled, so a
+  URL-bypass shape fixed for one provider is fixed for both.
+- **Defaults are unchanged and pinned by a test.** A self-hoster who changes
+  nothing keeps their own key going straight to the provider, and neither
+  provider acquires a Cloudflare dependency.
+- **The deciding property is where the counter lives, not the cost figure.**
+  A day of zero AI spend on a config that should call the model every bar is a
+  signal, and a counter we increment ourselves cannot raise it: the code that
+  stopped calling the model is the same code that would stop counting. That
+  rules out a locally computed estimate independently of latency.
+- **One test body now drives BOTH providers over the same URL-bypass table**,
+  rather than a second table that could be fixed on one side only. Reverting
+  the `grok` branch reds exactly the four gateway cases for `grok` and zero for
+  `claude`.
+- README states the consequence of going direct, which it previously did not:
+  the mechanism was documented and the fact that it leaves usage unmeasurable
+  was not.
+
+### A concurrent reader no longer halts the desk, or drops a heartbeat tick (issues #242, #251)
+
+On Windows `MoveFileEx(..., MOVEFILE_REPLACE_EXISTING)` fails with
+`ERROR_ACCESS_DENIED` while the destination is open in a process that did not
+ask for `FILE_SHARE_DELETE`, and CPython's `open()` does not ask. So any
+concurrent READER of a file this desk publishes made the publishing `replace`
+fail. Observed once on the deployed desk, on the heartbeat, in two weeks of
+`loop_error` records; the mechanism is certain and **which reader held the
+handle is not measured and is not claimed.**
+
+- **The heartbeat (#242) aborted the tick.** The exception escaped
+  `_write_heartbeat`, so the rest of that management cycle did not run, and
+  the stamp did not advance, which makes a watchdog read in that window
+  report a STALE caused by its own read.
+- **The risk snapshot (#251) HALTED the desk.** `save_snapshot` raising
+  `StateUnwritable` makes `_persist_state` set `_halt_reason =
+  "state_unwritable"`, and a halted desk returns from `step_all` before
+  `_resolve_pending`, `_check_stops` and `_manage_open`. It does not flatten,
+  unlike the gates that normally halt. **Bounded to an availability defect by
+  one fact: an opening order carries `sl` and `tp` to the VENUE, so protective
+  stops survive a halted desk.** Trailing and scale-outs do not.
+- **Both retry, narrowly.** `straightedge.atomic`
+  `replace_retrying_on_share_conflict` spins at 20ms inside a 0.5s window on
+  `PermissionError` ONLY, never a bare `OSError`, because a retry absorbs a
+  RACE and never a CONDITION: a full disk, a vanished directory and a revoked
+  ACL are states waiting cannot fix. **A hold that outlasts the window still
+  raises, and for `state.py` still halts**, which is the module's contract that
+  a write it cannot complete is COULD NOT MEASURE.
+- **The gate runs on `windows-latest`, because no POSIX run can reach it**: a
+  rename over an open file succeeds there. Each case holds a real handle,
+  releases it on a signal only after a positive control has observed a genuine
+  refusal, and the POSIX leg asserts the conflict does not exist rather than
+  pretending to cover it.
+- **The idiom is now named once.** Seven sites in this package publish
+  write-tmp-then-replace and two retried; the five non-mailbox sites that
+  should share one helper are being converted per site, since adopting it
+  where no guard exists is a behaviour change rather than a rename.
+  `broker/mt4_live.py` keeps its own loop: the mailbox is the interface a
+  customer installs against.
+
+
+### A non-finite number no longer reaches the journal as a number (issue #231)
+
+`_num("9" * 5000)` returns `inf`, so a model reply could put `sl`, `tp`,
+`limit` or `stop` into an `advice_turn` row as a non-finite value, and `rr`
+reached `reject` rows the same way. The order path already refused such
+values (#208, #211, #219, #221); this was the RECORD, which is the evidence
+the reconciliation work depends on.
+
+- **The value is written as `nonfinite:<value>`, a string**, and the row
+  carries a `nonfinite` list naming the dotted paths converted. Merged with
+  a caller-supplied list rather than replacing it; the first version of the
+  fix clobbered it, which bites only when a caller uses the key AND the row
+  carries a non-finite value.
+- **Applied by the WRITER, after redaction and immediately before
+  serialisation**, so it covers every row and every field rather than one
+  producer. `rr: Infinity` already reached `reject` rows that `_num` does
+  not author, so a producer-side fix would have passed its own test while
+  the same token kept shipping.
+- **Recursive**, which the issue did not name: `_jsonable` is applied per
+  top-level field and does not descend, so a value nested in a dict or list
+  reached disk untouched. Measured on the real `history_preflight` shape,
+  where `symbols[1].atr` is a path a non-finite value can occupy.
+- **`allow_nan=False` makes the claim structural**: a value that escaped
+  marking cannot reach the bytes. It degrades to a row naming the event and
+  the failure rather than raising into the desk, because losing an
+  append-only audit row is worse than writing a degraded one.
+- **Not clipped and not omitted.** `jq` parses a bare `Infinity`, reports
+  `isinfinite` true, and serialises `1.7976931348623157e+308`, so a
+  reconciliation through the obvious tool reports a price the desk never
+  saw with no error anywhere. Clipping is what jq already does. Omitting
+  cannot be told from the model saying nothing.
+- The gate reads the written BYTES and uses `node` and `jq` as well as
+  Python, because `json.loads` ACCEPTS the bad line: a Python-only
+  round-trip passes today and would have passed before the fix.
+
 ### Claims that overstate their code, and a missing adapter note (issue #193)
 
 Residue from straightedge#182's approving review. Every item is a sentence, a
@@ -538,6 +704,147 @@ reds 1, removing the `advice_error` write reds 4, recording a crash as
 reds 1, and adding the provider's sentence to the row reds 1. Restored, 7
 passed, and the two controls (a successful command writes no error row, a
 refusal is still a refusal) are green before and after by construction.
+
+### The stop-guard refusal channel is gated, not just documented (issue #228)
+
+#220 closed the `refused: <word>` channel with a scan that has a denominator.
+`_stop_guard`'s words are just as operator-visible and sat outside every scanner
+in `tests/refusal_scan.py`: they do not follow `refused: `, and no
+`RiskDecision` carries them. The guard returns a bare word, `_modify` hands it
+to `OrderResult.invalid_stops`, and the desk renders
+`sl failed retcode=10016 <word>`.
+
+**The record was already complete and the GATE was missing, so no
+operator-visible behaviour moves here.** All three words were documented in the
+`/sl` row. Nothing read that documentation, so a fourth word, or a rename of any
+of the three, would have reded nothing.
+
+**Three words, and the issue said two.** The issue measured by grepping for
+`stop_removal_refused` and `stop_exceeds_risk`, the two words named by module
+constants. `_stop_guard` also returns `spec_not_measured:<fields>`, built by
+concatenation, so a grep keyed on known names could not have found it. An
+enumeration that starts from the names somebody already knows is not a
+denominator, which is the same failure one level up from the one the issue was
+filed about.
+
+**FIVE replies can carry one of these words, not just `/sl`.** `_modify` is
+reached by `/sl`, `/tp`, `/replace`, `/be` and `/trail`, so the same refusal
+arrives behind five labels. The test derives that set from the source (a method
+qualifies when it both calls a modifier and renders `<verb> failed retcode=`)
+and pins it, so a sixth command reaching the guard fails there. `cancel`,
+`close` and `closeby` render the same way, cannot carry one of these words, and
+are pinned as the negative half, because a derivation returning every render
+would satisfy the positive assertion and prove nothing. On the auto path
+(`_act`, `_manage_open`) there is no reply at all and the refusal is journaled
+as `modify_refused`; `docs/CONTRACT.md` now says to reconcile that from the
+journal rather than from chat.
+
+**The gate is anchored to its own table, and this channel is where that stops
+being a precaution.** All three words appear in the `/sl` row's PROSE, so a
+check asking `word in contract_text` passes with the new table deleted
+entirely: measured 3 of 3 True, where the table-anchored check reports all
+three as undocumented. #220 measured the same shape at 15 of 28. The section is
+a LEVEL-2 heading on purpose, because #220's scan runs from
+`### Refusal reasons` to the next `## `, and a `###` table here would have been
+read as part of that enumeration, surfacing every word below as a row with no
+code behind it.
+
+**Prose is reconciled, not pattern-matched.** `_modify_pending` refuses with
+three sentences (`sl required`, `buy needs sl < entry < tp`,
+`sell needs tp < entry < sl`). Nothing asks whether a comment LOOKS like a
+word: the population of `invalid_stops` comments minus the guard's vocabulary
+must equal the pinned set exactly, so a new comment is either a word that needs
+a row or prose that needs a decision, and it cannot be neither.
+
+**One condition turned out to have two spellings**, `refused: sl_required` on
+the order path and `sl failed retcode=10016 sl required` on the working-order
+modify path. Both are documented. Renaming one changes an operator-visible
+reply, so it is filed as #228's follow-up (#233) rather than slipped in beside
+a gate.
+
+Six mutations, each red where it should be and nowhere else: a deleted table row
+reds 2, a renamed word reds 3, a fourth word reds 2, a new prose comment reds 1,
+a verb that stops reaching a modifier reds 1, and deleting the whole section
+reds 3. Restored, 7 passed. Run with `PYTHONDONTWRITEBYTECODE=1` and a fresh
+`PYTHONPYCACHEPREFIX` per run, with the `.pyc` count as corroboration rather
+than as the guard, and each verdict read from `returncode`.
+
+**A review measured six spellings the gate was blind to, and all six now fail
+rather than pass as covered.** The scan reads a return that is a literal, a
+module constant, a literal-prefixed concatenation or a literal-first f-string.
+It cannot read a word returned through a local variable, a `"".join([...])`, a
+`str(...)` call, or a concatenation whose left side is not a literal. The repair
+is not to teach it every spelling: each of those lands in the scanner's
+`forwarded` set rather than being dropped, so `forwarded` is pinned EMPTY for
+the guard and pinned to exactly the one hand-off site for the factory. An
+unreadable return is now a failure that says it could not read, which is the
+honest state for a scanner, where "green" would have been a false claim of
+coverage.
+
+The sixth was a result built with the `OrderResult` constructor instead of a
+factory, invisible to the comment scan by construction. That is closed
+structurally rather than excluded: `engine.py` reaches every result through
+`measured`, `unchanged`, `not_sent` or `invalid_stops`, zero direct
+constructions, and a test keeps it that way.
+
+Each spelling verified by injection, not by argument: a local variable, a
+`join`, a call, a non-literal concatenation, a second forwarded comment, and a
+direct construction, six mutations, each red and none of them green. Both the
+test module and the contract section now state what the gate reads and what it
+cannot, per the ruling on #220's scope note.
+
+### The unresolved-send refusal is asserted, and the behaviour question it was filed with was a false premise (issue #237)
+
+```
+$ grep -rn "send_refused_unresolved" tests/
+(nothing)
+```
+
+A journalled refusal event with zero assertions anywhere, and it is the
+structured record of the one refusal class that exists to stop a DUPLICATE
+ORDER. It carries no named `reason`, so a scan built from `_reject(` and
+`journal.write("reject", ...)` sites could not see it: outside that population
+by construction rather than missed by the instrument.
+
+**The issue said this refusal is broadcast to the chat, unlike every `reject`
+site, and offered three options depending on whether that is intended. It is
+not broadcast, so none of the three applies.** `_emit` notifies only when
+`_format_event` returns a non-empty string; the formatter has no arm for this
+event and returns `""`; and the event is in neither `ALWAYS_NOTIFY_EVENTS` nor
+the default `notify_events` allowlist. Measured through a real unresolved send
+across a restart: **zero `sendMessage` calls, including with the event
+explicitly allowlisted**, because the formatter is the binding guard. So the
+journal-only invariant holds with no exception, nothing needed a carve-out, and
+no behaviour changed here.
+
+**Two independent reasons keep it quiet, which is worth pinning rather than
+celebrating.** Either alone is sufficient, so an arm added to `_format_event`
+later would start broadcasting a refusal silently with only the allowlist left
+in the way. The test allowlists the event ON PURPOSE and requires the chat to
+stay empty, which pins the formatter rather than the allowlist; adding a
+formatter arm reds it.
+
+**And the operator is not left uninformed, which is the thing the issue was
+right to worry about.** On the DESK path the reply is `refused: unresolved send
+<client_id>`, prose on purpose because it names one in-flight send (#220 pins
+it as prose). This event is the AUTO and restart path, where nobody is waiting
+on a reply and the journal is the record, exactly like every other auto
+refusal.
+
+**Driven through a real unresolved send across a RESTART, never by calling
+`not_sent()`.** The ledger is durable beside the journal, so the second engine
+is a restart rather than a second object: the desk's in-memory
+`_already_attempted` guard is gone and the engine's control is the only thing
+between the operator and a duplicate order. The only un-stubbed way to open a
+ledger entry is a venue that takes the order and never answers, since a
+rejection and a fill both CLOSE the entry, so the fake sits at the broker
+boundary and nothing inside the desk is stubbed.
+
+Seven mutations, each red where it should be: the record removed reds 3, the
+duplicate guard removed reds 3, `attempts` dropped reds 1, `first_at` dropped
+reds 1, the row no longer naming the send reds 2, the key comparison dropped
+(so every send is refused) reds 4 including the control, and a formatter arm
+that broadcasts reds 1. Restored, 5 passed.
 
 ### The advice row is bounded by construction, not by fixture (issue #226)
 

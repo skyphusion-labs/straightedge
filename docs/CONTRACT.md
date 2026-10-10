@@ -1,6 +1,6 @@
 # Contract
 
-`docs/TESTING.md` is the companion to this file: this one says what the suite enforces, that one says what a green suite cannot see. Read it before writing a fixture.
+`docs/TESTING.md` is the companion to this file: this one says what the suite enforces, that one says what a green suite cannot see. Read it before writing a fixture or a probe: the failures it records reach a script written to settle a review as readily as they reach the suite, and a probe has no suite behind it.
 
 Code that disagrees with this file is wrong.
 
@@ -56,6 +56,7 @@ Auto EMA trading is off until `/auto on`.
 | MT4 send timeout | A send that produced no reply is UNRESOLVED, never "failed": the order may be filled, in flight, or never sent. The desk withdraws the request if it still can, states which of `withdrawn` / `claimed` / `locked` it achieved, reads the book once, reports what it matched, and refuses to transmit that order again. It does NOT conclude from an empty book that nothing happened. |
 | Agent billing | `AI_PROVIDER=computer` posts to the agent. The agent bills through the gateway (`CF_AIG_TOKEN`), not a provider key. |
 | Redact | Journal writes, `loop_error` stderr, and Telegram `send` redact BotFather tokens. Named secret keys in the journal become `[REDACTED]`, on write AND again on `tail()` read, so a row from an older build is redacted too. `login` is one of those keys and `doctor --connect` masks it to the last four instead; see SECURITY.md for why the two differ. |
+| Non-finite in a row | **A non-finite number is never written as a number (#231).** `sl`, `tp`, `limit` and `stop` come from a model reply through `_num`, which returns `inf` for a long digit string (`_num("9"*5000)`), and `rr` reaches `reject` rows the same way. Such a value is written as the STRING `nonfinite:<value>` (`nonfinite:inf`, `nonfinite:-inf`, `nonfinite:nan`), and the row carries a `nonfinite` list naming the dotted paths converted (`sl`, `symbols[1].atr`), merged with any the caller supplied rather than replacing it. The marking is applied by the WRITER, after redaction and immediately before serialisation, so it covers every row and every field including nested ones, present and future, rather than one producer. `json.dumps` runs with `allow_nan=False`, so a value that escaped marking cannot reach the bytes at all; it degrades to a row naming the event and the encoding failure rather than raising into the desk, because losing an append-only audit row is worse than writing a degraded one. **Not clipped and not omitted, and both alternatives were rejected for measured reasons:** `jq` parses a bare `Infinity`, reports `isinfinite` as true, and then serialises it as `1.7976931348623157e+308`, so a reconciliation piped through the obvious tool reports a price the desk never saw with no error anywhere; and a row that silently drops an unusable value cannot be told from one where the model said nothing. The order path refuses non-finite values separately (#208, #211, #219, #221); this row rule is about the RECORD. |
 | File mode | `journal.jsonl`, `journal.jsonl.1`, `journal.tg_offset`, `journal.equity.json`, `journal.lock`, `journal.heartbeat`, and `HALT` are chmod 0600 on Unix. The bot sets umask 077. Windows has no POSIX mode bits; the lock is still exclusive. |
 | Sender lock | `TELEGRAM_ALLOW_SENDERS` (or `telegram.allow_senders`) lists the sender ids that may command the desk. Every command is checked, read-only included. A sender that cannot be read is refused. A negative (shared) chat id with an empty list refuses to start. A refusal is journaled as `command_rejected` and is not answered. |
 | Currency limit | `max_currency_exposure` (default 2) caps the net count of COMMITMENTS touching any one currency: open positions AND resting working orders, because an order at the broker becomes a position without anyone being asked again. A buy of EURUSD counts +EUR and -USD. The symbol being staged counts toward the check, not just the open book. |
@@ -79,6 +80,95 @@ Auto EMA trading is off until `/auto on`.
 | Unmeasured is not refused | An advice action that could not be turned into an order at all writes `advice_stage_failed` with `measured=false`, never `reject`. COULD NOT MEASURE stays distinct from REFUSED. |
 | Error record | A command that fails with `ValueError` or `RuntimeError` writes a row before the chat gets its sentence: `command_error` with `command`, `source` and `error_type`, or `advice_error` with `provider`, `stage` and `turn_spent` when the provider call itself raised. Both carry `measured=false`, so a crash is never counted as a gate saying no. The row carries the exception CLASS and deliberately NOT its message: a message can be authored by a provider or quote a model reply, which is the channel #216 and #226 closed, and the chat already has the sentence. `advice_error` exists separately because the daily advice cap is spent BEFORE the provider call (the turn is billed either way), so a failed turn costs a budget slot and `turn_spent` is the only field that can say so; before this the whole path was invisible to the journal and the operator saw the budget shrink with no record of why (straightedge#232, found by the live end-to-end run #35 requires, because a fake transport returns a payload and never raises). |
 | Auto arming | `/auto on` and `/auto off` write `auto_on` and `auto_off`, the audit trail `/live` and `/approve` already had. |
+
+### Refusal reasons: every `refused:` reply
+
+`refused: <reason>` reaches the operator verbatim, so the reason word is part of
+the contract and not an implementation detail. **This table is the ENUMERATION
+for that one reply shape; the rows above carry the mechanism in depth.** It is
+kept complete in BOTH directions by
+`tests/test_contract_refusal_vocabulary.py`, which scans the source for every
+word the desk can put after `refused: ` and fails when one has no row here, and
+also fails on a row naming a word the code can no longer emit (#220).
+
+**What that gate does and does not cover**, because a guarantee stated loosely
+is the thing this document keeps having to correct. It is closed over sites
+that name a word LITERALLY. A site whose word arrives by interpolation
+(`f"refused: {decision.reason}"`) is covered only because another scanner reads
+that word where it is set; a site whose payload is free text nobody defines
+(`f"refused: {result.comment}"`, filled by `OrderResult.not_sent`) has no word
+to document at all. Those sites are not counted and not ignored: the scanner
+returns each one and the test PINS the set, so a new one of either kind fails
+until a person decides which it is. The pin is the part that forces the look,
+and two earlier versions of it did not: the first saw no f-string site, the
+second saw no CONCATENATED one, which is how most people would spell it.
+
+What the pin sees is stated rather than implied, because this paragraph has
+twice claimed more than the mechanism did. A refusal reply must carry the
+literal `refused: ` prefix somewhere in the source, so every string constant
+carrying it is a site whatever assembles the rest, and the forms are measured
+one per test: f-string, concatenation with and without the space, `str.join`,
+an f-string with a leading expression, `%` and `.format`. **The one thing not
+seen is a prefix computed at runtime** (`"ref" + "used: "`), which leaves no
+literal to find; that limit is pinned by its own test so it cannot quietly
+become wrong in either direction.
+
+**SCOPE, stated because the table cannot close over what it does not scan.**
+A refusal that does not take the `refused: <word>` shape is NOT in this table
+and is NOT gated by that test:
+
+* `_stop_guard` refuses a `/sl` with `stop_removal_refused` or
+  `stop_exceeds_risk`, which surface as `sl failed retcode=<n> <word>` and
+  journal as `modify_refused`. Both words are documented, in the `/sl` row
+  above, and neither is scanned; widening the gate to cover that channel is
+  filed separately rather than grown into this change.
+* A quote that cannot be read is refused by raising, with operator PROSE rather
+  than a word (`unreadable tick for <symbol>`, `no tick for <symbol>`), so
+  there is no vocabulary entry to make.
+
+So read this table as closed over `refused:` replies, which is what it is, and
+not over everything the operator can be refused with.
+
+A `:` suffix means the word is a PREFIX and a measured payload follows it, which
+is what makes the refusal actionable rather than merely named.
+
+| reason | what was measured | what the operator does |
+| --- | --- | --- |
+| `already_in_symbol` | a commitment in that symbol already exists | close or replace it first |
+| `currency_exposure` | the order would push net exposure in one currency past `max_currency_exposure` | reduce elsewhere in that currency, or raise the cap deliberately |
+| `daily_loss` | the UTC day's loss budget is spent | nothing today; this also HALTS and flattens |
+| `deviation_below_spread:` | the effective slippage tolerance is smaller than the current spread, with the measurement and the config key to change in the payload | raise `symbol_deviation_points` for that symbol, or wait for the spread |
+| `exposure_unmeasured` | currency exposure could not be computed at all | look at the venue; this is COULD NOT MEASURE, not a cap |
+| `halt_file` | the HALT file exists on disk | remove it when you mean to resume (`docs/RUNBOOK.md`) |
+| `halted` | the circuit is latched halted and names no narrower reason | read the journal for the halt that latched it |
+| `live_not_accepted` | mode is live and the account is real, but the risk phrase was never given | `/live on I-ACCEPT-RISK`, or start with `--i-accept-risk` |
+| `margin_buffer` | free margin as a fraction of equity is below `min_free_margin_pct` | reduce exposure, or add margin |
+| `max_advice_turns_per_day` | the UTC day's advice turn budget is spent | nothing today |
+| `max_drawdown` | the peak-to-trough drawdown cap is hit | nothing today; this also HALTS and flattens |
+| `max_positions` | open commitments carrying our magic are at `max_positions` | close one, or raise the cap deliberately |
+| `max_trades_per_day` | the UTC day's trade budget is spent | nothing today |
+| `no_signal` | the strategy produced FLAT or no side | not an error; nothing to send |
+| `orders_unmeasured` | `broker.orders()` could not be READ, so commitment is unmeasured | look at the venue or the Expert; reading a failed read as "no orders" would fail OPEN |
+| `outside_session` | an AUTO order fell outside the configured session window | wait for the session, or send it manually, which is not session-gated |
+| `rr_below_min` | reward-to-risk on the signal is below `min_rr` | widen the target, tighten the stop, or skip |
+| `size_exceeds_risk` | the order's worst case exceeds **`min(per_trade, loss_room)`**, the LESSER of the per-trade cap and `loss_room`, which is the money the account may still lose before EITHER halt gate trips, daily loss or drawdown, computed from the persisted snapshot the sizer never sees (#157). Measured that way at both emission sites: `risk.py` on a new order, `engine.py` on a `/replace`. The reason carries NO payload, so it does not say which half bound | **depends on which half bound, and you have to work that out.** Per-trade cap: reduce size. `loss_room`: size is not the problem and halving it refuses again. If DAILY LOSS is the near one, stop and wait for the UTC roll; if DRAWDOWN is, the roll will not help, because peak-to-trough outlives the day. From `/replace` the refusal means specifically that the replacement ADDS risk, since #164 exempts a reduction from the cap entirely, so the action there is a replacement at or below what is already resting and never a smaller version of the increase |
+| `size_zero` | sizing returned zero lots | the stop distance is too wide for the risk budget at min lot; skip it |
+| `sl_not_measured:` | the VENUE reported a stop that cannot be a price (`nan`, `inf`), with the value in the payload | look at the venue; this is not your omission |
+| `sl_required` | **Arrives on TWO channels for one condition (#233):** as `refused: sl_required` from the order and sizing path, and as `sl failed retcode=10016 sl_required` from the working-order modify path and the paper adapter's send guard. One word, one row, deliberately not duplicated into the stop-guard table, because a second row is two places to drift. No USABLE stop: `unusable_stop` returns this for any `sl <= 0`, so it covers a stop that was never set (the venue encodes that as `0`) AND one set to a negative price, which is set but cannot be a price | set a stop at a real price. A negative value is not a missing stop and is worth re-reading as a sign or units mistake rather than an omission |
+| `spec_not_measured:` | the venue never streamed the named sizing fields, which are in the payload | get the symbol into Market Watch; sizing refuses rather than defaulting |
+| `spread_too_wide` | spread exceeds `max_spread_atr_frac` of ATR | wait for the spread to come in |
+| `state_unreadable` | the durable risk state could not be READ | fix the path or permissions; the budgets cannot be trusted without it |
+| `state_unwritable` | the durable risk state could not be WRITTEN | fix the path or permissions; a restart would hand out spent budget again |
+| `stops_level` | the stop is closer than the broker's own minimum distance | widen the stop past `stops_level` |
+| `trade_not_allowed` | the account or the Expert has trading disabled | enable it at the terminal |
+| `volume_unusable:` | a close or scale-out volume is not a finite number above zero, with the value in the payload | retype the volume |
+
+One refusal is PROSE rather than a word, deliberately: `refused: unresolved send
+<client_id>` names a specific in-flight send and cannot be a vocabulary entry.
+The scanner above returns it separately and the test pins it, so a NEW prose
+refusal is looked at by a person instead of quietly joining a list of things
+nothing checks.
+
 
 ## Forbidden claims
 
@@ -128,6 +218,69 @@ Auto EMA trading is off until `/auto on`.
 | `/auto on\|off` | Optional EMA regime. Fill alerts do not wait for this. Journaled as `auto_on` / `auto_off`. |
 | `/status` `/positions` `/halt` `/resume` | Account. `/halt` flattens, drops the confirm, and cancels working orders. |
 
+## Stop-guard refusals: the modify channel
+
+`_stop_guard` decides whether a stop may be APPLIED to an open position, and its
+refusal reaches the operator as `<verb> failed retcode=10016 <word>`, not after
+`refused: `. That is a second vocabulary on a second channel, so it gets its own
+enumeration: the table below is kept complete in BOTH directions by
+`tests/test_stop_guard_vocabulary.py`, which reads the guard's returns out of the
+source and fails when one has no row here, and also fails on a row naming a word
+the guard can no longer return (#228). The `/sl` row above carries the mechanism
+in depth; this table is the word list.
+
+**WHAT THAT GATE READS, stated because a gate that does not say what it cannot
+see gets read as covering everything.** It reads a return that is a string
+literal, a module constant, a literal-prefixed concatenation, or an f-string
+opening with a literal. It CANNOT read a word returned through a local
+variable, a `join`, a `str(...)` call or a concatenation with a non-literal left
+side; each of those lands in the scanner's `forwarded` set, which the test pins
+EMPTY, so a new spelling fails as unreadable rather than passing as covered. A
+result built with the `OrderResult` constructor instead of a factory would be
+invisible to the same scan, so a separate test requires every result in
+`engine.py` to come from a factory, which is true today at zero direct
+constructions.
+
+**FIVE replies can carry one of these words, not just `/sl`.** `_modify` is
+reached by `/sl`, `/tp`, `/replace`, `/be` and `/trail`, so the same refusal
+arrives behind five labels (`sl failed`, `tp failed`, `replace failed`,
+`be failed`, `trail failed`). The test derives that set from the source rather
+than restating it, so a sixth command reaching the guard fails there. `cancel
+failed`, `close failed` and `closeby failed` render the same way and can never
+carry one of these words, because those paths never reach a modify.
+
+**On the AUTO path there is no reply and the record is the only witness.**
+`_act` and `_manage_open` reach the same guard with no operator waiting, so the
+refusal is journaled as `modify_refused` with both stops and no chat message is
+sent. Reconcile an auto refusal from `journal.jsonl`, never from chat scrollback.
+
+A `:` suffix means the word is a PREFIX and a measured payload follows it.
+
+| reason | what was measured | what the operator does |
+| --- | --- | --- |
+| `spec_not_measured:` | a WIDENING was asked for on a symbol whose sizing fields the venue never streamed, named in the payload | get the symbol into Market Watch; a TIGHTENING still applies, so risk can always be reduced |
+| `stop_exceeds_risk` | the widening's worst case exceeds `risk_pct * max_risk_multiple` of equity, or the remaining daily loss room | tighten instead, or accept the stop that fits; at or beyond breakeven nothing is capped |
+| `stop_removal_refused` | the price would leave a protected position unprotected: at or below zero, or non-finite (`nan`, `inf`) | send a real price; `0` is the venue encoding for "no stop" and `nan` compares False against every bound |
+
+TWO comments on this channel are operator PROSE rather than words, and that is
+deliberate: `_modify_pending` refuses a working-order modify with
+`buy needs sl < entry < tp` and `sell needs tp < entry < sl`, which describe an
+ORDERING between three numbers rather than a named condition. There is no word
+to converge them on and inventing one would be worse than the asymmetry. The
+test pins that set exactly, so a new comment is one of three things and cannot
+be none of them: a word that belongs in this table, prose that belongs in the
+pin, or a word whose row is in the `refused:` table.
+
+**A missing stop used to be the third prose comment and is now a WORD on both
+channels (straightedge#233).** `_modify_pending` and the paper adapter's send
+guard answer `sl failed retcode=10016 sl_required`, the same word the order and
+sizing path reports as `refused: sl_required`. **Its single row is in the
+`### Refusal reasons` table and names both channels**, deliberately not copied
+here: a second row would be two places to drift. This gate excludes it on that
+basis and a test proves the row really exists there, because an exclusion with
+no positive check is how a word stops being documented anywhere while two gates
+each believe the other covers it.
+
 ## Confirm and send
 
 `/confirm` for a market order reprices and re-runs `preview`.
@@ -172,7 +325,7 @@ calls apart.
 
 Journal events: `send_unresolved` (a send answered nothing; carries the key, what
 the mailbox did with the request, and any position whose comment matched),
-`send_refused_unresolved` (a second send for the same key was refused),
+`send_refused_unresolved` (a second send for the same key was refused; journal-only like every other refusal, and asserted that way with the event explicitly allowlisted, because `_format_event` rather than the allowlist is what keeps it out of the chat),
 `confirm_unresolved` (the chat path's record of the same), `inflight_unreadable`
 (the ledger file exists and could not be parsed, which must never read as "no open
 sends"). `Engine.start()` re-announces every open record on EVERY start.
@@ -353,9 +506,13 @@ Each `step_all` that reaches `account` writes `journal.heartbeat`.
 Line 1 is an ISO timestamp, and that has not changed since 1.0.0.
 After it, one `key=value` per line: `blocked=`, `mode=`, `stale_after_s=`,
 `tick_budget_s=`, `tick_gap_max_s=`, `over_budget=`, `tick_gap_ever_s=`,
-`over_budget_ever=`, `run_id=`, `started_at=`, `deployed=`.
+`over_budget_ever=`, `breach_rows_lost=`, `run_id=`, `started_at=`,
+`deployed=`.
 (`deployed=` was shipped by 1.6.0 and this list did not name it; corrected
-here rather than left for a reader to find in the renderer.)
+here rather than left for a reader to find in the renderer. **A test now reads
+this list and requires every rendered field to appear in it**, so the next
+addition cannot drift the way that one did: nothing asserted this before, and
+the format was a contract in name only.)
 `run_id=` is one value per desk PROCESS, assigned at construction and never
 reassigned, and `started_at=` is when that process started.
 A reader compares `run_id` across observations to see a RESTART. It is not the
@@ -385,6 +542,17 @@ last restart. It is not a stale reading; it is the one a restart used to erase.
 `tick_gap_ever_s` is a maximum over the heartbeats that SURVIVED, and it is
 never lower than what the live process has itself observed. Deleting
 `journal.heartbeat` resets it, and that is the only way to lose the box history.
+`breach_rows_lost` counts the `tick_gap_breach` rows this PROCESS detected and
+could not write, after a bounded retry. **It is the only surface that reports a
+hole in the audit log, because the channel designed to carry a breach is the
+journal and this field exists for the case where that journal is what failed**
+(straightedge#217). Zero on a healthy desk and published on every heartbeat, so
+it is a field a reader can rely on being present rather than one that appears
+only when something is wrong. A non-zero value means the breach HAPPENED and
+the row does not exist: `tick_gap_ever_s` still answers whether this box has
+ever breached, and the count of occurrences is short by this much. The journal
+row is attempted on up to three ticks before the record is declared lost; an
+unbounded retry would sit in the latency path the record exists to explain.
 A desk too old to publish `over_budget_ever` leaves the box history UNKNOWN. A
 reader says so and does NOT read the missing field as a clean history, the same
 rule this file already states for a missing `stale_after_s`.

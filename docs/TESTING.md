@@ -133,6 +133,65 @@ you did not. #170 was recorded as a real gap only because someone widened the
 fixture space after the first control came back empty; stopping at the clean
 nothing was the near-miss, and it was one step away.
 
+
+## If every row of a swept parameter gives the same answer, the parameter is not reaching the code
+
+The section above is the case where nothing reds. This is the case where
+EVERYTHING reds, identically, and it is a reviewer's instrument rather than a
+test: the same failure reaches a probe written to settle a review, and that
+probe has no suite to protect it.
+
+**The uniformity IS the reading.** Measured while reviewing #182: a sweep
+hunting a false refusal returned 32 refusals out of 32, at every bar age and
+every staleness. The probe was wrong, not the code. `synthetic.generate_bars`
+steps 3600 by default and the probe strided `start_ts` by 900, which put
+`bars[-1]` eight days in the FUTURE, so every reading refused for a reason
+unrelated to the subject. Trusting it would have filed a 32-case regression
+against a correct safety check.
+
+An all-refuse result that does not MOVE with its inputs is a broken instrument,
+not a finding. So a probe wants two controls, not one: a case that must pass and
+a case that must fail. With both present, a uniform answer is visibly a broken
+instrument rather than a result, and the fixture's own premise is worth
+asserting out loud, because the premise is what was wrong here and nothing in
+the output said so.
+
+**The same family reaches the plumbing around a probe, not only its fixtures**,
+and it is worth naming because each instance looked like a clean negative:
+
+- A mutation runner piped its summary through `head -14`. A widely-red mutation
+  printed a long failure list, the summary scrolled past the cut, and 18
+  failures read as NO RESULT. Fixed by printing the summary FIRST, so a
+  truncated tail can never be mistaken for an empty one.
+- A harness displayed the enclosing function of each mutation by matching on
+  line CONTENT, so it confidently named the wrong function. Nothing was wrong
+  with the mutation; the label was. Dropped in favour of `git diff -U0`, which
+  cannot be wrong about what it changed.
+- A census grep excluded string-method `.replace()` calls with
+  `\.replace\(.[a-z]+., ` and thereby excluded `os.replace(tmp, self.path)`,
+  dropping a filesystem call site from a population published as complete
+  (straightedge#251). **A filter written to remove noise removed a member of
+  the population.** Print the denominator and enumerate the exclusions: 19
+  `.replace(` occurrences, eight `datetime.replace(tzinfo=...)`, five string
+  operations, **one a docstring QUOTE of code**, seven real call sites. A count
+  with its domain and its exclusions stated cannot hide a wrong filter; a bare
+  "six sites" can.
+
+- **A guard that PRINTS its verdict has not asserted it.** A pre-apply check
+  computed `ok=0`, and the next line was `echo "SAFE: $ok"` chained to the
+  apply with `&&`. **`echo` succeeds whatever it prints**, so the apply ran
+  against a guard that had just said unsafe. The same guard was also the wrong
+  instrument for its subject, being line-oriented over files that are one
+  paragraph per line, and the correctness of what it let through was only
+  established by re-measuring at word level afterwards. Two defects stacked:
+  the verdict was never tested, and the verdict was wrong. Chain the ACTION
+  behind the comparison, never behind a line that reports it, and remember that
+  `$?` after a pipe is the PIPE's status, so a guard that pipes needs
+  `${PIPESTATUS[0]}`.
+
+Every one of those made a reviewer's instrument report the reassuring state,
+which is this file's subject applied to the tools the reviewer brought rather
+than to the code under review.
 ## A clean textual merge is not a passing merge
 
 Two changes can auto-merge with no conflict and produce a failing suite. Git
@@ -149,6 +208,15 @@ When two branches touch one test file, run the combined suite before either
 merges. `git merge --no-commit --no-ff <other>` then the suite, then
 `git merge --abort`.
 
+
+**The index is a third state.** A census that reads `git ls-files` sees the
+INDEX, not the working tree and not the ref. Measured: after resolving a
+`CHANGELOG` conflict in the working tree WITHOUT staging it, six
+`test_venue_vocabulary.py` counts came back inflated, because `git ls-files`
+emits a conflicted path once per unmerged stage, so the file was counted twice.
+The census was right and the tree was half-merged. `main` being green on the
+same tests is what separated the two readings, and a per-file count diff against
+it located the duplicate in one step.
 ## An observation taken downstream of your own mutation is not evidence
 
 Four of this sprint's wrong readings were the same act: looking at something
@@ -287,6 +355,129 @@ right and the narration was lucky, which is the distinction worth keeping: a
 correct outcome does not retroactively make the reading that accompanied it
 evidence.
 
+
+**This entry had no mechanism when it shipped, and the honest resolution is
+that the ENFORCEMENT already exists and is not ours: GitHub computes
+`mergeStateStatus` against the required contexts, and a `BLOCKED` pull request
+cannot be merged whatever any script of ours believes.** What has no mechanism,
+and what this entry is actually about, is the hand-rolled SECOND reading that
+gets built next to it. So the rule is: do not hand-roll it, and here is the
+command, because an entry telling a reader to assert something without saying
+how is the rot this file is about.
+
+```sh
+R=skyphusion-labs/straightedge
+SHA=$(gh pr view "$PR" --repo "$R" --json headRefOid --jq .headRefOid)
+# The contexts that GATE the branch, read from the rule rather than guessed:
+gh api "repos/$R/rules/branches/main" \
+  --jq '[.[]|select(.type=="required_status_checks")
+         |.parameters.required_status_checks[].context]'
+# Each one, by NAME, with ABSENT distinguished from PENDING and from a failure:
+for c in $(…that list…); do
+  gh api "repos/$R/commits/$SHA/check-runs" --jq \
+    "[.check_runs[]|select(.name==\"$c\")|.conclusion]
+     |if length==0 then \"ABSENT\" else .[0] // \"PENDING\" end"
+done
+```
+
+**Measured, and this is the control that makes the rule worth a section.** On a
+payload with no checks at all, which is exactly the four-poll window the
+paragraph above describes, the two expressions disagree:
+
+```
+$ echo '{"check_runs":[]}' | jq '[.check_runs[]|select(.conclusion!="success")]|length == 0'
+true
+```
+
+The broken expression reports **all-clear** on a sha where nothing has run, and
+the by-name form reports `coverage=ABSENT ci=ABSENT`. One command, offline,
+reproducible, and it is the whole argument: **the failure is not that the
+expression is subtly wrong, it is that its answer is identical in the clean case
+and in the empty case.**
+
+**FIVE distinguishable states, measured, not two.** This entry first named
+ABSENT and PENDING. Seven independent measurements by five seats over one
+evening found three more, and a count is wrong in BOTH directions across them:
+
+| state | what a rollup shows | how a count reads it |
+| --- | --- | --- |
+| ABSENT | the row is not there at all | green, because zero failures |
+| QUEUED | row present, not started | green, same reason |
+| present-but-IN_PROGRESS | row present, running | green, same reason |
+| present-but-PENDING | row present, unfinished, no conclusion | green, same reason |
+| COMPLETED | row present, conclusion set | the only one that is actually green |
+
+The longest measured run of the first state was **twelve consecutive polls
+reading zero failures while `ci` was simply not in the rollup**, roughly four
+minutes. And the opposite reassurance was measured on the same pull request one
+poll earlier: **every row present and none finished**, 12 of 12 not completed,
+which reads as twelve rows of progress rather than as nothing having run.
+
+**So neither a pass count nor a row count is sufficient, and they fail
+differently.** A row count misses ABSENT; a pass count misses all four. That is
+the reason to PRINT the row count as context.
+
+**But do not compare it to a constant, and this is where a first version of
+this entry was wrong.** The row count is a property of the BRANCH's workflow
+file; the required contexts are a property of the RULESET. **Those are different
+objects and only the second one gates.** Measured across the open pull requests
+at one instant: three different row counts were live simultaneously, because
+each branch runs the workflow its own head carries. A branch whose head predates
+a workflow change keeps producing the old count until it currents, and that is
+correct rather than a missing row.
+
+The worked counterexample is a dependency bump whose head carries an older
+`ci.yml` with five jobs: **it legitimately produces TEN rows, so a floor of 14
+rejects it on the count alone, before anything is known about its
+conclusions.** Nothing need be said about whether that branch passes; the
+defect is in the denominator, not in the verdict, and the argument is cleaner
+without one.
+
+**So the criterion is the by-NAME half on its own:** the required contexts
+PRESENT and SUCCESS, the language-specific `Analyze` jobs COMPLETED, and zero
+non-COMPLETED rows. Read which contexts are required from
+`/rules/branches/main` rather than hard-coding them, as above.
+
+**One measured edge on the conclusion half.** A row can be COMPLETED with a
+conclusion that is neither success nor failure: on that same dependency bump,
+`CodeQL` reads `status=completed conclusion=neutral`, measured through
+`repos/{o}/{r}/commits/{sha}/check-runs` rather than off the rollup label. So a
+gate asserting every row is SUCCESS rejects a branch that is fine, while
+`zero non-COMPLETED` accepts it correctly. **Treat `neutral` and `skipped` as
+acceptable conclusions and assert SUCCESS only on the contexts the ruleset
+actually requires.**
+
+That row was first described to this file as a sixth state, `skipping`, present
+and never running. **It is not: it is COMPLETED with a neutral conclusion, and
+the table above stays at five.** Recorded because the measurement is the only
+reason to know that, and a sixth state added on one unmeasured observation
+would have been this entry's own subject.
+
+**And one field that cannot be used as a check in either direction.**
+`closingIssuesReferences` on a pull request is empty for PRs that do close an
+issue (measured: one closed its issue with the field empty), and a populated
+field does not promise the close either, because the squash body is editable at
+merge time. **So neither emptiness nor content is evidence**, and the only
+reliable check is reading the ISSUE state back after the merge. That is the same
+record-versus-artifact distinction as everything else here: the pull request
+object is not the issue.
+
+`repos/{owner}/{repo}/rules/branches/main` needs no elevated scope: it answers
+for a plain collaborator token, which is why reading the rule is preferable to
+hard-coding `ci` and `coverage` into a script that then cannot notice the rule
+changing. Read **`/rules/branches/main`**, which answers "what GATES this
+branch", and never `/rulesets`, which answers only "what EXISTS" and lists
+rulesets that match no branch.
+
+**What a CI mechanism would take, and why there is not one.** A workflow job
+cannot assert its own siblings: inside the same run `ci` and `coverage` are
+pending by construction, so the job would have to be keyed on the completion of
+the others and would then be asserting, at merge time, the thing GitHub's own
+branch rule already computes and already enforces. **A second implementation of
+a gate that works is not a second gate, it is a second thing that can be
+wrong** -- and it would be the one with no enforcement behind it. So this entry
+is deliberately a PRACTICE with a runnable command, not a check, and it says so
+rather than leaving a reader to discover it.
 ## A control beats a second opinion
 
 Two instruments agreeing is CORROBORATION. A control showing the instrument can
@@ -426,6 +617,149 @@ only catches the blind-seam case. **Three seams are blind today**
 (`cancel`, `check_working`, `working`), which is a finding this file is
 raising, not one it has fixed.
 
+
+## And the dual: a substitute that cannot SUCCEED the way the real thing does
+
+The section above is a double too SOFT to fail. A double can also be too HARSH
+to pass, and that one is harder to spot because it presents as a red: the test
+fails, the fix looks wrong, and the thing that is actually wrong is the stand-in
+demanding behaviour the subject must not have.
+
+Measured, straightedge#242. The fix retries a `replace` that a concurrent
+Windows reader refused. The first version of the `windows-latest` test held the
+destination open across the whole call, so the retry spun for its full window
+against a reader that never released, and then re-raised. **It failed on the
+branch WITH the fix**, and it was the test that was wrong: a retry absorbs a
+RACE, never a CONDITION, and a retry that waited out a permanent hold would
+convert a rare dropped tick into a stopped desk. A sibling test in the same
+file REQUIRED exactly the behaviour this one forbade, so the two halves of one
+file asserted opposite outcomes.
+
+**Neither POSIX run could have arbitrated, because on POSIX the conflict does
+not exist at all** -- a rename over an open file succeeds there. Only the
+platform could say which half was right, which is the same argument as the
+section above from the other end: a double's fidelity is not reviewable from
+the side that cannot reach the state.
+
+Two things it changes about how to write one:
+
+- **Split the two cases and assert both outcomes.** A hold that outlasts the
+  window must SURFACE; a hold that lets go must be ABSORBED. A file whose two
+  halves pin opposite results cannot be satisfied by making the retry
+  unbounded, which is the repair a single over-harsh test invites.
+- **Make the stand-in release on a SIGNAL, not a timer**, and only after a
+  positive control has observed the real refusal. Then the test cannot pass by
+  the conflict never having occurred, and it cannot fail by demanding the
+  impossible.
+## A consumer that rebuilds what it should call looks maintained and is not
+
+Six instances in one evening, five from one seat and one independent, and **none
+of them was found by running the suite.** Every one was a correct line of code
+sitting beside another correct line of code that said the same thing, which is
+the shape that survives review: there is nothing wrong to see.
+
+| instance | what looked maintained | what was actually true |
+| --- | --- | --- |
+| a scanner gained a `composed:` output bucket | the gate filtered `("prose: ", "interpolated: ")` and all 20 tests passed | a concatenated refusal was surfaced by the instrument and dropped by the gate |
+| the filter was derived from the declaration | one correct spelling | FOUR call sites each spelled it, so mutating one mutated nothing the others called |
+| the comparison was shared via a helper | the pin and the injection test both called `non_word_sites` | each then built its own comparison against the pin, `==` in one and `!=` in the other |
+| a probe measured an injected line | a delta against the real module | the baseline moved when another case injected into it, so a probe redded on a change it was not about |
+| a verify-before-push script | it reported the in-tree bytecode count | it PRINTED the count and said `VERIFIED` regardless |
+| another seat's pre-apply guard | it printed `SAFE: 0` | the apply ran anyway |
+
+The fifth is the rule proving itself on its author: it was fixed in one script
+and left in its sibling, **instance closed, class open**, on the same evening
+that author was cataloguing the pattern in the gates. The sixth happened
+independently, which is what makes this a mechanism rather than one person's
+habit.
+
+**It took three iterations to fix the first one, and each fix was correct.** The
+filter was derived; then the four spellings became one predicate; then the two
+comparisons became one function. Each closed the instance and left the class one
+level up.
+
+### Scoping is a property of the PAIR, not of either side
+
+The sharpest version, because the same defect appeared in both halves of one
+read/write pair on one night:
+
+- **One gate scoped its WRITER and not its READER.** Its coverage check asked
+  `word not in contract_text`, which passes on a mention anywhere in the file.
+  15 of its 28 words were also named in prose, so deleting a table row left the
+  suite green.
+- **Another scoped its READER and not its WRITER.** Its `table_words` is
+  section-anchored, correctly and for a stated reason, while its control removed
+  a row with a whole-file `re.sub(..., count=1)`. Once a second table documented
+  the same word EARLIER in the document, the removal deleted *that* row, the
+  section kept its own, and the control redded with "the row was not removed"
+  **while nothing was wrong with either table.** Diagnosed by position: rows at
+  two offsets, the section spanning a third range, the deleted one outside it.
+
+**A scope stated on one side of a read/write pair is not a scope.** Both sides
+have to take it from one place, which is this rule again: the second control
+rebuilt the bounds instead of calling the reader's. The repair extracted the
+bounds into a helper, because a second spelling of them would have been the
+same defect a third time.
+
+### Why it survives review: the data is the missing discriminator
+
+**A gate whose subject does not occur in the data cannot be validated by running
+it.**
+
+The `composed:` case took three iterations because **the repository held no
+composed refusal site**, so every version, including the broken ones, behaved
+identically on it. Only an injected site discriminated them. The missing
+discriminator was the data, not the code, and no amount of care running the
+suite could have supplied it.
+
+That explains all six instances, which is why this is one rule rather than six:
+the thing being gated was absent from the repository, or present only in another
+test's injection, or benign on every run that happened.
+
+**The same rule has a second face, pointing the other way.** A gate whose
+subject is NON-DETERMINISTIC cannot be INVALIDATED by running it either: one
+green proves nothing and one red proves nothing, which is exactly why a re-run
+feels like evidence. And a third, measured on this repo's own counts: **a
+denominator whose corpus everyone edits incidentally is stale by default.** A
+repo-wide fenced-block count moved while its own pull request sat, because a
+`CHANGELOG.md` entry landed carrying a fenced block. **Every PR touches that
+file and none of their authors believe they are editing a counted corpus.**
+
+So the instruction is **state the corpus, not the number.** A number needs
+re-deriving by every reader; a corpus definition does not.
+
+### What to do instead
+
+1. **Call the shared body, never rebuild an equivalent one.** A second correct
+   spelling is still a second source of truth, and it diverges silently on the
+   day the subject first appears.
+2. **Derive both halves of a read/write pair from one place.** A
+   section-scoped reader with a whole-file writer is not scoped.
+3. **Measure by injection, not by running the gate.** If the gate's subject is
+   absent from the repository, a green run is not evidence; inject the subject
+   and watch the gate red.
+4. **Assert, do not print.** A step that echoes a number and continues cannot
+   fail. Prefer the invariant you actually need: `before == after` is usually
+   it, not `== 0`, because a zero assertion reds on pre-existing state and
+   tempts a cleanup the harness may refuse anyway.
+5. **State the corpus rather than the count**, for any figure drawn from a
+   corpus that other work edits incidentally.
+
+### The honest reach of this rule
+
+It does not say duplication is always visible. It says a duplicate that
+**diverges** is invisible while a gate **deleted** shows in the diff, and that
+the two want different responses: the first needs a single body, the second
+needs review. Conflating them produces a meta-test, which is another body,
+which is the defect again.
+
+**And the single-body fix has a measured limit.** On the gate above, hand-copying
+the filter inside any shared body reds; a caller that stops calling the chain
+(`drift = ()`) does not, and leaves every test green. That is recorded in the
+docstring rather than closed, because closing it needs the extra body the shared
+one exists to remove. **So the claim is the narrow one: there is no second
+comparison to drift, not that the gate cannot be removed.**
+
 ## Execute the documentation, do not review it
 
 Every procedure in a document rots silently, because reading one cannot tell a
@@ -445,8 +779,8 @@ branch:
 
 | domain | command naming the domain | files | with fenced blocks | blocks |
 | --- | --- | --- | --- | --- |
-| `docs/*.md` plus `README.md` | `git ls-files 'docs/*.md' README.md` | 11 | 6 | 41 |
-| `**/*.md` across the repo | `git ls-files '*.md'` | 18 | 12 | 64 |
+| `docs/*.md` plus `README.md` | `git ls-files 'docs/*.md' README.md` | 11 | 6 | 45 |
+| `**/*.md` across the repo | `git ls-files '*.md'` | 18 | 12 | 69 |
 
 **Those figures are MEASURED AT THE TIP THAT CARRIES THEM, not predicted for a
 future merge, and that change is deliberate.** Earlier versions of this
@@ -459,7 +793,11 @@ contains, and there is no arithmetic left to go stale.
 for the rule rather than an anecdote.** At `f98984b` the row read 18/11/57 and
 predicted 59 after this file merged. It merged, and the repo-wide figure was
 **62**. While the pull request adding the section above was open, #240 landed
-and it became **64**. The `docs/` row, meanwhile, hit its predicted 40 exactly
+and it became **64**. It reached **68**, and then **69** while the pull request
+carrying THIS sentence was open, because a `CHANGELOG.md` entry arrived
+carrying a fenced block. **That is a fourth movement with nothing in this file
+changing, and it came from the file nobody thinks of as documentation.**
+The `docs/` row, meanwhile, hit its predicted 40 exactly
 and has only moved by this file's own additions. So the broad domain moved
 three times without this file changing at all, and the narrow one never moved
 except when it did: **a markdown commit may move the count and may not, which
@@ -585,9 +923,60 @@ markdown table, which both renders better and keeps the row describing the file
 rather than describing itself; if you add a fence here, re-run and update the
 row.
 
-**The 2 are the `git diff` example far above and the script just above, and
-that is the whole population**, so the only thing that can move the number is a fence added
-to or removed from this file. Name the method as well, because this file is a
+**It went stale AGAIN, and this time nothing in this paragraph changed.** The
+sentence above used to read "the 2 are the `git diff` example far above and the
+script just above, and that is the whole population". **Measured on
+`origin/main` before this change: THREE.** #244 added a
+`python3 tests/double_census.py` output block in the section on substitutes, and
+the count here was not part of that diff, so the row describing this file was
+wrong the moment a section was appended to it. That is the third time this
+figure has rotted, and the second time it rotted while every word about it
+stayed put: the de-fenced table removed the self-reference and did not remove
+the dependence on the rest of the file.
+
+**So stop asserting the number in prose.** The blocks are enumerated below
+because an enumeration is checkable line by line, where a bare integer is only
+checkable by re-deriving it, and re-derive is exactly what nobody does:
+
+In file order, which is the order the script numbers them in:
+
+| # | what it is | command-shaped lines | executed |
+| --- | --- | --- | --- |
+| 1 | the `git diff --stat` pair, an example with its output | 2 | 0, both carry `<placeholder>` |
+| 2 | the required-contexts `gh` commands | 0 | 0, `gh`/`for`/assignments are not recognised |
+| 3 | the empty-payload control, a `jq` line and its output | 0 | 0 |
+| 4 | the `double_census.py` output | 0 | 0 |
+| 5 | the verifier itself | 0 | 0 |
+| 6 | the verifier's own `exit=1` output, quoted above | 0 | 0 |
+| 7 | the domain command below, added so this file is not a document the verifier refuses | 1 | **1** |
+
+**Seven, and only the last one runs.** That ratio is the honest reach of this
+tool restated: it recognises four command prefixes and skips anything carrying a
+placeholder, so most of what looks like a command in a document is correctly
+invisible to it. The row to watch is the last column summing to at least 1.
+
+**AND THE SHIPPED SCRIPT EXITED 1 ON THIS FILE, which is worse than a wrong
+count.** Run verbatim against `docs/TESTING.md` at `origin/main`:
+
+```
+fenced blocks: 3
+block 1: SKIP (placeholder)  git diff --stat origin/main..<head> ...
+block 1: SKIP (placeholder)  git diff --stat origin/main...<head> ...
+command lines executed: 0
+no command was executed: this is a broken check, not a clean document
+exit=1
+```
+
+Every command-shaped line in the file carried a `<placeholder>`, so the
+script's own `ran == 0` guard fired and reported the document broken. **The
+guard was right and the subject was this file.** A verifier that cannot pass on
+the document it ships in teaches a reader to ignore its exit code, which is the
+one thing a self-checking document cannot afford. One runnable line fixes it,
+and it is the command the domain table already names:
+
+```sh
+git ls-files 'docs/*.md' README.md
+``` Name the method as well, because this file is a
 case where both obvious ones lie: `grep -c` on the fence marker reports 5,
 since it counts matching LINES and one line carries two markers; `grep -o` of
 the same marker piped to `wc -l` reports 6, since it counts OCCURRENCES and two

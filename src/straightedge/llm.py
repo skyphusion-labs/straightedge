@@ -603,7 +603,30 @@ class Advisor:
                 "temperature": 0.2,
             },
             timeout=60.0,
-            headers={"Authorization": f"Bearer {self.cfg.grok_key}"},
+            # SAME DECISION, SAME PREDICATE, as the claude path below (#155).
+            # Routing `grok_url` at a Cloudflare AI Gateway is what gives this
+            # provider a call count, a token count and a cost figure, because
+            # the counter then lives OUTSIDE the process it measures. An
+            # estimate computed here could not serve that: the code that
+            # stopped calling the model is the same code that would stop
+            # incrementing our own counter, so a day of zero spend on a config
+            # that should call every bar would look identical to a healthy day.
+            # That is the point of this change, not accounting.
+            #
+            # `_is_cf_gateway` is CALLED rather than re-spelled, so a bypass
+            # shape fixed for one provider is fixed for both; the two cannot
+            # drift. It parses the HOST only, so the provider-specific path
+            # after the gateway id is irrelevant to the decision.
+            #
+            # Pointing `grok_url` straight at api.x.ai keeps the original
+            # direct BYOK behaviour, so a self-hoster with their own xAI key
+            # changes nothing. The URL decides; there is no mode flag that
+            # could disagree with it.
+            headers=(
+                {"cf-aig-authorization": f"Bearer {self.cfg.grok_key}"}
+                if _is_cf_gateway(self.cfg.grok_url)
+                else {"Authorization": f"Bearer {self.cfg.grok_key}"}
+            ),
         )
         choices = data.get("choices") or []
         if not choices:

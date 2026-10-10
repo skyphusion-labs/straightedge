@@ -9,6 +9,7 @@ Rotated history is <name>.1.
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import sys
@@ -62,7 +63,29 @@ class Journal:
             **{k: _jsonable(v) for k, v in fields.items()},
         }
         rec = redact(rec)
-        line = json.dumps(rec, default=str) + "\n"
+        # SANITISE LAST, immediately before serialisation (#231). Placed after
+        # `redact` on purpose: anything between this call and `json.dumps`
+        # could otherwise reintroduce a non-finite value, and the guarantee
+        # being made is about the BYTES, not about one producer's inputs.
+        rec, nonfinite = _mark_nonfinite(rec)
+        if nonfinite:
+            # MERGE, NEVER REPLACE. A caller may already use this key, and
+            # measured on the first version of this fix, it was clobbered:
+            # `write("advice_turn", nonfinite=["caller_said_this"], sl=inf)`
+            # wrote `"nonfinite": ["sl"]` and the caller's entry was gone.
+            #
+            # It bites only when a caller uses the key AND the same row carries
+            # a non-finite value, which is why nothing noticed: with no
+            # non-finite value the caller's field survives untouched. A row
+            # about what could not be measured is the worst place to silently
+            # drop what somebody said could not be measured.
+            prior = rec.get("nonfinite")
+            if prior is None:
+                rec["nonfinite"] = nonfinite
+            else:
+                kept = prior if isinstance(prior, list) else [prior]
+                rec["nonfinite"] = kept + [p for p in nonfinite if p not in kept]
+        line = _dump(rec) + "\n"
         self._rotate_if_needed(len(line.encode("utf-8")))
         with self.path.open("a", encoding="utf-8") as fh:
             fh.write(line)
@@ -369,6 +392,103 @@ def _unlock(fh: TextIO) -> None:
     import fcntl
 
     fcntl.flock(fd, fcntl.LOCK_UN)
+
+
+#: How a non-finite number is spelled in a row. A STRING, so the type itself
+#: says the field is not a measurement, and prefixed so it cannot be confused
+#: with a model that literally sent the text "inf".
+NONFINITE_PREFIX = "nonfinite:"
+
+
+def _mark_nonfinite(value: Any, _path: str = "") -> tuple[Any, list[str]]:
+    """Replace every non-finite float with a marked string, recursively.
+
+    WHY AT THE WRITER AND NOT AT `_num` (#231). `_num` is one producer; the
+    defect is in what reaches disk. `rr: Infinity` already arrives on `reject`
+    rows that `_num` does not author, so a fix at the producer would have
+    passed its own test while the same invalid token kept shipping from
+    somewhere else.
+
+    WHY RECURSIVE. `_jsonable` is applied per top-level field and does not
+    descend, so a non-finite value nested in a dict or list reached disk
+    untouched. Measured before the fix: a row with
+    `payload={"sl": inf, "deep": [nan]}` wrote bare `Infinity` and `NaN`
+    inside the nested object. A fix that only handled top-level fields would
+    have closed the shapes the issue named and left the nested one open.
+
+    WHY A MARKED STRING RATHER THAN A CLIP OR AN OMISSION. Three readers
+    disagree about a bare `Infinity` token, measured on this Mac:
+
+    * `python json.loads` ACCEPTS it as `inf`
+    * `node JSON.parse` REJECTS the line
+    * `jq` accepts it, reports `isinfinite` as TRUE, and then SERIALISES it as
+      `1.7976931348623157e+308`, which compares UNEQUAL to that same literal
+
+    So jq holds infinity internally and prints a plausible finite price: a
+    filter that asks is told the truth, and a filter that merely outputs the
+    field is handed a number with no provenance and no error anywhere.
+    Clipping is therefore not an option, because clipping is exactly what jq
+    already does and the whole defect is the plausible finite number. Omitting
+    it is not an option either: a row that silently drops an unusable value
+    cannot be told from one where the model said nothing.
+
+    Returns the converted value and the dotted paths that were converted, so
+    the caller can name them in the row. A reader then finds them by ONE key
+    instead of having to know which fields could have been numbers.
+    """
+    if isinstance(value, bool):
+        return value, []  # bool before float: `isinstance(True, int)` is True
+    if isinstance(value, float) and not math.isfinite(value):
+        return NONFINITE_PREFIX + repr(value), [_path or "."]
+    if isinstance(value, dict):
+        out_d: dict[Any, Any] = {}
+        found: list[str] = []
+        for k, v in value.items():
+            child, hits = _mark_nonfinite(v, f"{_path}.{k}" if _path else str(k))
+            out_d[k] = child
+            found.extend(hits)
+        return out_d, found
+    if isinstance(value, (list, tuple)):
+        out_l = []
+        found = []
+        for i, v in enumerate(value):
+            child, hits = _mark_nonfinite(v, f"{_path}[{i}]")
+            out_l.append(child)
+            found.extend(hits)
+        return out_l, found
+    return value, []
+
+
+def _dump(rec: dict[str, Any]) -> str:
+    """Serialise a row, with `allow_nan=False` making the claim structural.
+
+    `allow_nan=False` is the difference between "we convert non-finite values"
+    and "a non-finite value cannot reach the bytes". With it, a hole in
+    `_mark_nonfinite` raises here instead of silently emitting `Infinity`
+    again, which is the failure this issue is about.
+
+    TRIPWIRE, AND IT MUST NOT RAISE INTO THE DESK. `Engine._emit` calls
+    `Journal.write` unwrapped, so an exception here would propagate into the
+    trading loop, and losing an append-only audit row is worse than writing a
+    degraded one. So the fallback writes a VALID, PRESENT, loud row naming the
+    event and the failure rather than the fields it could not encode.
+
+    Unreachable while `_mark_nonfinite` is total, which is stated rather than
+    implied; the test suite drives this branch directly instead of pretending
+    it is covered.
+    """
+    try:
+        return json.dumps(rec, default=str, allow_nan=False)
+    except ValueError as exc:
+        return json.dumps(
+            {
+                "ts": rec.get("ts"),
+                "event": rec.get("event"),
+                "unencodable": str(exc),
+                "nonfinite": ["<row dropped: see unencodable>"],
+            },
+            allow_nan=False,
+        )
 
 
 def _jsonable(v: Any) -> Any:
