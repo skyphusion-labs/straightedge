@@ -70,6 +70,41 @@ PINNED_NON_WORD_SITES = (
 )
 
 
+def is_non_word_site(site: str) -> bool:
+    """THE gate's filter, in ONE place, called by every consumer.
+
+    This existed as the same expression written out at four call sites: the
+    pin, the injection test, the survives-the-filter test and the containment
+    test. Four correct spellings are still four sources of truth, and the
+    review proved what that costs: changing the PIN's line back to a
+    hand-copied `("prose: ", "interpolated: ")` left all twenty tests GREEN,
+    because the injection test rebuilt an equivalent filter of its own instead
+    of calling the pin's. The instrument reading it was not the gate acting on
+    it, one level up from where that was first fixed.
+
+    It is invisible on today's tree because no `composed: ` site exists in the
+    real sources, so a hand-copied list and the declaration behave identically
+    until the day one appears, which is the day it matters.
+
+    A hand-copy HERE is caught by
+    `test_each_kind_is_produced_and_survives_the_gate_filter`, which asks
+    whether a site of each DECLARED kind survives this predicate.
+    """
+    return site.startswith(NON_WORD_KINDS)
+
+
+def non_word_sites(*scans: object) -> tuple[str, ...]:
+    """Every non-word site across the given scans, filtered by the predicate."""
+    return tuple(
+        sorted(
+            site
+            for scan in scans
+            for site in scan.forwarded  # type: ignore[attr-defined]
+            if is_non_word_site(site)
+        )
+    )
+
+
 def _scans() -> dict[str, object]:
     """Every source of a word the operator can see after `refused: `.
 
@@ -238,10 +273,28 @@ def test_the_coverage_check_can_see_an_undocumented_reason() -> None:
     assert not undocumented(text)
 
     # The reverse gate too: a row for a word the code cannot emit is reported.
-    invented = text.replace(
-        "| `" + victim + "`",
-        "| `a_reason_the_code_never_emits` | x | y |\n| `" + victim + "`",
-        1,
+    #
+    # FOUND WITH `TABLE_ROW`, NEVER COMPOSED. The earlier version wrote the row
+    # shape out as `"| `" + victim + "`"`, with no optional colon, while the
+    # removal half above used the regex that allows one. So a victim that is a
+    # PREFIX word, whose row reads `| `word:` |`, matched nothing and this
+    # control redded loudly for a reason that had nothing to do with the gate.
+    # It passed only because `sorted(reason_words())[0]` happens not to be a
+    # prefix word today, which is luck rather than a property.
+    #
+    # The regex that knows a row may carry a trailing colon is `TABLE_ROW`, in
+    # this same file and already used by `table_words`. Adding `:?` to a
+    # second hand-written spelling would make two spellings agree by
+    # coincidence for the third time in this file; finding the real row means
+    # the control never writes the shape down at all.
+    row = next(
+        (m for m in TABLE_ROW.finditer(text) if m.group(1) == victim), None
+    )
+    assert row is not None, f"TABLE_ROW does not match the row for {victim!r}"
+    invented = (
+        text[: row.start()]
+        + "| `a_reason_the_code_never_emits` | x | y |\n"
+        + text[row.start() :]
     )
     assert "a_reason_the_code_never_emits" in stale_rows(invented), (
         "the stale-row check cannot see a row with no code behind it"
@@ -262,22 +315,7 @@ def test_non_word_refusal_sites_are_pinned_rather_than_ignored() -> None:
     word named elsewhere or free text nobody defines, and the message says
     which decision is owed.
     """
-    sites = tuple(
-        sorted(
-            s
-            for scan in _scans().values()
-            for s in scan.forwarded
-            # FILTERED BY THE SCANNER'S OWN DECLARATION, never by a list
-            # repeated here. A remembered list is what broke this: the scanner
-            # gained `composed: ` and this filter kept the two kinds it knew,
-            # so a concatenated refusal was surfaced by the instrument and
-            # dropped by the gate. Importing the declaration makes that drift
-            # impossible rather than merely fixed once, and
-            # `test_the_gate_covers_every_kind_the_scanner_can_emit` asserts
-            # the two cannot diverge.
-            if s.startswith(NON_WORD_KINDS)
-        )
-    )
+    sites = non_word_sites(*_scans().values())
     # Compared against a SORTED pin rather than the literal order above, so a
     # future editor adding an entry where it reads naturally does not get a
     # spurious failure. `{bad_stop}` sorts before `{bad}` because `_` < `}`,
@@ -494,7 +532,7 @@ def test_each_kind_is_produced_and_survives_the_gate_filter(kind: str) -> None:
     assert sites, f"the scanner produced nothing for the {kind!r} witness"
     of_kind = [s for s in sites if s.startswith(kind)]
     assert of_kind, f"expected a {kind!r} site, got {sites!r}"
-    survives = [s for s in of_kind if s.startswith(NON_WORD_KINDS)]
+    survives = [s for s in of_kind if is_non_word_site(s)]
     assert survives == of_kind, (
         f"a {kind!r} site does not survive the gate's filter, so the scanner "
         "would see a new refusal of this shape and the pin would stay green: "
@@ -516,10 +554,10 @@ def test_an_injected_composed_site_would_red_the_pin() -> None:
         '\n\ndef _injected(x) -> str:\n'
         '    return "refused: " + x.operator_detail\n'
     )
-    scan = scan_refusal_literals(injected)
-    sites = tuple(
-        sorted(s for s in scan.forwarded if s.startswith(NON_WORD_KINDS))
-    )
+    # CALLS THE PIN'S OWN AGGREGATOR. Rebuilding an equivalent filter here is
+    # what made this test look like a check on the gate while being a check on
+    # a lookalike, which is the defect the review found.
+    sites = non_word_sites(scan_refusal_literals(injected))
     assert sites != tuple(sorted(PINNED_NON_WORD_SITES)), (
         "injecting a concatenated refusal into desk.py leaves the pinned set "
         "unchanged, so the pin would not red and a new free-text refusal is "
@@ -562,7 +600,7 @@ def test_no_undeclared_kind_escapes_the_scanner() -> None:
     offenders = {}
     for where, text in sources.items():
         for site in scan_refusal_literals(text).forwarded:
-            if not site.startswith(NON_WORD_KINDS):
+            if not is_non_word_site(site):
                 offenders.setdefault(where, []).append(site)
 
     assert not offenders, (
