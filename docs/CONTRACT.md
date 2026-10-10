@@ -128,6 +128,64 @@ Auto EMA trading is off until `/auto on`.
 | `/auto on\|off` | Optional EMA regime. Fill alerts do not wait for this. Journaled as `auto_on` / `auto_off`. |
 | `/status` `/positions` `/halt` `/resume` | Account. `/halt` flattens, drops the confirm, and cancels working orders. |
 
+## Stop-guard refusals: the modify channel
+
+`_stop_guard` decides whether a stop may be APPLIED to an open position, and its
+refusal reaches the operator as `<verb> failed retcode=10016 <word>`, not after
+`refused: `. That is a second vocabulary on a second channel, so it gets its own
+enumeration: the table below is kept complete in BOTH directions by
+`tests/test_stop_guard_vocabulary.py`, which reads the guard's returns out of the
+source and fails when one has no row here, and also fails on a row naming a word
+the guard can no longer return (#228). The `/sl` row above carries the mechanism
+in depth; this table is the word list.
+
+**WHAT THAT GATE READS, stated because a gate that does not say what it cannot
+see gets read as covering everything.** It reads a return that is a string
+literal, a module constant, a literal-prefixed concatenation, or an f-string
+opening with a literal. It CANNOT read a word returned through a local
+variable, a `join`, a `str(...)` call or a concatenation with a non-literal left
+side; each of those lands in the scanner's `forwarded` set, which the test pins
+EMPTY, so a new spelling fails as unreadable rather than passing as covered. A
+result built with the `OrderResult` constructor instead of a factory would be
+invisible to the same scan, so a separate test requires every result in
+`engine.py` to come from a factory, which is true today at zero direct
+constructions.
+
+**FIVE replies can carry one of these words, not just `/sl`.** `_modify` is
+reached by `/sl`, `/tp`, `/replace`, `/be` and `/trail`, so the same refusal
+arrives behind five labels (`sl failed`, `tp failed`, `replace failed`,
+`be failed`, `trail failed`). The test derives that set from the source rather
+than restating it, so a sixth command reaching the guard fails there. `cancel
+failed`, `close failed` and `closeby failed` render the same way and can never
+carry one of these words, because those paths never reach a modify.
+
+**On the AUTO path there is no reply and the record is the only witness.**
+`_act` and `_manage_open` reach the same guard with no operator waiting, so the
+refusal is journaled as `modify_refused` with both stops and no chat message is
+sent. Reconcile an auto refusal from `journal.jsonl`, never from chat scrollback.
+
+A `:` suffix means the word is a PREFIX and a measured payload follows it.
+
+| reason | what was measured | what the operator does |
+| --- | --- | --- |
+| `spec_not_measured:` | a WIDENING was asked for on a symbol whose sizing fields the venue never streamed, named in the payload | get the symbol into Market Watch; a TIGHTENING still applies, so risk can always be reduced |
+| `stop_exceeds_risk` | the widening's worst case exceeds `risk_pct * max_risk_multiple` of equity, or the remaining daily loss room | tighten instead, or accept the stop that fits; at or beyond breakeven nothing is capped |
+| `stop_removal_refused` | the price would leave a protected position unprotected: at or below zero, or non-finite (`nan`, `inf`) | send a real price; `0` is the venue encoding for "no stop" and `nan` compares False against every bound |
+
+Three comments on this channel are operator PROSE rather than words, and that is
+deliberate: `_modify_pending` refuses a working-order modify with `sl required`,
+`buy needs sl < entry < tp` and `sell needs tp < entry < sl`, which describe an
+ORDERING between three numbers rather than a named condition. The test pins that
+set exactly, so a new comment is either a word that belongs in this table or
+prose that belongs in the pin, and it cannot be neither.
+
+**One meaning has two renderings, one per channel, and this is the record of
+it:** a missing stop is `refused: sl_required` on the order path and
+`sl failed retcode=10016 sl required` on the working-order modify path. Both are
+documented; normalising them would change an operator-visible reply, so it is
+filed as straightedge#233 rather than folded into the change that added this
+gate.
+
 ## Confirm and send
 
 `/confirm` for a market order reprices and re-runs `preview`.
