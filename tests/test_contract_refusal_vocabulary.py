@@ -105,6 +105,57 @@ def non_word_sites(*scans: object) -> tuple[str, ...]:
     )
 
 
+def pin_drift(*scans: object) -> tuple[str, ...]:
+    """What the scans hold that the pin does not, and vice versa. ONE body.
+
+    THE THIRD AND LAST ITERATION OF THE SAME DUPLICATION, which moved up a
+    level each time it was fixed:
+
+      1. the pin's filter was a hand-copied list
+      2. the filter was four spellings across four tests
+      3. the COMPARISON was two bodies: the pin built its own sites and
+         asserted `== PINNED`, the injection test built its own and asserted
+         `!= PINNED`
+
+    Each fix closed the instance and left the class one level up. Measured on
+    the committed tree before this change: hand-copying
+    `("prose: ", "interpolated: ")` into the PIN TEST's own body left all
+    twenty tests GREEN, while the same hand-copy inside `is_non_word_site`
+    redded three. The predicate was guarded; the pin's own body was not,
+    because a mutation of it was not a mutation of anything the injection test
+    called.
+
+    So the comparison is this function and nothing else. The pin asserts the
+    drift is EMPTY on the real scans; the injection test asserts it is
+    NON-EMPTY on injected ones. There is no second body left to mutate, and a
+    hand-copy anywhere inside this chain reds the injection test.
+
+    Deliberately NOT fixed by asserting that the two comparisons agree: that
+    would be another body, and it would be the fourth iteration.
+
+    WHERE THIS STOPS, MEASURED RATHER THAN ASSUMED. A hand-copied filter inside
+    any shared body is caught: inside this function, inside
+    `is_non_word_site` or inside `non_word_sites`, each reds
+    `test_an_injected_composed_site_would_red_the_pin`, because that test
+    calls the same chain. What is NOT caught is a caller that stops calling the
+    chain at all: replacing the pin test's `drift = pin_drift(...)` with
+    `drift = ()` leaves all twenty green.
+
+    That is the limit of this approach and it is not the defect the three
+    iterations were about. A duplicate that silently DIVERGES is invisible; a
+    test neutered to a constant is visible in the diff, and catching it would
+    need a meta-test asserting this test called what it says it calls, which
+    is the extra body this function exists to remove. So it is recorded here
+    instead of being closed, and the claim is the narrower true one: there is
+    no second comparison to drift, not that the gate cannot be removed.
+
+    Symmetric difference rather than one-sided, so a pinned entry the scanner
+    stopped producing is drift too; a pin that only grows rots exactly as
+    silently as one that is short.
+    """
+    return tuple(sorted(set(non_word_sites(*scans)) ^ set(PINNED_NON_WORD_SITES)))
+
+
 def _scans() -> dict[str, object]:
     """Every source of a word the operator can see after `refused: `.
 
@@ -315,19 +366,16 @@ def test_non_word_refusal_sites_are_pinned_rather_than_ignored() -> None:
     word named elsewhere or free text nobody defines, and the message says
     which decision is owed.
     """
-    sites = non_word_sites(*_scans().values())
-    # Compared against a SORTED pin rather than the literal order above, so a
-    # future editor adding an entry where it reads naturally does not get a
-    # spurious failure. `{bad_stop}` sorts before `{bad}` because `_` < `}`,
-    # which is exactly the kind of ordering trap that teaches people to stop
-    # trusting a pin.
-    assert sites == tuple(sorted(PINNED_NON_WORD_SITES)), (
-        f"the set of non-word `refused: ` sites changed.\nfound  {sites!r}\n"
+    drift = pin_drift(*_scans().values())
+    assert not drift, (
+        "the set of non-word `refused: ` sites drifted from the pin.\n"
+        f"drift (symmetric difference) {drift!r}\n"
         f"pinned {tuple(sorted(PINNED_NON_WORD_SITES))!r}\n"
         "A new site is one of three things, and which one is a person's call: "
         "a reason word that should be named and given a table row; a payload "
         "whose word is named elsewhere and already scanned there; or free text "
-        "that can never be a vocabulary entry and belongs in this pin."
+        "that can never be a vocabulary entry and belongs in this pin. An "
+        "entry that disappeared means the code stopped producing it."
     )
 
 
@@ -557,13 +605,16 @@ def test_an_injected_composed_site_would_red_the_pin() -> None:
     # CALLS THE PIN'S OWN AGGREGATOR. Rebuilding an equivalent filter here is
     # what made this test look like a check on the gate while being a check on
     # a lookalike, which is the defect the review found.
-    sites = non_word_sites(scan_refusal_literals(injected))
-    assert sites != tuple(sorted(PINNED_NON_WORD_SITES)), (
-        "injecting a concatenated refusal into desk.py leaves the pinned set "
-        "unchanged, so the pin would not red and a new free-text refusal is "
+    # CALLS THE PIN'S OWN COMPARISON, not a second one shaped like it. The
+    # injected site is absent from the pin, so it must appear in the drift,
+    # and the pin test asserts that same drift is empty on the real scans.
+    drift = pin_drift(scan_refusal_literals(injected))
+    assert drift, (
+        "injecting a concatenated refusal into desk.py produces no drift from "
+        "the pin, so the pin would not red and a new free-text refusal is "
         "unforced"
     )
-    assert any(s.startswith("composed: ") for s in sites), sites
+    assert any(s.startswith("composed: ") for s in drift), drift
 
 
 def test_no_undeclared_kind_escapes_the_scanner() -> None:
