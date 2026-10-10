@@ -10,8 +10,10 @@ Four properties are pinned here, and the third is the one that matters:
 
 1. The constraint is actually REQUESTED: the body carries the schema, with
    `format` and `effort` as siblings inside `output_config`.
-2. Only `claude` gets it. `grok` and `computer` cannot constrain output, and a
-   provider that cannot must not silently lose the parser.
+2. Only `claude` is SENT it today, and `_schema_mentions` pins that under every
+   provider's spelling rather than only Anthropic's. This used to read "`grok`
+   and `computer` cannot constrain output", which was false for grok and is
+   straightedge#313; the test underneath it was blind for the same reason.
 3. `parse_advice` is still the gate. An off-schema reply is forced to `hold`
    and the reason is STATED, where today it is coerced in silence or, for an
    unknown field beside a `buy`, not caught at all.
@@ -145,24 +147,101 @@ def test_the_schema_accepts_exactly_what_parse_advice_accepts() -> None:
 # --------------------------------------------------------------------------
 
 
+#: Every documented spelling of a structured-output constraint across the
+#: providers this desk can speak to. Anthropic nests it as
+#: `output_config.format`; xAI takes a TOP-LEVEL `response_format` on its
+#: chat-completions endpoint and `text.format` on its Responses API.
+#:
+#: The list exists because naming only Anthropic's key does not pin "this
+#: provider is sent no schema", it pins "this provider is not sent ANTHROPIC's
+#: schema. straightedge#313 measured the difference: injecting a real xAI
+#: `response_format` into the grok body left the previous version of these two
+#: tests GREEN, so the claim they are named for was unenforced.
+_SCHEMA_KEYS = ("output_config", "response_format", "json_schema", "text_format", "format")
+
+
+def _schema_mentions(node: object, path: str = "") -> list[str]:
+    """Every structured-output constraint in a request body, any spelling.
+
+    Walks the whole body rather than checking top-level keys, because the
+    constraint is nested on one provider and top-level on another. Also matches
+    the literal string `json_schema`, which is the `type` value all three
+    spellings share, so a shape nobody thought to list is still caught by the
+    value it must carry.
+    """
+    found: list[str] = []
+    if isinstance(node, dict):
+        for key, value in node.items():
+            here = f"{path}.{key}" if path else str(key)
+            if key in _SCHEMA_KEYS:
+                found.append(here)
+            found.extend(_schema_mentions(value, here))
+    elif isinstance(node, list):
+        for index, value in enumerate(node):
+            found.extend(_schema_mentions(value, f"{path}[{index}]"))
+    elif node == "json_schema":
+        found.append(f"{path}=json_schema")
+    return found
+
+
+def test_the_no_schema_check_can_go_red_on_every_providers_spelling() -> None:
+    """The control on the control: the checker must FAIL on a real schema.
+
+    Without this, `_schema_mentions` returning `[]` is indistinguishable from a
+    checker that can never return anything, and the two tests below would be
+    decoration. Each body here is the shape that provider actually documents.
+    """
+    anthropic = {"model": "x", "output_config": {"format": {"type": "json_schema"}}}
+    xai_chat = {"model": "x", "response_format": {"type": "json_schema", "json_schema": {}}}
+    xai_responses = {"model": "x", "text": {"format": {"type": "json_schema"}}}
+
+    assert _schema_mentions(anthropic), "checker is blind to Anthropic's spelling"
+    assert _schema_mentions(xai_chat), "checker is blind to xAI chat-completions spelling"
+    assert _schema_mentions(xai_responses), "checker is blind to xAI Responses spelling"
+    # And it must stay quiet on a body that carries none, or every test using
+    # it reds for free and says nothing.
+    assert _schema_mentions({"model": "x", "messages": [{"role": "user", "content": "hi"}]}) == []
+
+
+def test_the_claude_body_is_what_proves_the_checker_runs_on_real_code() -> None:
+    """The checker's positive case is driven by the SHIPPED request, not a fixture.
+
+    `_schema_mentions` is only trustworthy on the two negative tests below if it
+    fires on the one provider that genuinely sends a schema, through the real
+    `_claude` body builder rather than a hand-written dict.
+    """
+    advisor, transport = _advisor(_claude_reply('{"text":"x","action":"hold","symbol":null,"sl":null,"tp":null,"limit":null,"stop":null,"ticket":null,"summary":"x"}'))
+    advisor.ask("what now?", "snapshot")
+    _url, body = transport.sent[0]
+    assert _schema_mentions(body), "the claude body carries no schema, so the checker proves nothing"
+
+
 def test_grok_keeps_the_parser_and_is_sent_no_schema() -> None:
+    """No schema under ANY spelling, not merely no `output_config`.
+
+    straightedge#313: grok CAN be schema-constrained, so this test is pinning a
+    deliberate present state rather than a vendor limitation. Changing it is the
+    point: sending grok a schema has to edit this assertion, which is what stops
+    the wire change landing half-done or a stray schema appearing unnoticed.
+    """
     reply = 'Hold.\n{"action":"hold","symbol":null,"sl":null,"tp":null,"summary":"x"}'
     advisor, transport = _advisor({"choices": [{"message": {"content": reply}}]}, "grok")
     advice = advisor.ask("what now?", "snapshot")
 
     _url, body = transport.sent[0]
-    assert "output_config" not in body, "grok cannot constrain output"
+    assert _schema_mentions(body) == [], f"grok was sent a schema: {_schema_mentions(body)}"
     assert advice.action == "hold"
     assert "Hold." in advice.text
 
 
 def test_computer_keeps_the_parser_and_is_sent_no_schema() -> None:
+    """Same check for `computer`, whose capability is a question about OUR Worker."""
     reply = 'Hold.\n{"action":"hold","symbol":null,"sl":null,"tp":null,"summary":"x"}'
     advisor, transport = _advisor({"text": reply}, "computer")
     advice = advisor.ask("what now?", "snapshot")
 
     _url, body = transport.sent[0]
-    assert "output_config" not in body
+    assert _schema_mentions(body) == [], f"computer was sent a schema: {_schema_mentions(body)}"
     assert advice.action == "hold"
 
 

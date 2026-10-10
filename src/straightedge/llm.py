@@ -664,9 +664,41 @@ class Advisor:
             # `format` is not a top-level parameter, and the older
             # top-level `output_format` is deprecated.
             #
-            # Only the claude path gets this. `grok` and `computer` cannot
-            # constrain their output, and a provider that cannot must not
-            # silently lose the parser, so they keep `parse_advice` alone.
+            # ONLY THE CLAUDE PATH SENDS THIS TODAY, and the reason is NOT
+            # that the others are incapable. This comment used to say that
+            # ("`grok` and `computer` cannot constrain their output"), and for
+            # `grok` it was FALSE. That made it worse than no comment:
+            # `config.py` ships `provider: str = "grok"`, so this was the
+            # stated justification for the DEFAULT provider having a
+            # parsed-and-hoped `action` rather than a schema-guaranteed one,
+            # and it documented the gap as impossible to close. Nobody
+            # re-opens a question the code says has no answer.
+            #
+            # xAI documents structured outputs on the same OpenAI-compatible
+            # endpoint `grok_url` already defaults to, as a TOP-LEVEL
+            # `response_format: {"type": "json_schema", "json_schema": {...}}`,
+            # and its documented subset accepts every construct ADVICE_FORMAT
+            # uses: the closed `action` enum, `additionalProperties: false`,
+            # and `{"type": ["string", "null"]}`, which is its own documented
+            # spelling for a nullable field. The constructs are not the
+            # obstacle, and the parser is not what is missing either.
+            #
+            # WHAT IS MISSING IS ONE LIVE VERIFICATION, and leaving it missing
+            # is a decision rather than an oversight. The parameter name and
+            # the dialect both differ from Anthropic's `output_config.format`,
+            # so whether api.x.ai accepts THIS body cannot be settled from
+            # documentation; a rejected body is a 400 on the advice path for
+            # the default provider of a desk being demonstrated live. One
+            # probe against the real endpoint settles it, and
+            # straightedge#313 carries that probe plus the decision that
+            # follows it: what a MISSING tail key should mean on a provider
+            # with no server-side guarantee of completeness, where
+            # `_schema_violations` would otherwise force `hold` on every
+            # terse-but-valid reply.
+            #
+            # `computer` is a separate question and this comment does not
+            # cover it. That path is our own Worker (`agent/`), so what it can
+            # constrain is a question about our code, not a vendor's API.
             "output_config": {"effort": "medium", "format": ADVICE_FORMAT},
         }
         # ONE credential field, TWO endpoint shapes. Routing through a Cloudflare
