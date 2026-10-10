@@ -78,14 +78,22 @@ def _claude_reply(obj: dict) -> dict:
     return {"content": [{"type": "text", "text": json.dumps(obj)}]}
 
 
-#: NOTE the default here is `claude` and the SHIPPED default is `grok`
-#: (`AdviceConfig.provider`, `config.example.toml`, and the `AI_PROVIDER`
-#: fallback all say `grok`). This is a test-file convenience, because most cases
-#: in this file want the structured path. It has already misled one reader into
-#: filing straightedge#284 on the premise that `provider="grok"` was a departure
-#: from the default when it is the shipped value, so it is written down rather
-#: than left to be re-derived.
-def _engine(tmp_path: Path, *payloads: dict, provider: str = "claude") -> Engine:
+#: THIS DEFAULT IS THE SHIPPED DEFAULT, and a test below pins that it stays so
+#: (straightedge#290).
+#:
+#: It used to be `claude` while the product shipped `grok`, and the divergence
+#: cost three readers. Inside this file `provider="grok"` read as a departure
+#: from the default when it was the shipped value, while `provider="claude"` was
+#: invisible because it WAS the default: the case driving the structured path
+#: looked ordinary and the case driving the shipped path looked special. #284
+#: was filed on that inversion by a reader being careful.
+#:
+#: Every call whose vantage can matter now names it. The only calls still riding
+#: this default pass NO payload, so the advisor is never reached and no provider
+#: is exercised. That split is MEASURED, not asserted: flipping this default
+#: changes the outcome of exactly the payload-bearing calls and nothing else,
+#: and after making those four explicit the flip changes nothing at all.
+def _engine(tmp_path: Path, *payloads: dict, provider: str = "grok") -> Engine:
     cfg = BotConfig()
     cfg.journal_path = str(tmp_path / "j.jsonl")
     cfg.session.enabled = False
@@ -287,7 +295,7 @@ def test_every_model_reachable_field_driven_large_at_once_stays_in_bound(
     one reply. The row has to stay under the documented bound, and no field may
     carry a model string whole.
     """
-    engine = _engine(tmp_path, _claude_reply(_everything_large()))
+    engine = _engine(tmp_path, _claude_reply(_everything_large()), provider="claude")
     engine.handle_command(TgCommand("1", 1, "/ask take a view", 1))
     row = _turn(engine)
     blob = json.dumps(row, sort_keys=True)
@@ -453,6 +461,37 @@ def test_the_close_case_covers_the_SHIPPED_default_provider() -> None:
     )
 
 
+def test_the_helper_default_IS_the_shipped_default() -> None:
+    """straightedge#290: the divergence that manufactured a false premise.
+
+    This helper defaulted to `claude` while the product shipped `grok`. Neither
+    value was wrong; the DIVERGENCE was, because a reader inside this file
+    cannot see `AdviceConfig`, so they must guess which way the default points
+    and the guess inverts which case looks special. #284 was filed on that.
+
+    PINNED rather than commented, for the reason #284 itself established: a
+    docstring claiming the two agree is a sentence doing a fixture's job. If the
+    product default moves, this reds, and the move becomes an explicit decision
+    about this file instead of a silent re-pointing of every case riding the
+    default.
+
+    Read through `inspect` rather than compared to a literal, so there is no
+    second copy of the value to drift from the signature.
+    """
+    import inspect
+
+    shipped = BotConfig().advice.provider
+    helper = inspect.signature(_engine).parameters["provider"].default
+
+    assert helper == shipped, (
+        f"this file's _engine defaults to {helper!r} and the product ships "
+        f"{shipped!r}. That divergence is straightedge#290 and it cost three "
+        "readers a false premise. Either align this default, or, if the two are "
+        "meant to differ, make every call that rides the default name its "
+        "provider so no reader has to know which way the default points."
+    )
+
+
 def _maximal_row(tmp_path: Path, monkeypatch) -> dict:  # type: ignore[no-untyped-def]
     """The row the bound actually has to answer for: EVERY field at once.
 
@@ -468,7 +507,7 @@ def _maximal_row(tmp_path: Path, monkeypatch) -> dict:  # type: ignore[no-untype
     """
     from straightedge import journal as journal_mod
 
-    engine = _engine(tmp_path, _claude_reply(_everything_large()))
+    engine = _engine(tmp_path, _claude_reply(_everything_large()), provider="claude")
     assert Path(engine.journal.path).exists(), (
         "no live journal, so `_rotate_if_needed` returns early, the deferral "
         "branch is unreachable and this would measure a row short of maximal"
@@ -958,6 +997,7 @@ def test_an_ordinary_turn_is_byte_for_byte_what_it_was(tmp_path: Path) -> None:
             "sl": 1.09, "tp": 1.11, "limit": None, "stop": None, "ticket": None,
             "summary": "take it",
         }),
+        provider="claude",
     )
     engine.handle_command(TgCommand("1", 1, "/ask take a view", 1))
     row = _turn(engine)
