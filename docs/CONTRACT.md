@@ -509,7 +509,8 @@ Each `step_all` that reaches `account` writes `journal.heartbeat`.
 Line 1 is an ISO timestamp, and that has not changed since 1.0.0.
 After it, one `key=value` per line: `blocked=`, `mode=`, `stale_after_s=`,
 `tick_budget_s=`, `tick_gap_max_s=`, `over_budget=`, `tick_gap_ever_s=`,
-`over_budget_ever=`, `breach_rows_lost=`, `rotate_deferrals=`, `run_id=`,
+`over_budget_ever=`, `breach_rows_lost=`, `rotate_deferrals=`,
+`journal_bytes=`, `rotate_bytes=`, `run_id=`,
 `started_at=`,
 `deployed=`.
 (`deployed=` was shipped by 1.6.0 and this list did not name it; corrected
@@ -568,7 +569,25 @@ the live file, so a maximum recovered by scanning it would be a lower bound.
 The file is chmod 0600, atomic replace.
 A failed reconnect does not.
 `straightedge watch` reads the file. It exits 0 for `ALIVE ARMED`, 3 for
-`ALIVE NOT TRADING` (with the gate named), 4 for `STALE`, and 5 for `UNKNOWN`.
+`ALIVE NOT TRADING` (with the gate named), 4 for `STALE`, 5 for `UNKNOWN`,
+and 6 for `ALIVE DEGRADED` (reason `rotation_stuck`).
+`ALIVE DEGRADED` means the desk is ticking and trading and the JOURNAL has
+stopped rotating: `journal_bytes` is over `rotate_bytes`.
+In healthy operation the live file never exceeds that bound, because the
+rotation happens before the write that would cross it, so the pair is a
+reading and not an inference (straightedge#288).
+The alert is NOT keyed on `rotate_deferrals`. That count is per process,
+monotonic, and never cleared, so a backup agent that held the journal once
+an hour ago leaves it at 1 exactly like a holder still attached; from one
+heartbeat no threshold on it tells those apart, and one heartbeat is the
+deployed shape. The count is READ, and it is what says whether the
+rotation is being refused by a holder or failing for a reason nobody has a
+name for, which is the case an alert on the cause cannot see.
+A desk that publishes neither figure is reported as UNMEASURED in a note,
+never as a healthy rotation, and a `rotate_bytes` of 0 is read the same
+way rather than as a bound of zero.
+Exit 6 is additive: a caller testing non-zero already treats it as bad and
+a caller testing `== 4` for `STALE` is unchanged.
 It never calls `getUpdates` and never takes `journal.lock`.
 `watch --loop` announces a RESTART whenever `run_id` changes, whatever the
 state, and carries a count so a crash loop is not one line. A restart is not a

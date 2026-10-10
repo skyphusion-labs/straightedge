@@ -2968,6 +2968,13 @@ class Engine:
                 # was refused and a second copy of the figure could disagree
                 # with it (straightedge#251).
                 rotate_deferrals=self.journal.rotate_deferrals,
+                # straightedge#288. The PAIR, both off the journal, for the
+                # same reason the count is: the journal is the only thing that
+                # knows either figure and a second copy could disagree with it.
+                # Read on every heartbeat rather than cached, because the whole
+                # point is whether rotation is happening RIGHT NOW.
+                journal_bytes=self.journal.live_bytes(),
+                rotate_bytes=self.journal.rotate_bytes(),
             ),
             encoding="utf-8",
         )

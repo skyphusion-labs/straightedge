@@ -267,6 +267,7 @@ The exit code is the state:
 | 3 | `ALIVE NOT TRADING` | The desk is ticking. A gate refuses. The gate is named. |
 | 4 | `STALE` | No completed tick inside the threshold. |
 | 5 | `UNKNOWN` | Nothing was measured. The message says what is missing. |
+| 6 | `ALIVE DEGRADED` | The desk is ticking and trading. The journal has stopped rotating. |
 
 Exit 3 is the one an up-or-down check cannot see.
 The desk is up, and it is not trading.
@@ -277,6 +278,26 @@ Send `/live on I-ACCEPT-RISK` in the locked chat to arm it again.
 The other reasons are `halt_file`, `daily_loss`, `max_drawdown`,
 `trade_not_allowed`, `state_unreadable`, and `state_unwritable`.
 Read `Halt` above for those.
+
+Exit 6 is `ALIVE DEGRADED`, reason `rotation_stuck`.
+The desk is ticking, armed and trading. No order is affected.
+Its journal has stopped rotating, so the audit log is one file growing
+past the 10 MiB bound that is supposed to cap it.
+Something else on the computer is holding `journal.jsonl` open and
+refusing the rename: a backup agent, an antivirus scan, or an editor left
+open on the file.
+
+FIND THE HOLDER AND STOP IT. `handle64.exe journal.jsonl`, or Resource
+Monitor, CPU tab, Associated Handles, searched for the filename.
+Rotation resumes on the next journal write after the holder lets go.
+No restart, and no re-arm.
+RESTARTING THE DESK DOES NOT CLEAR IT: the holder is the other process,
+and a restart only resets the `rotate_deferrals` count that records how
+many rows were written while the file was over its bound.
+Removing the directory does not stop the holder either: a process holding
+a deleted file keeps the inode alive and keeps running.
+The rows written during the episode carry `rotate_deferred=1`, so the
+affected span is recoverable from the log afterwards.
 
 Alert mode:
 
