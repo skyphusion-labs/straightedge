@@ -45,6 +45,36 @@ sound; a floor needing another thread to still be holding when this one
 arrives is the #258 shape. The census cannot tell those apart -- that reading
 is the author's -- so it reports the population and the direction, and the
 `timing` mark records the author's answer.
+
+WHAT IT STRUCTURALLY CANNOT SEE, and a member that got through because of it.
+
+This census finds tests that READ THE CLOCK. The population that actually goes
+red on `windows-latest` is wider: tests that need SOMETHING SCHEDULED INSIDE A
+BUDGET. Every clock-reading test is in that wider set, so the census is a
+subset detector, and a member with no clock read at all is invisible to it.
+
+`test_mt4_wire.py::test_a_request_the_expert_already_claimed_is_reported_as_claimed`
+was exactly that. It made no clock call. It started a thread and bet that the
+thread won a rename against a `FileBridge(timeout_sec=0.4)` budget, and losing
+that bet on `windows-latest` produced `assert 'withdrawn' == 'claimed'`. This
+census reported 0 rows for that file and exited 0 the whole time it was
+flaking. The report was accurate about its own question and silent about the
+one that mattered (straightedge#321).
+
+WHY THAT WAS NOT FIXED BY WIDENING THIS FILE. Detecting "starts a thread and
+then asserts on an outcome within a budget" from the AST is possible and was
+considered. It was rejected for a specific reason rather than for cost: that
+member has now been rewritten to hold the clock still, so there is no longer a
+positive member to validate a widened detector against, and a detector
+validated against nothing is the decoration this file's own history is a record
+of avoiding. v1, v2 and v3 above were each caught by checking against members
+known in advance to belong; a v4 for this class would have none.
+
+So the limit is recorded here rather than papered over, and the rule for an
+author is the one this census cannot apply for them: if a test's correctness
+needs another thread to have reached a particular point before this one looks,
+it belongs to the #258 population whether or not it reads a clock, and the
+remedy is to remove the race rather than to mark it.
 """
 
 from __future__ import annotations
