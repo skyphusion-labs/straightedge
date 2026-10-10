@@ -39,11 +39,17 @@ the one site that is meant to forward. A new spelling therefore fails there
 rather than passing as covered: the gate cannot read it, and it refuses to
 pretend the read happened.
 
-The remaining hole was a result built WITHOUT the factory
-(`OrderResult(retcode=..., comment="...")`), which `scan_factory_comments`
-cannot see by construction. That is closed structurally rather than excluded:
-`engine.py` builds every result through a factory, zero direct constructions,
-and `test_every_result_is_built_through_a_factory` keeps it that way.
+The remaining hole was a result whose text bypasses the factory, and it is
+closed as a PROPERTY (straightedge#245) rather than as a list of spellings:
+`result_bypasses` reads three rules over the AST (the class name appears only
+as `OrderResult.<factory>(...)`, in an import, or in an annotation; no
+rebuilder such as `replace` or `__setattr__` is handed a `comment`; no
+assignment to `.comment`), with the factory set DERIVED from models.py.
+Nine bypass spellings are checked by `test_the_result_bypass_check_can_see_
+each_spelling` and the same shapes were injected into engine.py when this was
+written. WHAT IT CANNOT SEE: a class reached through `getattr(models,
+"OrderResult")` or `importlib`, and a result mutated through `__dict__`;
+those need a name built at runtime on purpose and this reads names.
 """
 
 from __future__ import annotations
@@ -72,18 +78,37 @@ GUARD_METHODS = ("_stop_guard",)
 #: condition. A contract cannot enumerate them as vocabulary, and forcing them
 #: into a word list would mean inventing three words no code emits.
 #:
-#: `sl required` is a deliberate exception on the record rather than an
-#: oversight: the `refused:` channel documents `sl_required` for the same
-#: condition, so the desk has ONE meaning with TWO renderings, one per channel.
-#: Normalising that is an operator-visible string change on a documented reply,
-#: so it is filed as #233 rather than decided in the change that adds the gate.
+#: `sl required` USED to be a deliberate exception here: the `refused:` channel
+#: documented `sl_required` for the same condition, so one meaning had two
+#: renderings, one per channel. #233 normalised it, so this channel now emits
+#: the WORD `sl_required` and it is no longer prose. The two sentences that
+#: remain are prose on purpose and were deliberately left alone: converging
+#: them would mean inventing words for an ordering between three numbers.
 PINNED_PROSE = frozenset(
     {
-        "sl required",
         "buy needs sl < entry < tp",
         "sell needs tp < entry < sl",
     }
 )
+
+#: Words this channel emits whose ONE row lives in the `refused:` vocabulary
+#: table instead of this section's, because the same condition arrives on both
+#: channels and the ruling on #233 is one row naming both, not a row per table.
+#:
+#: A SECOND row would be two places to drift, which is #220's own defect with a
+#: fresh coat. So the row stays where the word was first documented and this
+#: section does not copy it.
+#:
+#: THE EXCLUSION IS NOT A HOLE, and that is the part that needs the test below:
+#: an exclusion list with no positive check is how a word stops being
+#: documented anywhere while two gates each believe the other covers it.
+#: `test_a_word_documented_elsewhere_really_is_documented_there` asserts the row
+#: exists in that other section, so deleting it reds here.
+DOCUMENTED_IN_THE_REFUSED_TABLE = frozenset({"sl_required"})
+
+#: The section that holds those rows. #220's scan owns it; this is only used to
+#: prove the row is there, never to read vocabulary out of it.
+OTHER_TABLE_HEADING = "### Refusal reasons"
 
 #: The exact heading of the section whose table IS the enumeration. A LEVEL-2
 #: heading on purpose: #220's section scan takes everything from
@@ -294,32 +319,181 @@ def test_the_scanners_could_read_every_site() -> None:
     )
 
 
-def test_every_result_is_built_through_a_factory() -> None:
-    """The one hole the comment scan cannot see, closed by structure.
+MODELS = ROOT / "src" / "straightedge" / "models.py"
 
-    `scan_factory_comments` reads `OrderResult.invalid_stops(...)`. A result
-    built with the constructor directly, `OrderResult(retcode=10016,
-    comment="zz")`, would carry a word to the operator through the same render
-    and be invisible to it. Measured on the tree this was written against:
-    `engine.py` contains ZERO direct constructions and reaches every result
-    through `measured`, `unchanged`, `not_sent` or `invalid_stops`, so the hole
-    is closed by keeping that true rather than by writing an exclusion that
-    nothing enforces.
+#: Calls that can rebuild or alter an existing result without naming the class.
+#: `dataclasses.replace(result, comment=...)` and `object.__setattr__(result,
+#: "comment", ...)` are not constructions at all, which is why enumerating
+#: CONSTRUCTION spellings misses them: the property is that a result's text
+#: reaches a caller only by passing a factory, and these two skip it.
+REBUILDERS = frozenset({"replace", "evolve", "copy", "deepcopy", "setattr", "__setattr__"})
+
+
+def result_factories() -> frozenset[str]:
+    """The classmethods of `OrderResult`, DERIVED from models.py, never listed."""
+    tree = ast.parse(MODELS.read_text(encoding="utf-8"))
+    for cls in ast.walk(tree):
+        if isinstance(cls, ast.ClassDef) and cls.name == "OrderResult":
+            return frozenset(
+                node.name
+                for node in cls.body
+                if isinstance(node, ast.FunctionDef)
+                and any(
+                    isinstance(d, ast.Name) and d.id == "classmethod"
+                    for d in node.decorator_list
+                )
+            )
+    raise AssertionError("OrderResult is not defined in models.py")
+
+
+def result_bypasses(source: str, factories: frozenset[str]) -> list[str]:
+    """Every place `source` can produce an OrderResult WITHOUT a factory.
+
+    ONE PROPERTY, not a list of spellings: a result reaches a caller only by
+    passing a factory. Read as three rules over the AST, so a new spelling of
+    the same bypass is caught by the rule rather than by someone adding it to a
+    list:
+
+    1. THE CLASS NAME MAY APPEAR ONLY AS `OrderResult.<factory>(...)`, in an
+       import, or inside an annotation. A bare call, `_m.OrderResult(...)`,
+       `_R = OrderResult`, `OrderResult as OR`, and `type(x)(...)` all hold a
+       reference to the class that is not a factory call, so they fail by being
+       a reference, whatever name they are then called by.
+    2. NO REBUILDER may be handed a `comment`: `replace(...)`, `evolve(...)`,
+       `copy(...)`, `setattr` and `__setattr__`, where the call names the field
+       by keyword or by string constant.
+    3. NO ASSIGNMENT to an attribute called `comment`.
+
+    What it cannot see is stated rather than implied: a class reached by
+    `getattr(models, "OrderResult")` or `importlib`, and a result mutated
+    through `result.__dict__`. Those need someone to build the name at runtime
+    on purpose, and this scan reads names.
     """
-    tree = ast.parse(_source())
-    direct = [
-        node.lineno
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Name)
-        and node.func.id == "OrderResult"
-    ]
-    assert not direct, (
-        f"engine.py builds an OrderResult directly at line(s) {direct!r}. Its "
-        "`comment` reaches the operator through the same `<verb> failed "
-        "retcode=` render as a guard word and is invisible to the comment "
-        "scan, so use a factory or extend the scan."
+    tree = ast.parse(source)
+    parent: dict[int, ast.AST] = {}
+    for holder in ast.walk(tree):
+        for child in ast.iter_child_nodes(holder):
+            parent[id(child)] = holder
+
+    def in_annotation(node: ast.AST) -> bool:
+        cur: ast.AST | None = node
+        while cur is not None:
+            up = parent.get(id(cur))
+            if isinstance(up, ast.arg) and up.annotation is cur:
+                return True
+            if isinstance(up, ast.AnnAssign) and up.annotation is cur:
+                return True
+            if isinstance(up, (ast.FunctionDef, ast.AsyncFunctionDef)) and up.returns is cur:
+                return True
+            cur = up
+        return False
+
+    found: list[str] = []
+    for node in ast.walk(tree):
+        is_ref = (isinstance(node, ast.Name) and node.id == "OrderResult") or (
+            isinstance(node, ast.Attribute) and node.attr == "OrderResult"
+        )
+        if is_ref and not in_annotation(node):
+            up = parent.get(id(node))
+            gp = parent.get(id(up)) if up is not None else None
+            factory_call = (
+                isinstance(up, ast.Attribute)
+                and up.value is node
+                and up.attr in factories
+                and isinstance(gp, ast.Call)
+                and gp.func is up
+            )
+            if not factory_call:
+                found.append(f"line {getattr(node, 'lineno', 0)}: a reference to OrderResult that is not a factory call")
+        if isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                if alias.name == "OrderResult" and alias.asname:
+                    found.append(f"line {getattr(node, 'lineno', 0)}: OrderResult imported under the name {alias.asname!r}")
+        if isinstance(node, ast.Call):
+            func = node.func
+            name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
+            if name in REBUILDERS:
+                keyed = any(k.arg == "comment" for k in node.keywords)
+                named = any(
+                    isinstance(a, ast.Constant) and a.value == "comment" for a in node.args
+                )
+                if keyed or named:
+                    found.append(f"line {getattr(node, 'lineno', 0)}: {name}(...) sets `comment` outside a factory")
+            if isinstance(func, ast.Call) and getattr(func.func, "id", "") == "type":
+                found.append(f"line {getattr(node, 'lineno', 0)}: type(...)(...) rebuilds a result outside a factory")
+        targets: list[ast.expr] = []
+        if isinstance(node, ast.Assign):
+            targets = list(node.targets)
+        elif isinstance(node, (ast.AugAssign, ast.AnnAssign)):
+            targets = [node.target]
+        for tgt in targets:
+            if isinstance(tgt, ast.Attribute) and tgt.attr == "comment":
+                found.append(f"line {getattr(node, 'lineno', 0)}: assignment to `.comment`")
+    return found
+
+
+#: One spelling per way a result's text can bypass a factory, each of which the
+#: bare-name check this test used to be left green (#245, measured by injecting
+#: each into engine.py). Run through the real checker so the control is part of
+#: the suite rather than a thing a reviewer did once.
+BYPASS_SPELLINGS = {
+    "bare constructor": 'def f():\n    return OrderResult(retcode=1, comment="zz")\n',
+    "module attribute": "def f(m):\n    return m.OrderResult(retcode=1, comment=\"zz\")\n",
+    "alias assignment": 'def f():\n    R = OrderResult\n    return R(retcode=1, comment="zz")\n',
+    "import alias": "from straightedge.models import OrderResult as R\n",
+    "dataclasses.replace": 'def f(r):\n    return replace(r, comment="zz")\n',
+    "replace via module": 'def f(r):\n    return dataclasses.replace(r, comment="zz")\n',
+    "object.__setattr__": 'def f(r):\n    object.__setattr__(r, "comment", "zz")\n    return r\n',
+    "type(x)(...)": 'def f(r):\n    return type(r)(retcode=1, comment="zz")\n',
+    "attribute assignment": 'def f(r):\n    r.comment = "zz"\n    return r\n',
+}
+
+#: The same shapes that are FINE, so the checker is not simply refusing
+#: everything that mentions the class.
+CLEAN_SPELLINGS = {
+    "factory call": 'def f():\n    return OrderResult.invalid_stops("zz")\n',
+    "annotation": "def f(r: OrderResult) -> OrderResult | None:\n    return None\n",
+    "plain import": "from straightedge.models import OrderResult\n",
+    "unrelated replace": "def f(s):\n    return s.replace('a', 'b')\n",
+}
+
+
+def test_every_result_is_built_through_a_factory() -> None:
+    """The invariant, over the real `engine.py` (straightedge#245).
+
+    This used to match one spelling, a bare-name `OrderResult(...)` call, and
+    four other ways of putting an unscanned word into a result stayed green when
+    injected. The property is not "no direct construction", it is "a result's
+    text reaches a caller only by passing a factory", and `replace()` and
+    in-place mutation are the two spellings that are not constructions at all.
+    """
+    factories = result_factories()
+    assert {"invalid_stops", "not_sent", "unchanged", "unknown"} <= factories, (
+        f"the factory set derived from models.py looks wrong: {sorted(factories)!r}"
     )
+    found = result_bypasses(_source(), factories)
+    assert not found, (
+        "engine.py produces an OrderResult outside a factory, so its `comment` "
+        "reaches the operator through the same `<verb> failed retcode=` render "
+        f"as a guard word and is invisible to the comment scan: {found!r}"
+    )
+
+
+def test_the_result_bypass_check_can_see_each_spelling() -> None:
+    """POSITIVE CONTROL for the invariant, and its negative half.
+
+    A check that has only ever passed on the real file proves nothing, so each
+    bypass spelling is run through the real checker and must be reported, and
+    each clean spelling must not be.
+    """
+    factories = result_factories()
+    for label, src in BYPASS_SPELLINGS.items():
+        assert result_bypasses(src, factories), f"the check cannot see: {label}"
+    for label, src in CLEAN_SPELLINGS.items():
+        assert not result_bypasses(src, factories), (
+            f"the check refuses a clean spelling: {label}: "
+            f"{result_bypasses(src, factories)!r}"
+        )
 
 
 def test_the_denominator_is_not_empty_and_the_channel_is_still_wired() -> None:
@@ -465,12 +639,78 @@ def test_prose_comments_are_pinned_rather_than_ignored() -> None:
     pinned set. A new comment is therefore either a guard word that needs a row
     or prose that needs a decision in this pin, and it cannot be neither.
     """
-    extra = channel_comments() - guard_words()
+    extra = channel_comments() - guard_words() - DOCUMENTED_IN_THE_REFUSED_TABLE
     assert extra == PINNED_PROSE, (
         f"the set of non-vocabulary comments on this channel changed: found "
-        f"{sorted(extra)!r}, pinned {sorted(PINNED_PROSE)!r}. A new one is "
-        "either a refusal word that belongs in the table or prose that belongs "
-        "in this pin, and somebody has to say which."
+        f"{sorted(extra)!r}, pinned {sorted(PINNED_PROSE)!r}. A new one is one "
+        "of three things and somebody has to say which: a guard word that "
+        "belongs in this section's table; prose that belongs in PINNED_PROSE; "
+        "or a word whose row already exists in the `refused:` table, which "
+        "belongs in DOCUMENTED_IN_THE_REFUSED_TABLE and must then be proved "
+        "documented there."
+    )
+
+
+def test_a_word_documented_elsewhere_really_is_documented_there() -> None:
+    """An exclusion with no positive check is a hole, so this is the check.
+
+    #233 normalised one condition to one spelling: `_modify_pending` and the
+    paper adapter now emit the WORD `sl_required`, which the `refused:` channel
+    already documented. The ruling is ONE row naming both channels rather than
+    a row in each table, because a duplicated row is two places to drift.
+
+    That leaves this gate excluding a word it can emit, which is only safe
+    while the row actually exists in the other section. Without this test the
+    word could be deleted from there and BOTH gates would stay green, each
+    believing the other covered it. That is the failure mode an exclusion list
+    always has and almost never states.
+
+    Asserted on the ROW, not on a mention: #220 measured that 15 of its 28
+    words were also named in prose, so `word in text` passes on any mention
+    anywhere and would not notice the row going away.
+    """
+    text = CONTRACT.read_text(encoding="utf-8")
+    start = text.find(OTHER_TABLE_HEADING)
+    assert start >= 0, f"{OTHER_TABLE_HEADING!r} is gone, so the row cannot be there"
+    rest = text[start + len(OTHER_TABLE_HEADING) :]
+    end = rest.find("\n## ")
+    section = rest if end < 0 else rest[:end]
+    rows = {m.group(1) for m in TABLE_ROW.finditer(section)}
+    missing = sorted(DOCUMENTED_IN_THE_REFUSED_TABLE - rows)
+    assert not missing, (
+        f"{missing!r} is excluded from this section's table on the grounds that "
+        f"the `refused:` table documents it, and that table has no row for it. "
+        "Either restore the row there or document it here; right now the word "
+        "is documented nowhere and two gates each think the other has it."
+    )
+
+
+def test_the_word_names_both_channels_on_its_single_row() -> None:
+    """One row, and it has to SAY it serves two channels or it is misleading.
+
+    The row lives in the `refused:` table, but the word now also arrives as
+    `sl failed retcode=10016 sl_required`. An operator who meets it on the
+    modify path and finds a row that only mentions `refused:` has been told
+    the wrong thing about where it comes from, which is the defect #233 was
+    filed to remove rather than relocate.
+    """
+    text = CONTRACT.read_text(encoding="utf-8")
+    start = text.find(OTHER_TABLE_HEADING)
+    rest = text[start + len(OTHER_TABLE_HEADING) :]
+    end = rest.find("\n## ")
+    section = rest if end < 0 else rest[:end]
+    row = next(
+        (
+            line
+            for line in section.splitlines()
+            if line.startswith("| `sl_required`")
+        ),
+        None,
+    )
+    assert row is not None, "no `sl_required` row in the refusal table"
+    assert "sl failed" in row, (
+        "the single `sl_required` row does not name the modify channel, so an "
+        "operator meeting it there cannot tell it is the same condition: " + row
     )
 
 

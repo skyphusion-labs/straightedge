@@ -9,7 +9,7 @@ measured both on a 0.55 lot position sized at 0.5% risk: the stop removed, and
 27.5% of equity at risk after a 500 pip move.
 
 The working-order path already refuses this. `_modify_pending` returns
-`sl required` on `sl <= 0`, and `replace_pending` carries a circuit check, a
+`sl_required` on `sl <= 0`, and `replace_pending` carries a circuit check, a
 geometry check and a risk cap. The position path was the inconsistent one, so
 this is aligning an asymmetry rather than inventing policy.
 

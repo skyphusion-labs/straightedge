@@ -663,7 +663,7 @@ def _rest_then_strip_the_stop(engine):
     That is the reachability finding, not a shortcut. Measured on main:
 
     * `risk.py`'s `sl_required` refuses to STAGE one (`signal.sl <= 0`).
-    * `_modify_pending` refuses to MODIFY one to zero (`sl required`).
+    * `_modify_pending` refuses to MODIFY one to zero (`sl_required`).
 
     So the state only arrives from the venue side, and both live adapters pass
     it straight through: `mt4_live._ord` and `mt5_live.orders` each build
@@ -708,7 +708,7 @@ def test_our_own_commands_cannot_rest_an_order_without_a_stop(tmp_path) -> None:
     order, _spec, _limit = _rest_then_strip_the_stop(engine)
     restored = engine._modify_pending(order, sl=0.0, tp=order.tp, price=order.price)
     assert not restored.ok
-    assert "sl required" in restored.comment, restored.comment
+    assert "sl_required" in restored.comment, restored.comment
     engine.stop()
 
 
