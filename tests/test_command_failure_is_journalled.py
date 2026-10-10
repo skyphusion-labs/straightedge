@@ -30,8 +30,12 @@ the same third thing: no rule said no, the command could not be completed at
 all. So it gets its own event and stays out of the reason counts.
 """
 
+import socket
+
 from test_refusal_journal import FakeLlm, _engine
 
+from straightedge.config import AdviceConfig
+from straightedge.llm import Advisor
 from straightedge.telegram import TgCommand
 
 ASK = "/ask what should I do"
@@ -64,6 +68,77 @@ def _one(engine, event: str) -> dict:
     rec = engine.journal.last_event(event)
     assert rec is not None, f"no structured {event!r} record was written"
     return rec
+
+
+# -- the REAL transport, failing for real ---------------------------------
+#
+# WHAT THE REAL TRANSPORT ACTUALLY DOES WHEN IT FAILS, enumerated from
+# `UrlLibTransport.post_json` rather than guessed, because the question that
+# matters for a double is not "is it realistic" but "can it ENTER this state":
+#
+#   1. HTTP non-2xx      -> `_http_error(HTTPError)` -> TelegramError(
+#                           f"telegram http {status}", status=, retry_after=)
+#   2. URLError          -> TelegramError("telegram http failed")
+#      (connection refused, DNS failure, timeout)
+#   3. body is not JSON  -> TelegramError("telegram non-json")
+#   4. provider error    -> RuntimeError(str(data["error"]))      [llm.py]
+#   5. empty reply       -> RuntimeError("computer empty")        [llm.py]
+#
+# `RaisingLlm` below can produce 4 and 5 exactly, because those ARE bare
+# RuntimeErrors raised in `llm.py`. It can only APPROXIMATE 1, 2 and 3: the
+# real class is `TelegramError`, a RuntimeError SUBCLASS carrying `status` and
+# `retry_after`, and a fake raising bare RuntimeError proves the handler
+# journals on a raise without proving it is reachable by the thing that
+# actually raises.
+#
+# So this case uses no double at all. It points the REAL `UrlLibTransport` at
+# a REAL closed port, which produces a REAL `URLError` inside real urllib and
+# a real `TelegramError` from the real `_http_error` path (mode 2). Offline and
+# deterministic: a refused connection to a closed loopback port is immediate
+# and needs no network.
+
+
+def _closed_port() -> int:
+    """A port nothing is listening on, obtained by binding and releasing it."""
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+def test_the_real_transport_failing_is_journalled(tmp_path) -> None:
+    """The un-stubbable seam: real transport, real exception, real handler.
+
+    This is the case that answers "a stub cannot produce the failure mode of
+    the thing it stands in for". Every other case here hands the desk an
+    exception; this one makes the shipped code raise its own.
+    """
+    port = _closed_port()
+    advisor = Advisor(
+        AdviceConfig(
+            provider="computer",
+            computer_url=f"http://127.0.0.1:{port}/ask",
+            computer_token="not-a-real-token",
+        )
+    )
+    engine = _engine(tmp_path)
+    engine.desk.advisor = advisor
+    engine.advisor = advisor
+    engine.start()
+    reply = engine.handle_command(TgCommand("1", 1, ASK, 1))
+
+    # The real class, not an approximation of it.
+    rec = _one(engine, "command_failed")
+    assert rec["measured"] is False
+    assert rec["command"] == "ask"
+    assert "telegram http" in rec["error"], rec["error"]
+
+    turn = _one(engine, "advice_turn_failed")
+    assert turn["turn_spent"] is True
+    assert "telegram http" in turn["error"], turn["error"]
+
+    # And the operator still got their sentence.
+    assert "telegram http" in reply, reply
+    engine.stop()
 
 
 # -- the general case: any raised command ---------------------------------
