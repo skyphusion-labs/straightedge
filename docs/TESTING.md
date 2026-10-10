@@ -625,8 +625,10 @@ at all**, because a census that measured nothing is not a clean result.
 
 A double with no `raise` is **not** automatically a defect. Most tests
 exercise a happy path and should. What the census makes checkable is the
-CLAIM: if no double for a seam can fail, the suite covers no failure path
-through that seam, and one of the three answers above is owed.
+CLAIM: if no double for a seam can fail, **no DOUBLE in this suite** covers
+a failure path through that seam, and one of the three answers above is owed.
+Not "nothing covers it": a test that makes the REAL implementation fail covers
+the path and the census cannot see it, which is the limit stated below.
 
 **Now the limit, stated because this document is about claims that outlive
 their evidence and a mechanism shipped with an unverified claim would be this
