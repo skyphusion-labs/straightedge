@@ -221,6 +221,24 @@ def self_test() -> int:
 
     cases_run = 0
     failures: list[str] = []
+    #: One owner per temporary tree. `tree()` used `tempfile.mkdtemp`, which
+    #: returns a PATH and nothing else: no object owns the directory, so
+    #: nothing ever removes it and every self-test run left one tree per case
+    #: behind. Measured before this change, with an isolated TMPDIR so nothing
+    #: else could contribute: ONE `--self-test` run leaked 12 directories, and
+    #: it runs under `pytest` and again directly in `ci.yml`, so the rate is
+    #: per-run on every machine rather than one developer's.
+    #:
+    #: `TemporaryDirectory` has an owner. Holding the objects here keeps each
+    #: tree alive for as long as its case needs it, `cleanup()` below makes the
+    #: removal deterministic, and even on an exception the objects carry a
+    #: finalizer that removes the tree, which `mkdtemp` has no equivalent of.
+    #:
+    #: Why it is worth fixing at all, since it is only disk: these trees are
+    #: identically shaped, so they make a close-out audit of `/tmp` read old
+    #: sediment as current debris, and the correct response to a directory you
+    #: cannot attribute is to leave it alone. See straightedge#326.
+    holds: list[tempfile.TemporaryDirectory] = []
 
     def check(label: str, cond: bool) -> None:
         nonlocal cases_run
@@ -232,7 +250,9 @@ def self_test() -> int:
             print("  FAIL %s" % label)
 
     def tree(fragments: dict[str, str], unreleased_body: str = "") -> pathlib.Path:
-        d = pathlib.Path(tempfile.mkdtemp())
+        hold = tempfile.TemporaryDirectory()
+        holds.append(hold)
+        d = pathlib.Path(hold.name)
         (d / FRAGMENT_DIR).mkdir()
         for name, text in fragments.items():
             (d / FRAGMENT_DIR / name).write_text(text, encoding="utf-8")
@@ -309,6 +329,13 @@ def self_test() -> int:
     d2 = tree({})
     rc = cmd_release(d2, "1.9.1", apply=False)
     check("refuses a release with zero fragments", rc == 1)
+
+    # Deterministic removal, rather than waiting for the finalizer. Sequenced
+    # BEFORE the verdict print so a reader sees the count and the cleanup in
+    # one place, and so a cleanup that raised could not be mistaken for a case
+    # failure.
+    for hold in holds:
+        hold.cleanup()
 
     print("\nchangelog_assemble self-test: %d case(s), %d failure(s)"
           % (cases_run, len(failures)))
