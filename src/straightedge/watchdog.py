@@ -227,6 +227,7 @@ def render(
     run_id: str,
     started_at: str,
     deployed: str,
+    breach_rows_lost: int = 0,
 ) -> str:
     """The heartbeat file's whole content.
 
@@ -268,6 +269,14 @@ def render(
         f"over_budget={over}",
         f"tick_gap_ever_s={tick_gap_ever_s:.1f}",
         f"over_budget_ever={over_ever}",
+        # straightedge#217. A COUNT and not a boolean, because "the journal
+        # could not take a breach row" can happen more than once and an
+        # operator reconstructing a week needs to know how many occurrences are
+        # missing from the audit log, not merely that some are. Zero on a
+        # healthy desk, which is why it is safe to publish unconditionally: a
+        # field that only appears when something is wrong is a field no reader
+        # learns to expect.
+        f"breach_rows_lost={int(breach_rows_lost)}",
         f"run_id={run_id}",
         f"started_at={started_at}",
         f"deployed={deployed}",

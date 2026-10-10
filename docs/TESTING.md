@@ -604,7 +604,7 @@ branch:
 | domain | command naming the domain | files | with fenced blocks | blocks |
 | --- | --- | --- | --- | --- |
 | `docs/*.md` plus `README.md` | `git ls-files 'docs/*.md' README.md` | 11 | 6 | 45 |
-| `**/*.md` across the repo | `git ls-files '*.md'` | 18 | 12 | 68 |
+| `**/*.md` across the repo | `git ls-files '*.md'` | 18 | 12 | 69 |
 
 **Those figures are MEASURED AT THE TIP THAT CARRIES THEM, not predicted for a
 future merge, and that change is deliberate.** Earlier versions of this
@@ -617,7 +617,11 @@ contains, and there is no arithmetic left to go stale.
 for the rule rather than an anecdote.** At `f98984b` the row read 18/11/57 and
 predicted 59 after this file merged. It merged, and the repo-wide figure was
 **62**. While the pull request adding the section above was open, #240 landed
-and it became **64**. The `docs/` row, meanwhile, hit its predicted 40 exactly
+and it became **64**. It reached **68**, and then **69** while the pull request
+carrying THIS sentence was open, because a `CHANGELOG.md` entry arrived
+carrying a fenced block. **That is a fourth movement with nothing in this file
+changing, and it came from the file nobody thinks of as documentation.**
+The `docs/` row, meanwhile, hit its predicted 40 exactly
 and has only moved by this file's own additions. So the broad domain moved
 three times without this file changing at all, and the narrow one never moved
 except when it did: **a markdown commit may move the count and may not, which

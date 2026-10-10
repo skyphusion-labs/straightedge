@@ -36,6 +36,7 @@ the set of things not measured.
 from __future__ import annotations
 
 import ast
+import re
 from dataclasses import dataclass
 
 #: The keyword argument every `RiskDecision` carries its reason in.
@@ -220,6 +221,235 @@ def scan_reasons(source: str, *, class_name: str = "RiskManager") -> ReasonScan:
         forwarded=tuple(sorted(collector.forwarded)),
         unresolved=tuple(sorted(collector.unresolved)),
     )
+
+#: Functions that are the AUTHORITY for one refusal word, returning the reason
+#: a value earns or `None`. `sizing.unusable_stop` and `sizing.unusable_volume`
+#: are consulted by `engine.py` and rendered to the operator as
+#: `refused: <reason>`, so their words are part of the operator vocabulary even
+#: though no `RiskDecision` ever carries them.
+REASON_AUTHORITIES = ("unusable_stop", "unusable_volume")
+
+#: A reason WORD is a name this project defines: lower snake_case, optionally
+#: ending in `:` when a payload is appended at runtime. Anything else after
+#: `refused: ` is operator prose.
+REASON_WORD = re.compile(r"^[a-z][a-z0-9_]*:?$")
+
+#: EVERY KIND of non-word site `scan_refusal_literals` can put in `forwarded`,
+#: declared here so a gate can assert it covers all of them instead of listing
+#: prefixes from memory.
+#:
+#: This exists because of a measured defect: the scanner gained the `composed: `
+#: kind and the gate that pins non-word sites kept filtering on the two kinds it
+#: knew, so a concatenated refusal was surfaced by the instrument and ignored by
+#: the gate. Nothing in the types said so and a green run could not tell.
+#: Asserting that a bucket is EMPTY would not have caught it either, since
+#: `forwarded` legitimately holds eight entries here; the claim that holds is
+#: that the gate's filter covers every kind this scanner can emit.
+NON_WORD_KIND_PROSE = "prose: "
+NON_WORD_KIND_INTERPOLATED = "interpolated: "
+NON_WORD_KIND_COMPOSED = "composed: "
+NON_WORD_KINDS = (
+    NON_WORD_KIND_COMPOSED,
+    NON_WORD_KIND_INTERPOLATED,
+    NON_WORD_KIND_PROSE,
+)
+
+
+def scan_reason_authorities(
+    source: str, *, function_names: tuple[str, ...] = REASON_AUTHORITIES
+) -> ReasonScan:
+    """Every word the named module-level functions can return.
+
+    Needed because both scanners above are keyed on `RiskDecision`, and a
+    refusal word reaching the operator does not have to come through one.
+    `unusable_stop` returns `sl_required` and `sl_not_measured:<value>`;
+    `unusable_volume` returns `volume_unusable:<value>`. Reading `risk.py` and
+    `engine.py` alone therefore UNDERCOUNTS the vocabulary, which is the same
+    shape as the drift `scan_decision_reasons` exists for: the population
+    moved, not the scanner.
+
+    Reuses `_Collector`, so an f-string, a concatenation and a module constant
+    all resolve, and a return it cannot read lands in `unresolved` rather than
+    being skipped. `return None` names no reason and is skipped deliberately.
+    """
+    tree = ast.parse(source)
+    collector = _Collector(_module_string_constants(tree))
+    seen: set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if node.name not in function_names:
+            continue
+        seen.add(node.name)
+        for ret in ast.walk(node):
+            if isinstance(ret, ast.Return) and ret.value is not None:
+                if isinstance(ret.value, ast.Constant) and ret.value.value is None:
+                    continue
+                collector.visit(ret.value)
+    # A NAME THAT IS NOT THERE IS NOT A CLEAN READ. Without this, renaming
+    # `unusable_volume` would shrink the denominator silently and every caller
+    # would still pass, which is this module's own documented failure mode.
+    for wanted in function_names:
+        if wanted not in seen:
+            collector.unresolved.add(f"function not found: {wanted}")
+    return ReasonScan(
+        names=frozenset(collector.names),
+        prefixes=frozenset(collector.prefixes),
+        forwarded=tuple(sorted(collector.forwarded)),
+        unresolved=tuple(sorted(collector.unresolved)),
+    )
+
+
+def scan_refusal_literals(source: str) -> ReasonScan:
+    """Reason words written directly after `refused: ` in a reply string.
+
+    `desk.py` answers `refused: halted` and `refused: max_advice_turns_per_day`
+    as plain literals, with no decision object involved, so these are invisible
+    to every scanner above. An interpolated site (`f"refused: {reason}"`) names
+    nothing here and is correctly skipped: the word is named wherever that
+    expression was set, and the scanners above read it there.
+
+    NOT EVERY REFUSAL REPLY IS A REASON WORD, and `forwarded` carries two
+    kinds of non-word site so that neither is dropped:
+
+    * `prose: ...` for a literal with no word shape, such as
+      `refused: unresolved send <client_id>`, which names one in-flight send.
+    * `interpolated: ...` for an f-string whose head is exactly `refused: `,
+      so nothing literal follows it. Either the word is named elsewhere
+      (`f"refused: {decision.reason}"`) or the payload is free text nobody
+      defines (`f"refused: {result.comment}"`). The scanner cannot tell those
+      apart by dataflow and does not try; it returns the expression and the
+      caller pins the set.
+
+    Both are RETURNED rather than counted or ignored. Counting them would
+    corrupt the denominator with text that can never be documented as a word;
+    dropping them is the defect this module was written against, and TWO
+    earlier versions of this function did exactly that: the first to every
+    f-string site, the second to every CONCATENATED one, which is how most
+    people would spell it.
+
+    WHAT IS SEEN, AND THE ONE THING THAT IS NOT. The rule is not a list of
+    blessed shapes: a refusal reply has to carry the literal prefix somewhere
+    in the source, so every string constant carrying it is a site whatever
+    expression assembles the rest. Measured per form in
+    `tests/test_contract_refusal_vocabulary.py`: f-string, concatenation with
+    and without the space, `str.join`, an f-string with a LEADING expression,
+    `%` and `.format` are all seen. A docstring mentioning the prefix is not a
+    site and is skipped.
+
+    **The residual blind spot is a COMPUTED prefix** (`"ref" + "used: "`),
+    which leaves no literal to find and which no scan of this kind can see.
+    That limit is pinned by a test, so closing it later reds and forces this
+    paragraph to be updated rather than letting the claim drift.
+    """
+    tree = ast.parse(source)
+    collector = _Collector(_module_string_constants(tree))
+
+    # THE INVARIANT, stated because the previous two versions of this function
+    # each claimed closure they did not have. A refusal reply has to contain
+    # the literal prefix SOMEWHERE in the source, so every string Constant
+    # carrying it is a site, whatever expression assembles the rest. That is
+    # spelling-agnostic by construction: f-string, concatenation, `join`, `%`
+    # and `.format` all reach here, because all of them leave the prefix as a
+    # literal. The one residual blind spot is a COMPUTED prefix
+    # (`"ref" + "used: "`), which no literal scan can see and which nobody
+    # writes.
+    #
+    # The earlier versions enumerated shapes instead. The first returned on an
+    # f-string head and lost that whole kind; the second fixed the f-string
+    # and left `"refused: " + x.comment` invisible, which is how most people
+    # would spell it, while the comment claimed the hole was closed.
+    docstrings = set()
+    for holder in ast.walk(tree):
+        if isinstance(holder, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            body = getattr(holder, "body", None)
+            if (
+                body
+                and isinstance(body[0], ast.Expr)
+                and isinstance(body[0].value, ast.Constant)
+                and isinstance(body[0].value.value, str)
+            ):
+                docstrings.add(id(body[0].value))
+
+    fstring_heads = set()
+    for holder in ast.walk(tree):
+        if isinstance(holder, ast.JoinedStr) and holder.values:
+            head_node = holder.values[0]
+            if isinstance(head_node, ast.Constant) and isinstance(head_node.value, str):
+                fstring_heads.add(id(head_node))
+
+    parent: dict[int, ast.AST] = {}
+    for holder in ast.walk(tree):
+        for child in ast.iter_child_nodes(holder):
+            parent[id(child)] = holder
+
+    def enclosing_statement(node: ast.AST) -> str:
+        cur: ast.AST | None = node
+        while cur is not None and not isinstance(cur, ast.stmt):
+            cur = parent.get(id(cur))
+        if cur is None:
+            return ast.unparse(node)
+        text = " ".join(ast.unparse(cur).split())
+        return text if len(text) <= 90 else text[:87] + "..."
+
+    def take(text: str) -> None:
+        if not text.startswith("refused: "):
+            return
+        tail = text[len("refused: ") :]
+        if not tail:
+            return  # handled by the caller, which knows how it is composed
+        if REASON_WORD.match(tail):
+            collector._record(tail, prefix=True)
+        else:
+            collector.forwarded.add(NON_WORD_KIND_PROSE + text.rstrip())
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            if id(node) in docstrings or id(node) in fstring_heads:
+                continue  # prose about refusals, or handled below as the f-string
+            if node.value in ("refused: ", "refused:"):
+                # A BARE PREFIX WITH NOTHING LITERAL AFTER IT, and not an
+                # f-string head, so the rest is composed some other way:
+                # `"refused: " + x.comment`, a `join`, a `%`. The site is real
+                # and names no word here, so it is surfaced with the statement
+                # that builds it rather than dropped.
+                collector.forwarded.add(NON_WORD_KIND_COMPOSED + enclosing_statement(node))
+                continue
+            take(node.value)
+        elif isinstance(node, ast.JoinedStr):
+            head = node.values[0] if node.values else None
+            if not (isinstance(head, ast.Constant) and isinstance(head.value, str)):
+                continue
+            if head.value == "refused: ":
+                # NOTHING LITERAL FOLLOWS `refused: `, so this site names no
+                # word HERE. An earlier version returned early on exactly this
+                # string and the site vanished: not a name, not a prefix, not
+                # forwarded. Demonstrated by injecting a NEW
+                # `f"refused: {x.comment}"` site and getting byte-identical
+                # scanner output, which made the hole sit precisely in the
+                # mechanism meant to force a person to look at a new refusal.
+                #
+                # Two kinds reach here and the scanner cannot tell them apart
+                # by dataflow, which is exactly why it must not try: either the
+                # word is named elsewhere and another scanner reads it there
+                # (`f"refused: {decision.reason}"`), or the payload is free
+                # text nobody defines (`f"refused: {result.comment}"`, whose
+                # value comes from `OrderResult.not_sent`). So the EXPRESSION
+                # is returned and the caller pins the set, the same contract
+                # `forwarded` already carries for `RiskDecision(reason=...)`.
+                # A new site of either kind then fails until a person says
+                # which it is.
+                collector.forwarded.add(NON_WORD_KIND_INTERPOLATED + ast.unparse(node))
+                continue
+            take(head.value)
+
+    return ReasonScan(
+        names=frozenset(collector.names),
+        prefixes=frozenset(collector.prefixes),
+        forwarded=tuple(sorted(collector.forwarded)),
+        unresolved=tuple(sorted(collector.unresolved)),
+    )
+
 
 DECISION_CLASS = "RiskDecision"
 

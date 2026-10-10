@@ -226,6 +226,7 @@ def test_the_retry_window_cannot_delay_a_tick() -> None:
 # --- 3. the real thing, which only one platform can run --------------------
 
 
+@pytest.mark.timing
 @pytest.mark.skipif(
     sys.platform != "win32",
     reason=(

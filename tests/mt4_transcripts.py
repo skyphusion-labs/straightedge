@@ -678,6 +678,10 @@ class TranscriptExpert:
     errors: list[str] = field(default_factory=list)
     _stop: threading.Event = field(default_factory=threading.Event)
     _thread: threading.Thread | None = None
+    #: The last request body RECORDED. A delete that does not take leaves the
+    #: request on the shared name, and the next poll re-reads it; this is what
+    #: stops that becoming a phantom second request (#254, #258).
+    _last_body: str = ""
 
     def __enter__(self) -> TranscriptExpert:
         self.directory.mkdir(parents=True, exist_ok=True)
@@ -709,14 +713,40 @@ class TranscriptExpert:
             if req.exists():
                 try:
                     body = req.read_text(encoding="utf-8")
-                    req.unlink()
                 except OSError:
                     time.sleep(0.005)
                     continue
                 op = ea_kv(body, "op")
                 req_id = ea_kv(body, "id")
+                # RECORD BEFORE DELETING (#254). This used to sit after the
+                # `unlink`, so `seen` meant "requests I both read and deleted"
+                # while every caller reads it as "requests the Expert saw". One
+                # unlink denial recovered, because the file was still there and
+                # the next poll re-read it; a denial that persisted through the
+                # budget lost the request entirely and surfaced as a request
+                # that never arrived. `ERROR_ACCESS_DENIED` on exactly this
+                # operation is what #242 measured on the live Windows box.
+                if body == self._last_body:
+                    # The same request file, re-read because the delete did not
+                    # take. It is already recorded, and recording it twice
+                    # would turn a delete failure into a phantom SECOND
+                    # request, which is the opposite error from the one the
+                    # record-before-delete fix removes. Keyed on the body
+                    # rather than the id, so a genuinely new request (which
+                    # always carries a new id, and therefore a different body)
+                    # is never suppressed.
+                    time.sleep(0.005)
+                    continue
                 self.seen.append(body)
                 self.ops.append(op)
+                self._last_body = body
+                try:
+                    req.unlink()
+                except OSError:
+                    # Already recorded, so a delete failure is now visible AS a
+                    # delete failure: the request stays on the shared name and
+                    # the guard above stops the re-read double-counting it.
+                    pass
                 if self.answer_limit is not None and len(self.seen) > self.answer_limit:
                     continue
                 routed = self.route(op, body) if callable(self.route) else None
