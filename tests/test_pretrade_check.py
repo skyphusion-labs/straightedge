@@ -48,7 +48,7 @@ def _events(tmp_path: Path, name: str) -> list[dict]:
     path = tmp_path / "journal.jsonl"
     if not path.exists():
         return []
-    rows = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+    rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
     return [r for r in rows if r.get("event") == name]
 
 

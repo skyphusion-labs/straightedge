@@ -84,7 +84,7 @@ class TestTheDeskWithdrawsWhatItAbandons:
         left = tmp_path / REQ_NAME
         assert not left.exists(), (
             "the abandoned request is still on the shared name; the Expert's "
-            f"next 100ms poll will execute it. body={left.read_text()!r}"
+            f"next 100ms poll will execute it. body={left.read_text(encoding='utf-8')!r}"
         )
 
     def test_a_timed_out_read_is_removed_too(self, tmp_path: Path) -> None:
