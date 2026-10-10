@@ -585,6 +585,23 @@ def test_no_undeclared_kind_escapes_the_scanner() -> None:
 
     Checked over the real modules AND over every witness, since a kind can be
     unreachable in today's source and reachable from a probe.
+
+    THE REACH OF THIS LEG, STATED BECAUSE THE CLAIM AROUND IT WAS STRONGER
+    THAN THE INSTRUMENT. It sees an undeclared kind only on a spelling that
+    the real sources or one of the witnesses actually reaches. An emitter that
+    produced a new kind ONLY for, say, a `.format()` refusal would stay green
+    here until `desk.py` contains a `.format` refusal site. That is an
+    instrument limit rather than a defect, and it is not closed: closing it
+    would need a witness per spelling, which is the enumeration this file
+    already decided against.
+
+    So the honest statement of the chain is NOT "the class is impossible". It
+    is: for every spelling reached by the real sources or a witness, an
+    undeclared kind fails here, a declared kind with no witness fails in
+    `test_the_gate_covers_every_kind_the_scanner_can_emit`, and a kind the
+    declaration drops fails in
+    `test_each_kind_is_produced_and_survives_the_gate_filter`. A file whose
+    subject is overclaimed mechanisms does not get to overclaim its own.
     """
     from refusal_scan import scan_refusal_literals
 
