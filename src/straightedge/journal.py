@@ -285,6 +285,83 @@ class InstanceLockError(RuntimeError):
     """Another process already holds this journal's run lock."""
 
 
+#: The size a single journal row must stay under.
+#:
+#: Stated here and in `docs/CONTRACT.md` rather than only inside a test, which
+#: is what it was until straightedge#226: a bound that lives in one assertion
+#: is a number nobody can check a change against, and two separate suites had
+#: already hardcoded it. Tests import this, so the documented figure and the
+#: asserted figure cannot drift apart.
+#:
+#: DERIVED, not chosen, and the derivation is the contract rather than the
+#: number. 512 was the first figure here and the fixture that justifies this
+#: one measured it wrong before it ever landed: with every `ADVICE_PROPERTIES`
+#: field driven large AT ONCE and all four price fields non-finite, the
+#: `advice_turn` row measures 516 bytes, four over. #250's in-place
+#: `nonfinite:` marker is what made the difference, costing 97 bytes across
+#: those four fields.
+#:
+#:     516   measured worst case: every schema field large at once, all four
+#:           price fields non-finite, the symbol clipped to
+#:           RECORD_STRING_CHARS, and #216's per-field violation classes in
+#:           `degraded`
+#:    + 64   headroom for ONE more non-finite-capable numeric field on the
+#:           row, priced at an 8 character name, longer than any of the four
+#:           today; measured, not allowed for, because such a field costs
+#:           three places at once: the marked value, an entry in the
+#:           `nonfinite` list and a violation class in `degraded`. The
+#:           existing four cost 44, 44, 50 and 53.
+#:    = 580
+#:
+#: WHAT INVALIDATES THIS FIGURE, stated so it cannot go stale in silence:
+#: a SECOND new non-finite-capable numeric field on the row, a field name
+#: longer than 8 characters, a rise in `RECORD_STRING_CHARS`, a per-field
+#: violation class wider than `:not_a_number`, or a longer spelling of
+#: `nonfinite:`. Any of those needs this figure re-derived rather than nudged.
+#:
+#: A field added to `ADVICE_PROPERTIES` alone costs the row NOTHING, measured:
+#: the row's fields are fixed in `desk.py` rather than derived from the schema,
+#: so a schema field is free until somebody journals it. The fixture drives
+#: INPUT; the bound answers for the ROW.
+#:
+#: Stated here and in `docs/CONTRACT.md` rather than only inside a test, and a
+#: test reads the figure back out of that row, so the documented bound and the
+#: asserted bound cannot drift. #119 is why a ceiling exists at all, where one
+#: row stored a rendering of other rows and the payload compounded daily; an
+#: ordinary `advice_turn` still measures 196 bytes against this ceiling.
+RECORD_ROW_BOUND = 580
+
+#: How much of a MODEL-CHOSEN string a row may carry.
+#:
+#: Long enough that every real instrument name, vendor suffix and all, survives
+#: whole (`EURUSD`, `EURUSDm`, `EURUSD.a`, `XAUUSD`, `BTCUSD`), and short enough
+#: that no number of such fields can push a row past the bound
+#: `docs/CONTRACT.md` states (straightedge#226).
+RECORD_STRING_CHARS = 48
+
+
+def clip_for_record(value: str, limit: int = RECORD_STRING_CHARS) -> str:
+    """Bound a model-chosen string for the durable record, and SAY it was cut.
+
+    straightedge#226. `advice_turn` wrote `symbol` verbatim, and `symbol` is
+    model-chosen on the advice path, which is the premise of #197: a 5600
+    character symbol produced a 5838 byte row against the 512 byte bound this
+    repo documents, and the bounded-row test passed anyway because it varied
+    fields that are not echoed. #216 bounded the REASON and this is the same
+    exposure one field over.
+
+    The marker is not decoration. A silently truncated value reads as the whole
+    value, so a reader cannot tell `EURUSD` from a 5600 character string that
+    starts with it, and that is the defect class rather than a nicety: the
+    length is stated so the row says what it dropped.
+
+    Short values are returned unchanged, so nothing that fits is reshaped.
+    """
+    if len(value) <= limit:
+        return value
+    return f"{value[:limit]}[+{len(value) - limit} chars]"
+
+
 def lock_path_for(journal_path: str | Path) -> Path:
     p = Path(journal_path)
     return p.with_name(p.stem + ".lock")
