@@ -170,7 +170,7 @@ calls apart.
 
 Journal events: `send_unresolved` (a send answered nothing; carries the key, what
 the mailbox did with the request, and any position whose comment matched),
-`send_refused_unresolved` (a second send for the same key was refused),
+`send_refused_unresolved` (a second send for the same key was refused; journal-only like every other refusal, and asserted that way with the event explicitly allowlisted, because `_format_event` rather than the allowlist is what keeps it out of the chat),
 `confirm_unresolved` (the chat path's record of the same), `inflight_unreadable`
 (the ledger file exists and could not be parsed, which must never read as "no open
 sends"). `Engine.start()` re-announces every open record on EVERY start.
