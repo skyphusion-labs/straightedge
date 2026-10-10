@@ -1,4 +1,10 @@
-"""Issue #263: both censuses detect drift, and nothing ran either of them.
+"""Issue #263: the censuses detect drift, and nothing ran any of them.
+
+THREE censuses now, not the two #263 found: `encoding_census` joined them
+in straightedge#307 and is invoked here for the reasons below, which were
+written for the first two and needed no adjustment. The title of this file
+is the contract: a census in this repo has an invoker or it is a dead
+letter.
 
 `tests/double_census.py` (#244) and `tests/timing_census.py` (#262) are good
 instruments and were dead letters: neither is a CI step, and neither is
@@ -43,6 +49,7 @@ from __future__ import annotations
 import pathlib
 
 import double_census
+import encoding_census
 import timing_census
 
 #: Seams that have doubles but no double that can FAIL, as measured today.
@@ -316,3 +323,214 @@ def test_the_reader_facing_message_carries_the_narrowed_claim() -> None:
     )
     for bad in RETRACTED_CLAIM_WORDINGS:
         assert bad not in msg, f"the reader-facing message overclaims: {bad}"
+
+
+# --- straightedge#307: the encoding census ---------------------------------
+#
+# WHY THESE LIVE HERE and not in a file of their own: this file already IS the
+# answer to "a census with no invoker is a dead letter", and `encoding_census`
+# is a census. Splitting it out would reproduce the #263 defect one file over.
+
+
+def test_every_text_mode_file_operation_names_an_encoding() -> None:
+    """THE GATE for straightedge#307.
+
+    `Path.read_text()` with no `encoding=` decodes through the platform
+    locale, which is cp1252 on the `windows-latest` leg. There were 40 such
+    sites in `tests/` when this landed and the suite was green, because
+    nothing those sites read happened to carry a byte cp1252 rejects. What
+    kept `CHANGELOG.md` ASCII-clean was the repo's no-em-dash STYLE rule,
+    doing encoding-safety work nobody assigned it. A style rule is not a
+    guard, which is the whole reason this assertion exists.
+    """
+    c = encoding_census.collect()
+
+    assert c.files_scanned > 0, (
+        "the encoding census scanned NO files, so a clean result means the "
+        "instrument stopped working rather than the population being empty"
+    )
+    assert c.total > 0, (
+        f"the encoding census found NO text-IO call sites at all across "
+        f"{c.files_scanned} files, which is not credible: there were 280 when "
+        f"this was written. The scanner, not the repo, is what changed."
+    )
+    assert not c.unresolved, (
+        "the encoding census could not CLASSIFY these call sites, which is a "
+        "finding about the scanner and not a clean result:\n  "
+        + "\n  ".join(c.unresolved)
+    )
+    assert not c.findings, encoding_census.findings_message(c.findings)
+
+
+def test_the_encoding_census_can_see_an_offender(tmp_path: pathlib.Path) -> None:
+    """CONTROL. The gate above has only ever passed, which proves nothing.
+
+    Every shape here is one the scanner must get right, and three of them are
+    here because the FIRST version of this census got them wrong and this
+    control is what caught it. That version looked for any string argument
+    whose characters were all in `rwxabt+U` and called it the mode, so
+    `open("x", "rb")` read its FILENAME as the mode and `write_text("ab")`
+    was dismissed as binary -- a false negative in the only direction that
+    matters. Classification is by signature POSITION now.
+
+    Synthesized in `tmp_path` rather than by editing a file under `src/`,
+    because a control that requires a person to break the repo first is a
+    control that does not get run.
+    """
+    cases = [
+        ("findings", "a plain read_text",
+         "import pathlib\npathlib.Path('x').read_text()\n"),
+        ("findings", "a plain write_text",
+         "import pathlib\npathlib.Path('x').write_text('d')\n"),
+        ("findings", "the builtin open in text mode", "open('x')\n"),
+        ("findings", "read_text on a fixture expression",
+         "import pathlib\nd = pathlib.Path('.')\n(d / 'j.jsonl').read_text()\n"),
+        ("findings", "a FILENAME that looks like a mode string", "open('rb')\n"),
+        ("findings", "write_text of a mode-shaped string",
+         "import pathlib\npathlib.Path('f').write_text('ab')\n"),
+        ("named", "an encoding named by keyword",
+         "import pathlib\npathlib.Path('x').read_text(encoding='utf-8')\n"),
+        ("named", "an encoding named POSITIONALLY",
+         "import pathlib\npathlib.Path('x').read_text('utf-8')\n"),
+        ("named", "encoding='locale', deliberate and explicit",
+         "import pathlib\npathlib.Path('x').read_text(encoding='locale')\n"),
+        ("binary", "binary mode positionally", "open('x', 'rb')\n"),
+        ("binary", "binary mode by keyword", "open('x', mode='wb')\n"),
+        ("exempt_api", "os.open, which has no encoding parameter",
+         "import os\nos.open('x', os.O_RDONLY)\n"),
+        ("unresolved", "a mode this census cannot read", "m = 'r'\nopen('x', m)\n"),
+        ("unresolved", "a shadowed open", "from gzip import open\nopen('x')\n"),
+        ("unresolved", "another module's open", "import gzip\ngzip.open('x')\n"),
+    ]
+
+    for i, (bucket, label, source) in enumerate(cases):
+        d = tmp_path / f"case{i}"
+        d.mkdir()
+        (d / "synthetic.py").write_text(source, encoding="utf-8")
+        c = encoding_census.scan(roots=[d])
+        landed = sorted(
+            k for k in ("findings", "named", "binary", "exempt_api", "unresolved")
+            if getattr(c, k)
+        )
+        assert landed == [bucket], (
+            f"{label}: the census put it in {landed or ['no bucket']} rather "
+            f"than {bucket!r}. Source:\n{source}"
+        )
+
+    # And `read_bytes` must not be a candidate at all: it never decodes, so
+    # demanding an encoding of it would be a false positive the fixer cannot
+    # satisfy.
+    d = tmp_path / "bytes"
+    d.mkdir()
+    (d / "synthetic.py").write_text(
+        "import pathlib\npathlib.Path('x').read_bytes()\n", encoding="utf-8"
+    )
+    c = encoding_census.scan(roots=[d])
+    assert c.total == 0, f"read_bytes was treated as a text-IO site: {c}"
+
+
+def test_the_encoding_census_refuses_an_empty_denominator(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A census that measured nothing must never read as "nothing is wrong".
+
+    Same property `double_census.collect` raises `RuntimeError` for. Without
+    it, a glob that stops matching turns this gate permanently green, which is
+    the failure mode every census in this repo was written against.
+    """
+    import pytest
+
+    with pytest.raises(RuntimeError, match="NOTHING CHECKED"):
+        encoding_census.scan(roots=[tmp_path])
+
+
+def test_an_encoding_less_read_of_utf8_really_does_misread_under_cp1252(
+    tmp_path: pathlib.Path,
+) -> None:
+    """THE HAZARD ITSELF, asserted rather than cited.
+
+    The census above is only worth having if the defect it hunts is real. This
+    proves it on synthesized bytes, and it pins BOTH failure modes because
+    they need different reactions from a reader:
+
+      RAISE   `UnicodeDecodeError` naming a byte offset. Loud, and the easier
+              one, because something tells you.
+      MISREAD no exception at all, wrong text. This is the one that matters:
+              it cannot be found by looking at whether CI went red.
+
+    Platform-independent on purpose. It passes `encoding="cp1252"` explicitly
+    instead of relying on the runner's locale, so the POSIX legs assert the
+    same property the Windows leg would meet, and the test cannot quietly
+    become a no-op on the platform where it is cheap to run.
+    """
+    # --- the RAISE half ----------------------------------------------------
+    # U+FB01 LATIN SMALL LIGATURE FI is ef ac 81 in utf-8. 0x81 is UNDEFINED
+    # in cp1252. This is not hypothetical: `#197`'s case-mapping corpus put
+    # this exact character into a file in `tests/`.
+    ligature = tmp_path / "ligature.txt"
+    ligature.write_text("ligature: \ufb01\n", encoding="utf-8")
+    raw = ligature.read_bytes()
+    assert b"\x81" in raw, (
+        "this control depends on an undefined cp1252 byte being present and "
+        f"it is not: {raw.hex()}"
+    )
+    assert ligature.read_text(encoding="utf-8") == "ligature: \ufb01\n", (
+        "the utf-8 read did not round-trip, so the control is measuring "
+        "something other than the decoder"
+    )
+    try:
+        ligature.read_text(encoding="cp1252")
+    except UnicodeDecodeError as exc:
+        assert "undefined" in exc.reason, exc.reason
+    else:
+        raise AssertionError(
+            "cp1252 decoded a byte that is undefined in cp1252, so this "
+            "control can no longer produce its positive and the census above "
+            "is guarding nothing"
+        )
+
+    # --- the SILENT MISREAD half, the worse one ----------------------------
+    # Every byte of a utf-8-encoded Latin-1 character IS defined in cp1252, so
+    # there is no exception to notice: the text simply comes back wrong.
+    accented = tmp_path / "accented.txt"
+    truth = "caf\u00e9 na\u00efve r\u00e9sum\u00e9\n"
+    accented.write_text(truth, encoding="utf-8")
+    assert b"\x81" not in accented.read_bytes(), (
+        "this half must NOT rely on an undefined byte, or it is just the "
+        "raise case again"
+    )
+    misread = accented.read_text(encoding="cp1252")
+    assert misread != truth, (
+        "cp1252 returned the correct text, so there is no silent misread to "
+        "guard against"
+    )
+    assert len(misread) > len(truth), (
+        f"expected mojibake longer than the truth, got {misread!r}"
+    )
+    assert accented.read_text(encoding="utf-8") == truth
+
+
+def test_the_encoding_census_reader_facing_message_carries_the_claim() -> None:
+    """INVOKED, not grepped.
+
+    Same reasoning as `test_the_reader_facing_message_carries_the_narrowed_claim`
+    above: reading this file for a string spells the needle in the file being
+    read, so the assertion always finds ITSELF. Build the message instead and
+    assert on what a tripped reader is actually shown.
+    """
+    msg = encoding_census.findings_message(["tests/test_x.py:12 read_text()"])
+
+    assert encoding_census.UNNAMED_ENCODING_CLAIM in msg, (
+        "the message a tripped reader sees no longer carries the shared "
+        "claim, so it is a second spelling of it:\n" + msg
+    )
+    assert "tests/test_x.py:12" in msg, (
+        "the message does not name the offending site, so a reader cannot act "
+        "on it"
+    )
+    assert "cp1252" in encoding_census.UNNAMED_ENCODING_CLAIM, (
+        "the claim no longer names the encoding that makes this a defect"
+    )
+    assert "utf-8" in encoding_census.DIRECTIONS, (
+        "the directions no longer say what to do"
+    )

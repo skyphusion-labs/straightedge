@@ -372,7 +372,7 @@ def test_an_unresolved_send_is_announced_on_every_start(tmp_path) -> None:
     assert again.report_unresolved_sends() == 1
     events = [
         json.loads(line)["event"]
-        for line in (tmp_path / "j.jsonl").read_text().splitlines()
+        for line in (tmp_path / "j.jsonl").read_text(encoding="utf-8").splitlines()
     ]
     assert events.count("send_unresolved") >= 2
 
@@ -386,7 +386,7 @@ def test_an_unreadable_ledger_is_reported_and_not_read_as_empty(tmp_path) -> Non
     assert engine.report_unresolved_sends() == 0
     events = [
         json.loads(line)["event"]
-        for line in (tmp_path / "j.jsonl").read_text().splitlines()
+        for line in (tmp_path / "j.jsonl").read_text(encoding="utf-8").splitlines()
     ]
     assert "inflight_unreadable" in events
 
@@ -422,7 +422,7 @@ def test_an_interrupt_leaves_the_entry_open_without_probing_the_book(tmp_path) -
         engine.handle_command(TgCommand("1", 1, "/confirm", 2))
     assert key in engine.inflight.open_entries(), "the interrupt lost the record"
     events = [
-        json.loads(line) for line in (tmp_path / "j.jsonl").read_text().splitlines()
+        json.loads(line) for line in (tmp_path / "j.jsonl").read_text(encoding="utf-8").splitlines()
     ]
     unresolved = [r for r in events if r["event"] == "send_unresolved"]
     assert unresolved and unresolved[-1]["book_read_failed"].startswith("not attempted")
@@ -456,7 +456,7 @@ def test_a_book_read_that_itself_fails_is_reported_and_not_silent(tmp_path) -> N
     engine.handle_command(TgCommand("1", 1, "/confirm", 2))
     engine.stop()
     events = [
-        json.loads(line) for line in (tmp_path / "j.jsonl").read_text().splitlines()
+        json.loads(line) for line in (tmp_path / "j.jsonl").read_text(encoding="utf-8").splitlines()
     ]
     unresolved = [r for r in events if r["event"] == "send_unresolved"]
     assert unresolved and "timeout" in unresolved[-1]["book_read_failed"]
@@ -473,7 +473,7 @@ def test_a_matched_position_is_reported_as_unmanaged(tmp_path) -> None:
     engine.handle_command(TgCommand("1", 1, "/confirm", 2))
     engine.stop()
     events = [
-        json.loads(line) for line in (tmp_path / "j.jsonl").read_text().splitlines()
+        json.loads(line) for line in (tmp_path / "j.jsonl").read_text(encoding="utf-8").splitlines()
     ]
     unresolved = [r for r in events if r["event"] == "send_unresolved"][-1]
     assert unresolved["matched"], f"the fill carrying {key} was not matched"
