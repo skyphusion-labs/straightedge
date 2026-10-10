@@ -148,6 +148,22 @@ def channel_comments() -> frozenset[str]:
     return _scans()["engine.py (OrderResult.invalid_stops comments)"].names
 
 
+def _section_bounds(contract_text: str) -> tuple[int, int]:
+    """Byte range of this section, so a WRITER can be scoped like the READER.
+
+    Extracted from `table_words` rather than spelled a second time: a control
+    that scopes itself with its own copy of these bounds is the duplicate that
+    #220 spent three iterations removing from its own gate.
+    """
+    start = contract_text.find(TABLE_HEADING)
+    if start < 0:
+        return (0, 0)
+    rest = contract_text[start + len(TABLE_HEADING) :]
+    end = rest.find("\n## ")
+    stop = len(contract_text) if end < 0 else start + len(TABLE_HEADING) + end
+    return (start, stop)
+
+
 def table_words(contract_text: str) -> frozenset[str]:
     """The words this section's TABLE documents, trailing `:` stripped.
 
@@ -525,9 +541,30 @@ def test_the_coverage_check_can_see_an_undocumented_word() -> None:
     victim = sorted(guard_words())[0]
     assert victim in table_words(text), "the table does not document " + victim
 
-    damaged = re.sub(
-        r"^\| `%s:?` \|.*$\n?" % re.escape(victim), "", text, count=1, flags=re.M
+    # REMOVED FROM THIS SECTION, not from the file. The reader above is
+    # section-scoped and this removal was not, which is the same whole-file
+    # versus section mismatch #220 found in its own gate, mirrored: there the
+    # READER was unscoped, here the WRITER was.
+    #
+    # Latent on the tree this was written against, because `spec_not_measured`
+    # had exactly one row in the file. #220 adds a `### Refusal reasons` table
+    # that documents the same word EARLIER in the document, so a whole-file
+    # `count=1` deletes THAT row, this section keeps its own, and the control
+    # reds with "the row was not removed" while nothing is wrong with either
+    # table. Measured on the merge: rows at lines 156 and 259, this section
+    # spanning 219 to 276, so the deleted one sat outside it.
+    sec_start, sec_end = _section_bounds(text)
+    row = next(
+        (
+            m
+            for m in TABLE_ROW.finditer(text)
+            if m.group(1) == victim and sec_start <= m.start() <= sec_end
+        ),
+        None,
     )
+    assert row is not None, f"no row for {victim!r} inside {TABLE_HEADING!r}"
+    line_end = text.find("\n", row.start())
+    damaged = text[: row.start()] + text[line_end + 1 :]
     assert table_words(damaged) != table_words(text), "the row was not removed"
     assert victim in undocumented(damaged), (
         "the coverage check did not notice a table row being deleted, so its "
