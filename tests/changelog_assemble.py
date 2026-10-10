@@ -95,7 +95,7 @@ def read_fragments(root: pathlib.Path) -> tuple[list[Fragment], list[str]]:
                 "hyphen separated; use %s for no issue)" % (FRAGMENT_DIR, path.name, NO_ISSUE)
             )
             continue
-        text = path.read_text()
+        text = path.read_text(encoding="utf-8")
         if not text.strip():
             errors.append("%s/%s is empty" % (FRAGMENT_DIR, path.name))
             continue
@@ -146,7 +146,7 @@ def apply_release(root: pathlib.Path, version: str, frags: list[Fragment]) -> li
     """Insert the assembled block and delete the fragments. Returns a log."""
     log: list[str] = []
     path = root / CHANGELOG
-    text = path.read_text()
+    text = path.read_text(encoding="utf-8")
     marker = "\n%s\n" % UNRELEASED
     if marker not in text:
         raise SystemExit("FATAL: %s has no '%s' line to replace." % (CHANGELOG, UNRELEASED))
@@ -155,7 +155,7 @@ def apply_release(root: pathlib.Path, version: str, frags: list[Fragment]) -> li
     # would make the next author wonder where entries go, which is the question
     # this whole change exists to answer once.
     replacement = "\n%s\n\n%s\n" % (UNRELEASED, assemble(version, frags).rstrip("\n"))
-    path.write_text(text.replace(marker, replacement, 1))
+    path.write_text(text.replace(marker, replacement, 1), encoding="utf-8")
     log.append("%s: inserted %d entr%s under ## %s"
                % (CHANGELOG, len(frags), "y" if len(frags) == 1 else "ies", version))
     for f in frags:
@@ -170,7 +170,7 @@ def cmd_check(root: pathlib.Path) -> int:
     for f in frags:
         print("  %s" % f.path.name)
 
-    stray = unreleased_entries((root / CHANGELOG).read_text())
+    stray = unreleased_entries((root / CHANGELOG).read_text(encoding="utf-8"))
     print("'### ' entries under %s in %s: %d" % (UNRELEASED, CHANGELOG, len(stray)))
     for s in stray:
         print("  %s" % s)
@@ -235,10 +235,10 @@ def self_test() -> int:
         d = pathlib.Path(tempfile.mkdtemp())
         (d / FRAGMENT_DIR).mkdir()
         for name, text in fragments.items():
-            (d / FRAGMENT_DIR / name).write_text(text)
+            (d / FRAGMENT_DIR / name).write_text(text, encoding="utf-8")
         (d / CHANGELOG).write_text(
             "# Changelog\n\n%s\n%s\n## 1.8.0\n\n### An older entry\n\n- old\n"
-            % (UNRELEASED, unreleased_body)
+            % (UNRELEASED, unreleased_body), encoding="utf-8"
         )
         return d
 
@@ -274,9 +274,9 @@ def self_test() -> int:
     # 3. the ONE-PLACE invariant, in both directions.
     clean = tree(good)
     check("clean tree: no stray entries under Unreleased",
-          unreleased_entries((clean / CHANGELOG).read_text()) == [])
+          unreleased_entries((clean / CHANGELOG).read_text(encoding="utf-8")) == [])
     dirty = tree(good, unreleased_body="\n### A stray entry put straight in the file\n\n- x\n")
-    stray = unreleased_entries((dirty / CHANGELOG).read_text())
+    stray = unreleased_entries((dirty / CHANGELOG).read_text(encoding="utf-8"))
     check("detected: an entry written straight into CHANGELOG.md", len(stray) == 1)
     check("and the older released entry is NOT counted as stray",
           all("older" not in s for s in stray))
@@ -294,7 +294,7 @@ def self_test() -> int:
     d = tree(good)
     frags, _ = read_fragments(d)
     apply_release(d, "1.9.0", frags)
-    after = (d / CHANGELOG).read_text()
+    after = (d / CHANGELOG).read_text(encoding="utf-8")
     check("apply: the Unreleased heading SURVIVES, empty", UNRELEASED in after)
     check("apply: the new version heading is present", "## 1.9.0" in after)
     check("apply: the older released section is untouched", "### An older entry" in after)
