@@ -177,6 +177,18 @@ and it is worth naming because each instance looked like a clean negative:
   with its domain and its exclusions stated cannot hide a wrong filter; a bare
   "six sites" can.
 
+- **A guard that PRINTS its verdict has not asserted it.** A pre-apply check
+  computed `ok=0`, and the next line was `echo "SAFE: $ok"` chained to the
+  apply with `&&`. **`echo` succeeds whatever it prints**, so the apply ran
+  against a guard that had just said unsafe. The same guard was also the wrong
+  instrument for its subject, being line-oriented over files that are one
+  paragraph per line, and the correctness of what it let through was only
+  established by re-measuring at word level afterwards. Two defects stacked:
+  the verdict was never tested, and the verdict was wrong. Chain the ACTION
+  behind the comparison, never behind a line that reports it, and remember that
+  `$?` after a pipe is the PIPE's status, so a guard that pipes needs
+  `${PIPESTATUS[0]}`.
+
 Every one of those made a reviewer's instrument report the reassuring state,
 which is this file's subject applied to the tools the reviewer brought rather
 than to the code under review.
