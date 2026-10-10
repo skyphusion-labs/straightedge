@@ -486,6 +486,66 @@ because a fixture that never reaches the unmeasured-to-measured path would pass
 the absence check by accident. Restoring the unconditional write reds exactly
 that one test and nothing else.
 
+### A journal row is JSON now, and a non-finite number is not written as a number (issue #231)
+
+`Journal.write` ended `json.dumps(rec, default=str)`, and `allow_nan` defaults
+to True, so `float("inf")` was emitted as the bare token `Infinity`, which
+RFC 8259 has no production for. Three readers gave three answers to one line:
+
+```
+python3 json.loads   accepts, float('inf')
+node JSON.parse      REJECTS, Unexpected token 'I'
+jq-1.7.1-apple       accepts, prints 1.7976931348623157e+308
+```
+
+**So the record did not carry an unusable value, it carried whatever the
+reader's parser invented**, and the jq answer is the dangerous one. It is worse
+than a clip because jq's own answers disagree: `isinfinite` is true, the
+printed value is `DBL_MAX`, and an equality against `DBL_MAX` is false. A
+reconciliation piped through `jq`, which is the obvious tool for the job,
+therefore reported a price the desk never saw, at a number with no provenance,
+with no error anywhere. #37's evidence package is the consumer.
+
+**The value is now `null` IN PLACE and its path is named** in a reserved
+`unrepresentable` list on the same row (`sl=inf`, `symbols[1].atr=nan`). Three
+things that buys: valid JSON in every reader by construction; `null` here can
+be told from a field nobody set, which is `clip_for_record`'s discipline of
+saying what it dropped (#226); and ONE rule at every depth rather than omission
+at the top level and null when nested, because absent-OR-null has two absent
+states nothing distinguishes (#225, #206).
+
+A string spelling (`"sl": "inf"`) was the other candidate and is not used: a
+number field that is sometimes a string is the two-types-one-field shape #225
+removed from a neighbouring row. Clipping to `DBL_MAX` is not used because that
+is exactly what jq already does.
+
+**Enforced in `Journal.write`, not at a producer.** `_num` turning a long digit
+string into `inf` is how it was found, but `rr: Infinity` reaches a `reject` row
+without going through `_num`, so a producer fix would have passed its own test
+while the same token kept shipping from elsewhere. One pass covers every row,
+present and future, at every depth: flat fields, nested dicts, lists of dicts
+(the `history_preflight` shape) and bare lists.
+
+**A Python-only suite cannot see this defect at all,** which is why the gate is
+the written BYTES plus a strict parse that refuses the extension the way node
+does. `json.loads` ACCEPTS the bad line, so a round trip through Python alone
+passed before the fix and would pass after it. The real `node` and `jq` are run
+too, as corroboration and never as the gate, because they skip on a box without
+them and a skipped test proves nothing.
+
+Eight mutations, each red where it should be: the writer pass removed reds 10,
+lists no longer walked reds 6 (including both real readers), dicts no longer
+walked reds 10, the value replaced but never named reds 6, clipped to `DBL_MAX`
+reds 6, written as a string reds 6, every float nulled reds 4 **including the
+control** that a clean row is untouched and unmarked, and the caller-marker
+merge dropped reds 1. Restored, 11 passed.
+
+**That last mutation found an unpinned branch in code written for this issue.**
+Dropping the merge of a caller-supplied `unrepresentable` field left the file
+green, so the branch existed with nothing standing behind it, which is the same
+shape as #226's unreachable `except`. It has a test now, and the test asserts
+that both entries survive rather than which came first.
+
 ## 1.8.0
 
 ### The worst tick gap this box has seen now outlives the process (issue #153)

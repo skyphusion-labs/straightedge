@@ -9,6 +9,7 @@ Rotated history is <name>.1.
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import sys
@@ -62,6 +63,29 @@ class Journal:
             **{k: _jsonable(v) for k, v in fields.items()},
         }
         rec = redact(rec)
+        # A NON-FINITE NUMBER IS NOT WRITTEN AS A NUMBER (#231). `json.dumps`
+        # defaults `allow_nan=True`, so `float("inf")` was emitted as the bare
+        # token `Infinity`, which RFC 8259 has no production for. Three readers
+        # gave three answers on one such line: Python accepted it as `inf`,
+        # `node JSON.parse` REJECTED the line, and `jq 1.7.1` accepted it and
+        # printed `1.7976931348623157e+308`. So the record did not carry an
+        # unusable value, it carried whatever the reader's parser invented, and
+        # the jq answer is the dangerous one: a reconciliation piped through jq
+        # reports a price the desk never saw, at a number with no provenance,
+        # with no error anywhere.
+        #
+        # HERE rather than at any producer. `_num` turning a long digit string
+        # into `inf` was how it was found, but `rr: Infinity` reaches a `reject`
+        # row without going through `_num` at all, so a fix at a producer would
+        # have passed its own test while the same token kept shipping from
+        # somewhere else. One pass at the writer covers every row, present and
+        # future.
+        rec, unrepresentable = _representable(rec)
+        if unrepresentable:
+            existing = rec.get(UNREPRESENTABLE_KEY)
+            if isinstance(existing, list):
+                unrepresentable = sorted({*map(str, existing), *unrepresentable})
+            rec[UNREPRESENTABLE_KEY] = unrepresentable
         line = json.dumps(rec, default=str) + "\n"
         self._rotate_if_needed(len(line.encode("utf-8")))
         with self.path.open("a", encoding="utf-8") as fh:
@@ -324,6 +348,64 @@ def _unlock(fh: TextIO) -> None:
     import fcntl
 
     fcntl.flock(fd, fcntl.LOCK_UN)
+
+
+#: Reserved field. When a row carries a value that cannot be written as a JSON
+#: number, the value becomes `null` and its path is named here as
+#: `path=spelling`, so `null` on this row can be told from a field nobody set.
+#: A caller passing a field of this name has its list merged rather than
+#: replaced (#231).
+UNREPRESENTABLE_KEY = "unrepresentable"
+
+#: Each non-finite float is NAMED rather than counted, because three different
+#: findings hide behind one word: a price of `inf`, a price of `-inf` and a
+#: price that is `nan` ask different questions about the venue.
+
+
+def _spell(value: float) -> str:
+    if math.isnan(value):
+        return "nan"
+    return "inf" if value > 0 else "-inf"
+
+
+def _representable(value: Any, path: str = "") -> tuple[Any, list[str]]:
+    """Replace every non-finite float with `null`, naming where each one was.
+
+    `null` IN PLACE rather than dropping the key, and the same rule at every
+    depth, because a field that can be absent OR null has two absent states and
+    nothing distinguishes them (#225, #206). The marker is what separates this
+    `null` from a field nobody set, which is the discipline `clip_for_record`
+    already applies to a string it shortened (#226).
+
+    A string spelling (`"sl": "inf"`) was the other candidate and is not used:
+    a number field that is sometimes a string is the two-types-one-field shape
+    #225 removed from a neighbouring row. Clipping to `DBL_MAX` is not used
+    either, because that is precisely what `jq` already does, and a plausible
+    finite number with no provenance is the worst of the available failures.
+
+    `bool` is a subclass of `int` and `int` is always finite, so only `float`
+    is examined; a `Decimal` or a numpy scalar would reach `default=str` as it
+    always has.
+    """
+    found: list[str] = []
+    if isinstance(value, float) and not math.isfinite(value):
+        return None, [f"{path}={_spell(value)}" if path else _spell(value)]
+    if isinstance(value, dict):
+        out: dict[Any, Any] = {}
+        for key, val in value.items():
+            child = f"{path}.{key}" if path else str(key)
+            out[key], names = _representable(val, child)
+            found.extend(names)
+        return out, sorted(found)
+    if isinstance(value, (list, tuple)):
+        items = []
+        for index, val in enumerate(value):
+            child = f"{path}[{index}]"
+            item, names = _representable(val, child)
+            items.append(item)
+            found.extend(names)
+        return items, sorted(found)
+    return value, found
 
 
 def _jsonable(v: Any) -> Any:

@@ -1189,6 +1189,14 @@ A pending fill writes `open` with `fill=true`.
 A vanished ticket writes `close` with `fill=true`.
 The venue holds the live book. It is not the fill log.
 
+A field reading `null` beside an `unrepresentable` list is a value the desk
+measured and could not write as a number: `"sl": null` with
+`"unrepresentable": ["sl=inf"]` means the stop arrived as infinity, not that
+nobody set a stop. The list names the path and which spelling arrived (`inf`,
+`-inf`, `nan`), and a path like `symbols[1].atr=nan` locates it inside a
+nested row. Do NOT read such a row through a tool that invents a number for
+it: before this existed, `jq` printed `1.7976931348623157e+308` for a value
+the desk never saw.
 JSONL, one event per line: `start`, `open`, `close`, `modify`, `reject`, `halt`, `order_check_fail`, `pending`, `recap`, `reconnect`, `loop_error`, `confirm_stage`, `confirm_cancel`, `confirm_sent`, `approve_always`, `approve_off`, `auto_on`, `auto_off`, `live_on`, `live_off`, `live_not_restored`, `risk_state_error`, `advice_turn`, `advice_circuit_block`, `advice_stage_failed`, `flatten`, `flatten_incomplete`, `close_failed`, `close_partial`, `cancel_failed`, `positions_read_failed`, `orders_read_failed`, `account_read_failed`, `send_unresolved`, `send_refused_unresolved`, `confirm_unresolved`, `inflight_unreadable`, `notify_truncated`, `venue_clock`, `stop`.
 `reject` is written by every gate that refuses, on every path, and it is the
 record to grep when the bot will not trade.
