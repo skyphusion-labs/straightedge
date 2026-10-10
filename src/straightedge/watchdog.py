@@ -21,7 +21,11 @@ It does mean the operator-visible state space is three states and not two:
      gate's own named reason: `live_not_accepted` after a restart, and also
      `halt_file`, `daily_loss`, `max_drawdown`, `trade_not_allowed`,
      `state_unreadable` or `state_unwritable`.
-  3. ticking and the circuit is clear. `ALIVE ARMED`.
+  3. ticking, the circuit is clear, and the journal has stopped rotating.
+     `ALIVE DEGRADED`, reason `rotation_stuck`. The desk is trading and no
+     order is affected; its audit log is one file growing past its bound
+     (straightedge#288).
+  4. ticking and the circuit is clear. `ALIVE ARMED`.
 
 A watchdog that reports up-or-down calls state 2 healthy, and state 2 is "your
 bot silently stopped trading". Distinguishing it is the whole point, so the
@@ -129,6 +133,14 @@ UNBOUNDED_TAIL_ALLOWANCE = 2
 
 STATE_ARMED = "ALIVE ARMED"
 STATE_NOT_TRADING = "ALIVE NOT TRADING"
+#: Ticking, armed, and a HOUSEKEEPING contract has failed. Not ARMED,
+#: because `ok` drives both the repeat and the chat, so a condition that
+#: cannot make `ok` false is told once and never again: that is exactly how
+#: `rotate_deferrals` came to be published and watched by nobody
+#: (straightedge#288). Not NOT_TRADING either, because the desk IS trading
+#: and that state's remedy is to re-arm, which would be the wrong
+#: instruction for a holder on a file.
+STATE_DEGRADED = "ALIVE DEGRADED"
 STATE_STALE = "STALE"
 STATE_UNKNOWN = "UNKNOWN"
 
@@ -144,6 +156,10 @@ EXIT_ARMED = 0
 EXIT_NOT_TRADING = 3
 EXIT_STALE = 4
 EXIT_UNKNOWN = 5
+#: ADDITIVE on purpose: a caller testing `!= 0` already treats this as bad
+#: and a caller testing `== 4` for STALE is unaffected, so no deployed
+#: scheduled task changes meaning (straightedge#288).
+EXIT_DEGRADED = 6
 
 
 def new_run_id() -> str:
@@ -229,6 +245,8 @@ def render(
     deployed: str,
     breach_rows_lost: int = 0,
     rotate_deferrals: int = 0,
+    journal_bytes: int = 0,
+    rotate_bytes: int = 0,
 ) -> str:
     """The heartbeat file's whole content.
 
@@ -286,6 +304,18 @@ def render(
         # unconditionally for the same reason: a field that appears only when
         # something is wrong is a field no reader learns to expect.
         f"rotate_deferrals={int(rotate_deferrals)}",
+        # straightedge#288. THE PAIR, never one of them: a size with no bound
+        # beside it is a number a reader has to hold a copy of the threshold to
+        # judge, which is the drift `stale_after_s` is published to avoid. In
+        # healthy operation the live file never exceeds the bound, because the
+        # rotation happens before the write that would cross it, so the two
+        # together are what makes "rotation is not happening" a reading rather
+        # than an inference from a count. `rotate_bytes` defaults to 0 and the
+        # watcher treats a non-positive bound as UNMEASURED rather than as a
+        # bound of zero, so a desk that publishes neither is not reported as a
+        # desk whose journal is infinitely over its limit.
+        f"journal_bytes={int(journal_bytes)}",
+        f"rotate_bytes={int(rotate_bytes)}",
         f"run_id={run_id}",
         f"started_at={started_at}",
         f"deployed={deployed}",
@@ -474,6 +504,64 @@ def decide(path: str | Path, *, now: datetime, cfg: Any = None) -> Report:
             "this watcher can report that the desk is ticking and cannot "
             "report that it is the same desk."
         )
+    # ROTATION. Two published readings and no threshold of this watcher's
+    # own, which is the whole reason this is an alert at all. The desk
+    # publishes the bound beside the size, exactly as it publishes
+    # `stale_after_s` beside the timestamp, and in healthy operation the live
+    # file NEVER exceeds that bound because `Journal._rotate_if_needed` rotates
+    # before the write that would cross it. So one comparison means "a rotation
+    # was attempted and did not happen", with no duration to wait out.
+    #
+    # WHY NOT A THRESHOLD ON `rotate_deferrals`, which is the field #288 named:
+    # it is a monotonic per-process count with no clock and no clearing. A
+    # backup agent that held the journal once an hour ago leaves it at 1
+    # forever, and a holder still attached leaves it at 1 too, so from ONE
+    # heartbeat no value of N tells those apart. The deployed shape is a
+    # scheduled single check (`loop=False`), so a delta between observations is
+    # not available either. The count is still READ: it is what says whether
+    # the rotation is being REFUSED by a holder or failing for a reason nobody
+    # has thought of, which is the more general instrument #288 asked for.
+    journal_bytes = _int_field(hb, "journal_bytes")
+    rotate_bytes = _int_field(hb, "rotate_bytes")
+    deferrals = _int_field(hb, "rotate_deferrals")
+    rotation_stuck = (
+        journal_bytes is not None
+        and rotate_bytes is not None
+        and rotate_bytes > 0
+        and journal_bytes > rotate_bytes
+    )
+    if journal_bytes is None or rotate_bytes is None or rotate_bytes <= 0:
+        notes.append(
+            "NOTE: this desk publishes no journal_bytes and rotate_bytes pair, "
+            "so whether the journal is rotating is UNMEASURED from this file. "
+            "rotate_deferrals counts refusals for the life of the process and "
+            "cannot say whether one is still unresolved. The absence is NOT "
+            "read as a healthy rotation. Upgrade the desk."
+        )
+    elif rotation_stuck:
+        over = journal_bytes - rotate_bytes
+        cause = (
+            f"rotate_deferrals={deferrals}, so something is HOLDING the file "
+            "open and refusing the replace"
+            if deferrals
+            else "rotate_deferrals=0, so the rotation is not being refused by "
+            "a holder: it is failing, or not being attempted, for a reason "
+            "this desk does not have a name for"
+        )
+        notes.append(
+            f"NOTE: journal.jsonl is {journal_bytes} bytes against its "
+            f"{rotate_bytes} byte rotation bound, {over} over. In healthy "
+            "operation the live file never exceeds that bound, because the "
+            f"rotation happens before the write that would cross it. {cause}."
+        )
+    elif deferrals:
+        notes.append(
+            f"NOTE: this process has deferred {deferrals} rotation(s) and the "
+            "journal is INSIDE its bound now, so something held the file open "
+            "and let go. The rows written while it was over the bound carry "
+            "rotate_deferred=1. Nothing to do; the count does not clear until "
+            "the desk restarts."
+        )
     if hb.fields.get("over_budget") == "1":
         notes.append(
             "NOTE: the desk has observed a gap between ticks longer than its "
@@ -555,6 +643,41 @@ def decide(path: str | Path, *, now: datetime, cfg: Any = None) -> Report:
                     f"NOT trade ({blocked})",
                     detail,
                     remedy,
+                ]
+                + notes
+            ),
+        )
+    if rotation_stuck:
+        # AFTER `blocked` on purpose. A desk that will not trade is the louder
+        # condition and its remedy is the urgent one; the rotation reading
+        # rides that report as a note, and a NOT_TRADING report is already not
+        # `ok`, so it repeats on the desk's own threshold and the note repeats
+        # with it. The only state this can hide behind is one that is already
+        # being told.
+        return Report(
+            state=STATE_DEGRADED,
+            reason="rotation_stuck",
+            exit_code=EXIT_DEGRADED,
+            next_sleep_s=next_sleep,
+            stale_after_s=float(stale_after),
+            run_id=run_id,
+            started_at=started_at,
+            text="\n".join(
+                [
+                    f"straightedge {STATE_DEGRADED}: ticking, the circuit is "
+                    "clear, and the journal has STOPPED ROTATING",
+                    detail,
+                    "No order is affected and the desk is trading. This is the "
+                    "audit log: every row is landing, and the file it lands in "
+                    "is growing past the bound that is supposed to cap it.",
+                    "FIND THE HOLDER AND STOP IT. On the deployed Windows box "
+                    "that is `handle64.exe journal.jsonl`, or Resource "
+                    "Monitor, CPU, Associated Handles, searched for the "
+                    "filename. A backup agent, an antivirus scan and an editor "
+                    "left open all do this. Rotation resumes on the next write "
+                    "after the holder lets go: no restart, no re-arm, and "
+                    "restarting the desk does NOT clear it, because the holder "
+                    "is the other process.",
                 ]
                 + notes
             ),

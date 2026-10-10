@@ -22,10 +22,22 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-# PowerShell 7.4 turns native-command stderr into a terminating error under
-# ErrorActionPreference Stop. `schtasks /query` on a task that does not exist
-# writes to stderr, and that case is a FINDING here, not an error, so the
-# behaviour is switched off explicitly rather than hoped about.
+# THE CLAIM THAT USED TO SIT HERE WAS FALSE, and straightedge#274 is what makes
+# that worth writing down rather than quietly deleting. It said the behaviour
+# was "switched off explicitly rather than hoped about". It is not:
+# `$PSNativeCommandUseErrorActionPreference` exists only on PowerShell 7.3 and
+# later, the box has 5.1 and no `pwsh`, so on the only shell that runs this the
+# guard is INERT. In Deploy-Desk.ps1 the failure that same inert guard was
+# written to stop is the one that aborted a live deploy.
+#
+# NO BEHAVIOUR CHANGE HERE, and the reason is measured rather than assumed: the
+# stderr case the comment described is UNREACHABLE. `schtasks /query` writes to
+# stderr only for a task that does not exist, and the loop below has already
+# `continue`d on `Get-ScheduledTask` returning $null before it ever calls
+# schtasks. The one invocation that does run is against a task that exists, it
+# writes no stderr, and its exit code is checked. The assignment is kept because
+# on 7.3+ it is real, and it is now labelled as what it is rather than as a
+# mitigation this script depends on.
 if (Test-Path Variable:PSNativeCommandUseErrorActionPreference) {
     $PSNativeCommandUseErrorActionPreference = $false
 }

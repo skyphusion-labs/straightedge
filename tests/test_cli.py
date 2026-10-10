@@ -508,7 +508,7 @@ def test_run_synthetic(tmp_path, monkeypatch) -> None:
 
 def test_backtest_csv_and_range(tmp_path) -> None:
     csv_path = tmp_path / "x.csv"
-    csv_path.write_text("time,open,high,low,close\n1000,1.1,1.11,1.09,1.105\n")
+    csv_path.write_text("time,open,high,low,close\n1000,1.1,1.11,1.09,1.105\n", encoding="utf-8")
     rc = main(
         [
             "backtest",

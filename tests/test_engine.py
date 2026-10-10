@@ -155,7 +155,7 @@ def test_engine_respects_halt_file(tmp_path: Path) -> None:
     broker.seed_bars("EURUSD", bars)
     engine = Engine(cfg, broker, halt_dir=tmp_path)
     engine.start()
-    (tmp_path / "HALT").write_text("x")
+    (tmp_path / "HALT").write_text("x", encoding="utf-8")
     engine.step_all()
     assert engine.halted
     engine.stop()
