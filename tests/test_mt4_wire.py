@@ -27,8 +27,6 @@ from __future__ import annotations
 import inspect
 import re
 import sys
-import threading
-import time
 from pathlib import Path
 
 import pytest
@@ -57,6 +55,7 @@ from mt4_transcripts import (
     t_select,
     t_symbol,
 )
+from straightedge.broker import mt4_live
 from straightedge.broker.mt4_live import (
     BAR_FIELDS,
     ORD_FIELDS,
@@ -86,77 +85,6 @@ TIMEOUT = 3.0
 
 def wired(tmp_path: Path, transcripts: dict[str, Transcript], **kw: object) -> TranscriptExpert:
     return TranscriptExpert(tmp_path, transcripts, **kw)  # type: ignore[arg-type]
-
-
-class RenameClaimer:
-    """Claim the shared name the way the real Expert does, deterministically.
-
-    WHY THIS EXISTS RATHER THAN `wired(..., answer_limit=0)`.
-    `TranscriptExpert` models the claim as read-then-`unlink` and deliberately
-    TOLERATES an `unlink` that is refused, because #242 measured
-    `ERROR_ACCESS_DENIED` on exactly that operation on the live Windows box. When
-    the refusal happens the request stays on the shared name, so the bridge's own
-    withdrawal succeeds and reports `withdrawn` -- which is CORRECT, because
-    nothing had claimed it. The test then fails on the withdrawal assertion
-    instead of on the precondition it actually lost, which is why
-    `test_a_request_the_expert_already_claimed_is_reported_as_claimed` failed on
-    the windows leg and never on POSIX.
-
-    The real Expert claims with `FileMove(REQ_NAME, FILE_COMMON, gClaimPath, ...)`
-    (`mt4/Experts/Mt4RiskBot.mq4:313`) BEFORE it reads the body, and `_withdraw`
-    (`src/straightedge/broker/mt4_live.py:555-574`) is written against exactly
-    that: the file being GONE is the claim. So this claims by rename, retries a
-    refusal within a bounded grace, and records whether it ever got the claim.
-
-    `claimed` is the precondition, asserted separately from the behaviour under
-    test, so a lost precondition says so instead of masquerading as a wrong
-    withdrawal.
-    """
-
-    def __init__(self, directory: Path, grace_sec: float = 10.0) -> None:
-        self.directory = directory
-        self.grace_sec = grace_sec
-        self.claimed = False
-        self.refusals = 0
-        self.detail = ""
-        self._stop = threading.Event()
-        self._thread: threading.Thread | None = None
-
-    def __enter__(self) -> RenameClaimer:
-        self.directory.mkdir(parents=True, exist_ok=True)
-        self._thread = threading.Thread(target=self._loop, daemon=True)
-        self._thread.start()
-        return self
-
-    def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
-        self._stop.set()
-        if self._thread is not None:
-            self._thread.join(timeout=5.0)
-
-    def _loop(self) -> None:
-        req = self.directory / REQ_NAME
-        claim = self.directory / (REQ_NAME + ".claim")
-        deadline = time.monotonic() + self.grace_sec
-        while not self._stop.is_set() and time.monotonic() < deadline:
-            try:
-                req.replace(claim)
-            except FileNotFoundError:
-                # Not written yet, or already claimed by this loop.
-                time.sleep(0.002)
-                continue
-            except PermissionError:
-                # NTFS refuses while the other side holds the handle. The real
-                # Expert retries its claim for the same reason
-                # (`Mt4RiskBot.mq4:324-331`).
-                self.refusals += 1
-                time.sleep(0.005)
-                continue
-            self.claimed = True
-            return
-        self.detail = (
-            "never claimed %s within %.1fs (%d refusals)"
-            % (REQ_NAME, self.grace_sec, self.refusals)
-        )
 
 
 def broker(tmp_path: Path) -> Mt4Broker:
@@ -835,7 +763,7 @@ class TestReplyMatching:
         assert caught.value.op == "market"
 
     def test_a_request_the_expert_already_claimed_is_reported_as_claimed(
-        self, tmp_path: Path
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """The unsafe outcome must never render as the safe one.
 
@@ -843,15 +771,46 @@ class TestReplyMatching:
         bridge gives up the file can be gone because the Expert HAS it. An unlink
         that finds nothing there is not a withdrawal, and calling it one would
         turn the ambiguous-money case into a clean bill of health.
+
+        NOT TIMING-DEPENDENT, and that is the point of the shape (#258, #262).
+        Two earlier versions of this test bet on the SCHEDULER. The first used
+        the stand-in Expert in another thread; the second used a dedicated
+        claimer thread and at least SAID when its setup was lost, but it still
+        bet that the claimer won a rename against a 0.4s budget, and losing that
+        bet on `windows-latest` is the whole of the observed
+        `assert 'withdrawn' == 'claimed'`.
+
+        The subject was never the scheduler. It is that `_withdraw` reports
+        `claimed` when the shared name is GONE, and that is decided at one seam
+        (`mt4_live.py:555-574`) by one fact: whether `unlink` raises
+        `FileNotFoundError`. So the claim is performed synchronously inside the
+        wait, at the one moment it can matter, with the clock held still: the
+        budget expires on the first poll, so exactly one pass happens and no
+        wall-clock time is relied on at all.
         """
-        with RenameClaimer(tmp_path) as claimer:
-            bridge = FileBridge(tmp_path, timeout_sec=0.4)
-            with pytest.raises(BridgeTimeout) as caught:
-                bridge.call("market", {"symbol": "EURUSD", "side": "buy", "volume": 0.17})
-        # The PRECONDITION, asserted before the behaviour. A claim that never
-        # happened is a lost setup, not a wrong withdrawal, and conflating the
-        # two is what made this read as a flake rather than as a broken fixture.
-        assert claimer.claimed, "precondition lost: " + claimer.detail
+        req = tmp_path / REQ_NAME
+        claim = tmp_path / (REQ_NAME + ".claim")
+        clock = [0.0]
+        monkeypatch.setattr(mt4_live.time, "monotonic", lambda: clock[0])
+
+        def claim_then_expire(_seconds: float) -> None:
+            # The Expert's claim, by rename, exactly as `FileMove` does it
+            # (`Mt4RiskBot.mq4:313`), and then the budget runs out. One pass.
+            if req.exists():
+                req.replace(claim)
+            clock[0] += 10.0
+
+        monkeypatch.setattr(mt4_live.time, "sleep", claim_then_expire)
+
+        bridge = FileBridge(tmp_path, timeout_sec=0.4)
+        with pytest.raises(BridgeTimeout) as caught:
+            bridge.call("market", {"symbol": "EURUSD", "side": "buy", "volume": 0.17})
+
+        # The precondition, asserted rather than assumed. If the request was
+        # never claimed this says so, instead of the withdrawal assertion below
+        # failing and reading as wrong behaviour.
+        assert claim.exists(), "the claim never happened, so the precondition was lost"
+        assert not req.exists(), "the shared name still holds the request"
         assert caught.value.withdrawal == "claimed"
         assert caught.value.withdrawn is False
         assert caught.value.may_still_execute is True
