@@ -521,7 +521,7 @@ def test_a_deferred_rotation_keeps_the_worst_case_row_in_bound(
         _turn,
     )
 
-    engine = _engine(tmp_path, _claude_reply(_everything_large()))
+    engine = _engine(tmp_path, _claude_reply(_everything_large()), provider="claude")
     live = Path(engine.journal.path)
     assert live.exists(), (
         "no live journal, so `_rotate_if_needed` returns early and the "
