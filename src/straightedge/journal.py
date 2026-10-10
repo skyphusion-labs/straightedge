@@ -174,6 +174,47 @@ class Journal:
         _chmod600(self.path)
         return False
 
+    def live_bytes(self) -> int:
+        """Size of the LIVE file, and 0 when there is nothing to measure.
+
+        Published on the heartbeat, because it is the ONE reading that says
+        rotation is not happening RIGHT NOW (straightedge#288).
+        `rotate_deferrals` cannot: it is a monotonic per-process count with no
+        clock and no clearing, so a backup agent that held the file once an
+        hour ago leaves it at 1 forever and a holder still attached leaves it
+        at 1 too. Any threshold on that count fires on the transient case and
+        never clears.
+
+        A missing file reads 0 rather than raising. The desk writes this field
+        on every heartbeat, and a heartbeat that fails because the journal has
+        not been created yet would be a monitoring surface taking down the
+        thing it monitors.
+        """
+        try:
+            return self.path.stat().st_size
+        except OSError:
+            return 0
+
+    def rotate_bytes(self) -> int:
+        """The bound the live file is rotated AT, for publishing beside it.
+
+        A METHOD rather than an exported constant, for two reasons. The tests
+        drive rotation by monkeypatching the module global, and a value read
+        at call time follows that while a second name bound at import would
+        not. And the heartbeat publishes the desk's OWN threshold next to the
+        reading judged against it, exactly as `stale_after_s` is published next
+        to the timestamp, so the watcher never has to import this module or
+        hold a copy of the figure: "the desk's number is the one used here"
+        (`watchdog.decide`).
+
+        The invariant that makes the pair an instrument: in healthy operation
+        the live file NEVER exceeds this bound, because `_rotate_if_needed`
+        rotates before the write that would cross it. So `live_bytes` over
+        this figure means a rotation was attempted and did not happen, with no
+        duration to wait out and no count to pick a threshold on.
+        """
+        return _ROTATE_BYTES
+
     def tail(self, n: int = 20) -> list[dict[str, Any]]:
         """Last n live records, redacted AGAIN on the way out.
 
@@ -357,6 +398,43 @@ class InstanceLockError(RuntimeError):
 #: row stored a rendering of other rows and the payload compounded daily; an
 #: ordinary `advice_turn` still measures 196 bytes against this ceiling.
 RECORD_ROW_BOUND = 580
+
+#: THE MEASURED MAXIMAL ROW, and the FLAT MARGIN over it, as figures something
+#: READS (straightedge#306).
+#:
+#: The derivation above was corrected to "538 measured plus 42 flat" and
+#: neither number was ever read by anything. `RECORD_ROW_BOUND` is pinned
+#: against `docs/CONTRACT.md` by a test, because #226 measured it being
+#: raisable to 1024 with the whole suite green while the contract still said
+#: 512; its own derivation then grew two more figures with exactly that
+#: property. The maximal row could have grown to 579 with every test green
+#: while this comment, `docs/CONTRACT.md` and a changelog fragment all went on
+#: saying the margin was 42, and "re-deriving means measuring the maximal row
+#: again" was an instruction to a reader rather than a gate.
+#:
+#: `RECORD_ROW_BOUND` IS STILL ITS OWN LITERAL ON PURPOSE. Writing it as
+#: `MAXIMAL_ROW_BYTES + RECORD_ROW_MARGIN` would make the sum true by
+#: construction, so the identity could never go red, and a sum that cannot go
+#: red is the decoration this file keeps warning about. Three literals and a
+#: test that measures the row and checks they agree can go red; a derived sum
+#: can only be arithmetically right about a stale measurement.
+MAXIMAL_ROW_BYTES = 538
+RECORD_ROW_MARGIN = 42
+
+#: What `rotate_deferred` costs every row it marks, measured.
+#:
+#: A conditional row field costs the bytes of its KEY, so this figure is
+#: `len(json.dumps({"rotate_deferred": 1}))`, the separators that join it to
+#: the row included, and the test asserts the measured delta against BOTH that
+#: expression and this constant. Pinning it against the expression is what
+#: makes a rename or a widened value red with the new cost named, rather than
+#: silently drawing more of the margin.
+#:
+#: It is a constant rather than a sentence because a 15 character non-numeric
+#: marker drew 22 bytes while matching no entry on the invalidation list above,
+#: and the list went on describing the whole allowance (straightedge#287).
+#: A draw nothing reads is a draw nobody subtracts.
+ROTATE_DEFERRED_ROW_BYTES = 22
 
 #: How much of a MODEL-CHOSEN string a row may carry.
 #:

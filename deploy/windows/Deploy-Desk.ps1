@@ -32,32 +32,45 @@ param(
     [string[]] $Tasks = @("straightedge-desk", "straightedge-watch"),
     [switch] $BookIsFlat,
     [switch] $Apply,
-    [string] $Rollback
+    [string] $Rollback,
+    # The operator's assertion that a previous deploy which did not finish has
+    # been dealt with. straightedge#274: the script now leaves a marker on disk
+    # for the whole window in which it is changing the box, and refuses to start
+    # another -Apply run over one. It cannot know that the half-landed state was
+    # resolved; only a human who looked can say so.
+    [switch] $PreviousDeployResolved
 )
 
 $ErrorActionPreference = "Stop"
-if (Test-Path Variable:PSNativeCommandUseErrorActionPreference) {
-    $PSNativeCommandUseErrorActionPreference = $false
+
+# Say, Die, Invoke-Git, Write-Utf8NoBom, Assert-PowerShellSupported and the
+# in-progress marker helpers live in DeskDeployLib.ps1, dot-sourced here.
+#
+# straightedge#274 is why they are not in this file. The function that aborted a
+# live deploy mid-window was unreachable by any test, because the only way to
+# reach it was to run a deploy. The guard that was supposed to prevent that
+# abort, `$PSNativeCommandUseErrorActionPreference = $false`, exists only on
+# PowerShell 7.3 and later and the box has 5.1, so it was present in the file
+# and dead on the only shell the box has. It is GONE rather than gated: the fix
+# is inside Invoke-Git, it needs no version test, and it is now watched going
+# red in CI under Windows PowerShell 5.1, which is the shell the box runs.
+$lib = Join-Path $PSScriptRoot "DeskDeployLib.ps1"
+if (-not (Test-Path $lib)) {
+    Write-Host "::error::no library at $lib; this script cannot run without it"
+    throw "no library at $lib"
 }
+. $lib
+
+Assert-PowerShellSupported -Version $PSVersionTable.PSVersion
+Say "PowerShell edition : $($PSVersionTable.PSEdition)"
 
 $git = "C:\Program Files\Git\cmd\git.exe"
-function Say($m) { Write-Host "[deploy] $m" }
-function Die($m) { Write-Host "::error::$m"; throw $m }
 
-function Invoke-Git {
+# The library's Invoke-Git takes the git path and the repo explicitly, so that a
+# test can drive it. This closes over the two this script uses.
+function Invoke-RepoGit {
     param([string[]] $GitArgs)
-    $out = & $git -C $Repo @GitArgs 2>&1
-    if ($LASTEXITCODE -ne 0) { Die "git $($GitArgs -join ' ') exited $LASTEXITCODE : $out" }
-    return ($out | Out-String).Trim()
-}
-
-function Write-Utf8NoBom {
-    param([string] $Path, [string] $Text)
-    # NEVER Set-Content -Encoding UTF8. On Windows PowerShell 5.1 that writes a
-    # BOM, and a BOM in config.toml stopped the desk's loader dead on
-    # 2026-10-08; see docs/DEPLOY.md. The desk now tolerates one and complains,
-    # but nothing written BY this script should ever need that tolerance.
-    [System.IO.File]::WriteAllText($Path, $Text, (New-Object System.Text.UTF8Encoding $false))
+    return (Invoke-Git -Git $git -Repo $Repo -GitArgs $GitArgs)
 }
 
 function Assert-TasksState {
@@ -101,6 +114,38 @@ if ($stateFull.StartsWith($repoFull, [System.StringComparison]::OrdinalIgnoreCas
 }
 Say "state dir is a sibling of the checkout, not a child"
 
+# ----------------------------- 0b. a previous deploy that never finished
+#
+# straightedge#274. The marker is written for the whole window in which this
+# script is changing the box, and removed once step 8 has PROVED supervision is
+# back on. Finding one means a previous run died inside that window, so the box
+# may be running a tree nobody chose, with supervision off.
+$markerPath = Get-DeployMarkerPath -RecordDir $RecordDir
+$prior = Read-DeployMarker -Path $markerPath
+if ($null -ne $prior) {
+    Write-Host "::warning::a previous deploy recorded itself IN PROGRESS and never cleared the record:"
+    Say "  marker        : $markerPath"
+    Say "  written at    : $($prior.at)"
+    Say "  phase reached : $($prior.phase)"
+    Say "  shell / pid   : PowerShell $($prior.ps_version) / pid $($prior.pid)"
+    Say "  before commit : $($prior.before_commit)"
+    Say "  tree moved    : $($prior.tree_moved)"
+    Say "  validated     : $($prior.validated)"
+    Say "  rollback rec  : $($prior.rollback_record)"
+    # A ROLLBACK IS LET THROUGH ON PURPOSE. Refusing the recovery tool over the
+    # very state it recovers from is a lockout, and the standing guardrail here
+    # is that a filter which can ban its own ingress path does not belong in
+    # that path. A dry run is let through too, because it changes nothing and
+    # refusing it would remove the operator's way to inspect.
+    if ($Apply -and -not $Rollback -and -not $PreviousDeployResolved) {
+        Die "REFUSING: the deploy above did not finish. Resolve it first (roll back with -Rollback $($prior.rollback_record), or read the tree, doctor and both tasks by hand), then re-run with -PreviousDeployResolved. See docs/DEPLOY.md."
+    }
+    if ($Apply) {
+        $why = if ($Rollback) { "-Rollback was given" } else { "-PreviousDeployResolved was given" }
+        Say "proceeding over the marker because $why"
+    }
+}
+
 if (-not $Apply) { Say "DRY RUN. Nothing will be changed. Re-run with -Apply." }
 
 # ---------------------------------------------------------------- rollback mode
@@ -116,8 +161,12 @@ if ($Rollback) {
 
 # ------------------------------------------- 1. record the rollback point FIRST
 
-$before = Invoke-Git @("rev-parse", "HEAD")
-$status = Invoke-Git @("status", "--porcelain")
+$before = Invoke-RepoGit @("rev-parse", "HEAD")
+# A rollback record whose commit is not a commit is not a rollback record.
+# Invoke-Git merges stdout and stderr, so a git that decided to narrate would
+# otherwise be written in here as the previous state (straightedge#274).
+if ($before -notmatch '^[0-9a-f]{40}$') { Die "rev-parse HEAD returned something that is not a 40-character oid, so the rollback point cannot be trusted: $before" }
+$status = Invoke-RepoGit @("status", "--porcelain")
 $expert = Join-Path $Repo "mt4\Experts\Mt4RiskBot.mq4"
 $expertHash = if (Test-Path $expert) { (Get-FileHash -Algorithm SHA256 $expert).Hash.ToLower() } else { "" }
 
@@ -180,6 +229,56 @@ if (-not $BookIsFlat) {
     exit 0
 }
 
+# ------------------------------------------------ THE ABORT WINDOW OPENS HERE
+#
+# straightedge#274. Every step below changes the box: supervision goes off, the
+# desk is killed, the tree moves. A live deploy aborted inside this window on a
+# `git fetch` that had SUCCEEDED and left a real-money box with no desk and no
+# supervision, and the only thing that noticed was a person reading the
+# transcript. Two mechanisms close that, because they fail differently:
+#
+#   * the `finally` below runs whenever this script THROWS. It announces the
+#     half-landed state and re-enables supervision when that is safe.
+#   * the marker on disk survives the script being KILLED, the window being
+#     closed, or the box rebooting, where no `finally` runs at all. The next
+#     -Apply run refuses to step over it.
+#
+# THE `finally` DOES NOT RE-ENABLE UNCONDITIONALLY, and that is a decision
+# rather than an omission. Re-enabling is right when the tree never moved (the
+# #274 case exactly: the box goes back to what it already was) and when the tree
+# moved AND the loader plus doctor accepted it. It is WRONG when the tree moved
+# and validation refused it, because supervision would then crash-loop a desk on
+# a tree this script has already rejected. In that one case the box is left down
+# deliberately, loudly, with the rollback command printed, and a human decides.
+
+$treeMoved = $false
+$validated = $false
+$supervisionDisabled = $false
+$completed = $false
+$phase = "before any change"
+$after = "(not reached)"
+
+function Set-Phase {
+    param([string] $Name)
+    $script:phase = $Name
+    if (-not $Apply) { return }
+    $marker = [ordered]@{
+        at = (Get-Date).ToUniversalTime().ToString("o")
+        phase = $Name
+        pid = $PID
+        ps_version = $PSVersionTable.PSVersion.ToString()
+        repo = $Repo
+        requested_ref = $Ref
+        before_commit = $before
+        tree_moved = [bool]$script:treeMoved
+        validated = [bool]$script:validated
+        rollback_record = $recordPath
+    }
+    Write-DeployMarker -Path $markerPath -Marker $marker
+}
+
+try {
+
 # --------------------------------------------- 3. DISABLE THE TRIGGERS, not just
 #                                                  the process
 #
@@ -205,8 +304,12 @@ if ($Apply) {
         else { Say "$name not present, nothing to disable" }
     }
     Assert-TasksState -WantEnabled $false
+    $supervisionDisabled = $true
+    Set-Phase "supervision-disabled"
+    Say "in-progress marker written: $markerPath"
 } else {
     Say "would disable: $($Tasks -join ', ')"
+    Say "would write an in-progress marker at $markerPath and clear it at step 8"
 }
 
 # ------------------------------------------------------------ 4. stop the desk
@@ -225,6 +328,7 @@ if ($Apply) {
                Where-Object { $_.CommandLine -like "*straightedge*run*" })
     if ($still.Count -gt 0) { Die "a desk process is still running after a stop; refusing to change the tree underneath it" }
     Say "no desk process remains"
+    Set-Phase "desk-stopped"
 } else {
     Say "would stop any python process whose command line matches straightedge run"
 }
@@ -232,18 +336,25 @@ if ($Apply) {
 # ------------------------------------------------------------- 5. move the tree
 
 if ($Apply) {
-    Invoke-Git @("fetch", "--tags", "--prune", "origin") | Out-Null
-    $target = Invoke-Git @("rev-parse", "--verify", "$Ref^{commit}")
+    # THE #274 LINE. `git fetch` writes "From https://github.com/..." to stderr
+    # on every fetch that advances a ref, and on Windows PowerShell 5.1 that was
+    # a terminating NativeCommandError here, right after the desk was killed and
+    # before supervision came back.
+    Invoke-RepoGit @("fetch", "--tags", "--prune", "origin") | Out-Null
+    $target = Invoke-RepoGit @("rev-parse", "--verify", "$Ref^{commit}")
+    if ($target -notmatch '^[0-9a-f]{40}$') { Die "rev-parse --verify of $Ref returned something that is not a 40-character oid: $target" }
     Say "target commit     : $target"
     # DETACHED at an exact commit on purpose. A branch name is not a statement
     # about what is running, because the branch moves; that is how twelve days
     # of staleness went unnoticed. `git clean` is NEVER run here: it is the one
     # command that could remove an untracked config.toml, and nothing in this
     # procedure needs it.
-    Invoke-Git @("checkout", "--detach", $target) | Out-Null
-    $after = Invoke-Git @("rev-parse", "HEAD")
+    Invoke-RepoGit @("checkout", "--detach", $target) | Out-Null
+    $after = Invoke-RepoGit @("rev-parse", "HEAD")
     if ($after -ne $target) { Die "checkout did not land on $target (HEAD is $after)" }
     Say "HEAD is now        : $after"
+    $treeMoved = $true
+    Set-Phase "tree-moved"
 } else {
     Say "would fetch and checkout --detach $Ref (git clean is never run)"
     $after = "(dry run)"
@@ -264,6 +375,8 @@ if ($Apply) {
     & $PythonExe -m straightedge --config $ConfigPath doctor
     if ($LASTEXITCODE -ne 0) { Die "doctor exited non-zero; it is the documented pre-run gate and it has refused this tree" }
     Say "doctor exited 0"
+    $validated = $true
+    Set-Phase "validated"
 } else {
     Say "would reinstall, then run assert-config-loads.py and doctor"
 }
@@ -281,6 +394,7 @@ if ($Apply) {
     $stampPath = Join-Path $StateDir "journal.deployed.json"
     Write-Utf8NoBom -Path $stampPath -Text ($stamp | ConvertTo-Json)
     Say "stamped: $stampPath"
+    Set-Phase "stamped"
 } else {
     Say "would write journal.deployed.json with the ref and the full oid"
 }
@@ -295,6 +409,54 @@ if ($Apply) {
     Assert-TasksState -WantEnabled $true
 } else {
     Say "would re-enable and then PROVE enabled: $($Tasks -join ', ')"
+}
+
+# ----------------------------------------------- THE ABORT WINDOW CLOSES HERE
+
+$phase = "complete"
+$completed = $true
+if ($Apply) {
+    Remove-DeployMarker -Path $markerPath
+    Say "in-progress marker cleared: the box is supervised again"
+}
+
+} finally {
+    if ($Apply -and -not $completed) {
+        # SELF-ANNOUNCE. Before straightedge#274 a half-landed deploy produced
+        # nothing but a stack trace in a transcript somebody had to read.
+        Write-Host "::error::DEPLOY DID NOT COMPLETE, and the box is in a half-landed state."
+        $treeLine = if ($treeMoved) { "YES, HEAD is now $after" } else { "no, HEAD is still $before" }
+        $validLine = if ($validated) { "yes" } else { "NO" }
+        Say "phase reached      : $phase"
+        Say "tree moved         : $treeLine"
+        Say "config validated   : $validLine"
+        Say "rollback record    : $recordPath"
+        Say "in-progress marker : $markerPath (LEFT IN PLACE; the next -Apply run refuses to step over it)"
+
+        if ($supervisionDisabled) {
+            $resumeIsSafe = Test-ResumeSupervisionIsSafe -TreeMoved $treeMoved -Validated $validated
+            if ($resumeIsSafe) {
+                # A throw in here would REPLACE the exception that brought us
+                # here, so the re-enable gets its own try and reports instead.
+                try {
+                    foreach ($name in $Tasks) {
+                        $t = Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue
+                        if ($null -ne $t) { Enable-ScheduledTask -TaskName $name | Out-Null; Say "re-enabled $name on the way out" }
+                    }
+                    Assert-TasksState -WantEnabled $true
+                    Say "supervision is BACK ON. The tree is one a desk may run on, so this is the state the box was already in."
+                } catch {
+                    Write-Host "::error::THE RE-ENABLE ON THE WAY OUT ALSO FAILED: $($_.Exception.Message)"
+                    Write-Host "::error::SUPERVISION IS OFF AND THE DESK IS DOWN. Re-enable by hand: Enable-ScheduledTask -TaskName <name> for each of $($Tasks -join ', ')"
+                }
+            } else {
+                Write-Host "::error::SUPERVISION IS LEFT DISABLED AND THE DESK IS DOWN, DELIBERATELY. The tree moved and the loader or doctor refused it, so re-enabling supervision would crash-loop a desk on a tree this script has already rejected. A human decides this one."
+            }
+        } else {
+            Say "supervision was never disabled, so there is nothing to restore"
+        }
+        Write-Host "::error::to roll back: Deploy-Desk.ps1 -Rollback $recordPath -BookIsFlat -Apply"
+    }
 }
 
 # -------------------------------------------------------------- 9. verify

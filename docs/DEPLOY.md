@@ -134,6 +134,60 @@ could still resolve it. Everything else at this gate is a human's call: the
 script can report the ledger, it cannot decide that stopping a live autonomous
 desk right now is acceptable.
 
+### The abort window, and what now happens when a deploy dies inside it
+
+Steps 3 through 8 are the window in which the box is changed: supervision off,
+desk killed, tree moved. **On 2026-10-10 a real deploy aborted inside it and
+left the box with no desk and no supervision** (`#274`). The cause was
+`Invoke-Git` treating stderr as failure: `git fetch` writes
+`From https://github.com/...` to stderr on every fetch that advances a ref, and
+on Windows PowerShell 5.1 native stderr under `$ErrorActionPreference = "Stop"`
+is a terminating `NativeCommandError`. So a fetch that SUCCEEDED threw. The
+mitigation in the file was `$PSNativeCommandUseErrorActionPreference = $false`,
+which exists only on PowerShell 7.3 and later; the box has 5.1 and no `pwsh`, so
+the control was present in the script and dead on the only shell it runs.
+
+**The failure distribution was the worst available one.** A fetch with nothing
+to report writes nothing, so the script worked on every rehearsal against an
+already-current tree and failed on every deploy that moved the tree.
+
+Three things changed, and all three are implemented:
+
+1. **The exit code is the authority on whether git failed; stderr is not.**
+   `Invoke-Git` lives in `deploy/windows/DeskDeployLib.ps1`, sets
+   `$ErrorActionPreference` to `Continue` for its own scope only (the variable
+   is dynamically scoped, so `Stop` still covers every other line), and judges
+   `$LASTEXITCODE`. It also clears `$LASTEXITCODE` first, so a git that never
+   ran cannot inherit the previous command's 0 and read as success. There is no
+   version test anywhere in the fix, which is why there is nothing left that can
+   be inert.
+2. **A half-landed deploy announces itself.** A `finally` prints the phase
+   reached, whether the tree moved, whether the config validated, the rollback
+   record and the marker path. It re-enables supervision when that is safe, and
+   **safe is a decision rather than a reflex**: safe when the tree never moved
+   (the `#274` case exactly, where the box goes back to what it already was) or
+   when the tree moved AND the loader plus `doctor` accepted it. When the tree
+   moved and validation refused it, **the box is left down deliberately**,
+   because re-enabling would crash-loop a desk on a tree the script has already
+   rejected, and that is a human's call. `Test-ResumeSupervisionIsSafe` is that
+   judgement as a pure function, and all four combinations are tested.
+3. **An in-progress marker survives what a `finally` cannot.** No `finally`
+   runs when the process is killed, the window is closed or the box reboots, so
+   `C:\bot-state\deploys\deploy-in-progress.json` is written for the whole
+   window and removed only once step 8 has PROVED supervision is back on. The
+   next `-Apply` run **refuses to step over one** and names the way forward.
+   `-PreviousDeployResolved` is the operator's assertion that it was dealt
+   with; `-Rollback` is let through without it, because refusing the recovery
+   tool over the state it recovers from is a lockout.
+
+**The shell was also the reason CI never saw this.** Every CI step that ran
+`Deploy-Desk.ps1` used `shell: pwsh`, and PowerShell 7 does not turn native
+stderr into a terminating error at all, so the gate could not produce the red.
+`deploy/windows/Test-DeployScripts.ps1` now runs under **both**
+`shell: powershell` (Windows PowerShell 5.1, what the box has) and
+`shell: pwsh`, and the 5.1 leg carries a control that reproduces the pre-fix
+abort before asserting the fix.
+
 **3. DISABLE THE TRIGGERS. Not just the process.** This is the step that is
 easy to get wrong, and it only exists because of `#133`.
 
@@ -169,6 +223,8 @@ the full OID and the time, written without a BOM.
 
 **8. Re-enable supervision, and PROVE it is enabled.** Not "enable and assume":
 the script reads each task back and fails if `Settings.Enabled` is not true.
+The in-progress marker is cleared here and nowhere earlier, so the marker's
+absence means supervision was proved on rather than merely attempted.
 **A deploy that leaves supervision disabled returns the box to exactly the
 state `#133` existed to fix, and it does so silently.** That is the worst
 outcome this procedure could produce, so it is the one thing it asserts twice.
@@ -311,13 +367,29 @@ part of the install.
 
 ## What is NOT verified
 
-**`Deploy-Desk.ps1` has never performed a real deploy.** CI exercises its dry
-run against a real git checkout on `windows-latest`, proves the dry run changes
-nothing, and watches it refuse a state directory inside the checkout. None of
-that exercises the task disable and enable, the checkout, the reinstall or the
-stamp write, because those need a desk to stop. **The first real run should be
-watched by a person, on the demo account, in a market-closed window**, and the
-rollback record from step 1 is what makes that acceptable.
+**`Deploy-Desk.ps1` has performed exactly one real deploy, on 2026-10-10, and
+it ABORTED mid-window** (`#274`; the deploy was finished by hand afterwards and
+verified). That is the correction to what this section said before, which was
+that the script had never run for real.
+
+What CI exercises on `windows-latest`, through
+`deploy/windows/Test-DeployScripts.ps1` under both Windows PowerShell 5.1 and
+PowerShell 7: the `Invoke-Git` stderr-does-not-abort and failure-still-aborts
+pair, with the pre-fix function driven red first on 5.1; the version
+requirement from both sides; the abort-window resume judgement in all four
+combinations; the marker round trip and its absence of a BOM; the dry run
+stopping at the judgement gate; the full dry run changing nothing; the refusal
+of a state directory inside the checkout; and the marker refusal with and
+without `-PreviousDeployResolved`, run with `-Apply` genuinely set and
+`-BookIsFlat` genuinely absent so a refusal that stopped firing fails the case
+instead of changing the runner.
+
+**What that still does not reach:** the task disable and enable, the checkout,
+the reinstall, the stamp write, and the `finally`'s announcement TEXT, all of
+which need a desk to stop. The `finally`'s DECISION is tested; its wording is
+not. **The next real run should be watched by a person, on the demo account, in
+a market-closed window**, and the rollback record from step 1 is what makes
+that acceptable.
 
 The BOM trap, the sibling-directory requirement and the trigger-disable step are
 each written down because somebody hit them, not because they were predicted.
