@@ -8,7 +8,7 @@ from dataclasses import dataclass
 
 from straightedge.currencies import normalize_model_symbol
 from straightedge.inflight import new_key
-from straightedge.journal import redact_text
+from straightedge.journal import clip_for_record, redact_text
 from straightedge.llm import Advice, Advisor
 from straightedge.models import OrderResult, Signal, SignalKind
 from straightedge.telegram import HELP, NOT_ADVICE, TgCommand
@@ -219,11 +219,40 @@ class Desk:
             "reason": reason,
         }
         if signal is not None:
-            fields["symbol"] = signal.symbol
+            fields["symbol"] = clip_for_record(signal.symbol)
             fields["kind"] = signal.kind.value
             fields["rr"] = signal.rr
         elif symbol:
-            fields["symbol"] = symbol
+            # CLIPPED HERE, not at each caller, because this is the single
+            # writer of every MODEL-CHOSEN `reject` symbol, and such a symbol
+            # can reach it from any advice path. Six other sites write a
+            # `reject` row and none of them can: `desk.py` twice through
+            # `_journal_only` with literal constants only, and `engine.py` four
+            # times from `cfg.symbols` by way of `step_all` and `step_symbol`,
+            # so operator-scoped. The earlier wording here said "every `reject`
+            # row", which is false, and a comment claiming a uniqueness the
+            # code does not have hands the next reader this PR's own mistake
+            # with somebody else's authority behind it: a seventh writer gets
+            # added, "single writer" is believed, and nobody checks.
+            # `_stage_close` passed `advice.symbol`
+            # raw from three sites and a close is NEVER gated by
+            # `advice_allows`, so a 5600 character symbol measured a 5751 byte
+            # reject row while the `advice_turn` row beside it was 299 and
+            # reported nothing wrong. `ADVICE_PROPERTIES["symbol"]` carries no
+            # `maxLength`, so the schema gate sees no violation and nothing
+            # forces a hold: this is the default shape, not a `grok`-only one.
+            #
+            # Clipping three call sites would have left the fourth. Deriving
+            # the fields from the schema did not reach this either, because the
+            # gap was PATH coverage rather than field coverage, and no
+            # derivation over fields can find a row a fixture never writes
+            # (straightedge#226, found in review).
+            #
+            # Operator-typed symbols are unaffected: every real instrument
+            # name, vendor suffix and all, is shorter than
+            # `RECORD_STRING_CHARS` and survives whole, which is asserted
+            # rather than assumed.
+            fields["symbol"] = clip_for_record(symbol)
         if ticket is not None:
             fields["ticket"] = ticket
         if command:
@@ -822,12 +851,22 @@ class Desk:
                 # `EURUSD`, which is an instrument the whitelist ALLOWS, so the
                 # record read as a bug in the gate rather than as a rejected
                 # reply (straightedge#197).
-                shown = normalize_model_symbol(advice.symbol)
+                # Bounded for the record for the same reason as the
+                # `advice_turn` row, and AFTER `normalize_model_symbol` so the
+                # #197 rule still decides what the string is before this
+                # decides how much of it the row keeps.
+                named = normalize_model_symbol(advice.symbol)
+                # `shown` is for the CHAT and `named` for the RECORD, because
+                # `_reject` now clips the row's symbol itself. Passing the
+                # already-clipped `shown` would clip it twice and produce a
+                # marker inside a marker, which reads as two different
+                # measurements of one string.
+                shown = clip_for_record(named)
                 self._reject(
                     "advice_symbol",
                     "symbol_not_allowed",
                     source="advice",
-                    symbol=shown,
+                    symbol=named,
                 )
                 lines.append(
                     f"not staging {advice.action} {shown}: symbol_not_allowed"
@@ -880,7 +919,10 @@ class Desk:
             provider=getattr(self.advisor.cfg, "provider", ""),
             session=session,
             action=advice.action,
-            symbol=advice.symbol,
+            # BOUNDED, because `symbol` is model-chosen on this path and the
+            # row is the durable record (straightedge#226). Unbounded here gave
+            # a 5838 byte row from a 5600 character symbol.
+            symbol=clip_for_record(advice.symbol) if advice.symbol else advice.symbol,
             sl=advice.sl,
             tp=advice.tp,
             limit=advice.limit,

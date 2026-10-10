@@ -46,6 +46,7 @@ from pathlib import Path
 from straightedge.broker.paper import PaperBroker
 from straightedge.config import BotConfig
 from straightedge.engine import Engine
+from straightedge.journal import RECORD_ROW_BOUND
 from straightedge.llm import Advisor
 from straightedge.synthetic import generate_bars
 from straightedge.telegram import TgCommand
@@ -223,7 +224,7 @@ def test_a_model_chosen_key_cannot_grow_the_row(tmp_path: Path) -> None:
     row = _turns(engine)[0]
     assert "KKKK" not in json.dumps(row), "a model-chosen key reached the journal"
     assert row["degraded"] == "unknown_field x2", row["degraded"]
-    assert len(json.dumps(row, sort_keys=True)) <= 512, (
+    assert len(json.dumps(row, sort_keys=True)) <= RECORD_ROW_BOUND, (
         "the row grew with the reply: " + str(len(json.dumps(row)))
     )
     engine.stop()
@@ -248,7 +249,7 @@ def test_a_model_chosen_value_cannot_grow_the_row(tmp_path: Path) -> None:
         "the model's action text reached the journal"
     )
     assert row["degraded"] == "action:not_in_enum", row["degraded"]
-    assert len(json.dumps(row, sort_keys=True)) <= 512
+    assert len(json.dumps(row, sort_keys=True)) <= RECORD_ROW_BOUND
     engine.stop()
 
 
@@ -295,7 +296,7 @@ def test_the_row_stays_bounded_and_carries_no_prose(tmp_path: Path) -> None:
     engine.handle_command(TgCommand("1", 1, "/ask take a view", 1))
     row = _turns(engine)[0]
     blob = json.dumps(row, sort_keys=True)
-    assert len(blob) <= 512, f"the turn row is carrying prose: {blob}"
+    assert len(blob) <= RECORD_ROW_BOUND, f"the turn row is carrying prose: {blob}"
     assert "a very long explanation" not in blob
     assert "\n" not in str(row["degraded"])
     engine.stop()
