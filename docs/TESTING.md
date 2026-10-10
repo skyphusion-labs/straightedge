@@ -133,6 +133,65 @@ you did not. #170 was recorded as a real gap only because someone widened the
 fixture space after the first control came back empty; stopping at the clean
 nothing was the near-miss, and it was one step away.
 
+
+## If every row of a swept parameter gives the same answer, the parameter is not reaching the code
+
+The section above is the case where nothing reds. This is the case where
+EVERYTHING reds, identically, and it is a reviewer's instrument rather than a
+test: the same failure reaches a probe written to settle a review, and that
+probe has no suite to protect it.
+
+**The uniformity IS the reading.** Measured while reviewing #182: a sweep
+hunting a false refusal returned 32 refusals out of 32, at every bar age and
+every staleness. The probe was wrong, not the code. `synthetic.generate_bars`
+steps 3600 by default and the probe strided `start_ts` by 900, which put
+`bars[-1]` eight days in the FUTURE, so every reading refused for a reason
+unrelated to the subject. Trusting it would have filed a 32-case regression
+against a correct safety check.
+
+An all-refuse result that does not MOVE with its inputs is a broken instrument,
+not a finding. So a probe wants two controls, not one: a case that must pass and
+a case that must fail. With both present, a uniform answer is visibly a broken
+instrument rather than a result, and the fixture's own premise is worth
+asserting out loud, because the premise is what was wrong here and nothing in
+the output said so.
+
+**The same family reaches the plumbing around a probe, not only its fixtures**,
+and it is worth naming because each instance looked like a clean negative:
+
+- A mutation runner piped its summary through `head -14`. A widely-red mutation
+  printed a long failure list, the summary scrolled past the cut, and 18
+  failures read as NO RESULT. Fixed by printing the summary FIRST, so a
+  truncated tail can never be mistaken for an empty one.
+- A harness displayed the enclosing function of each mutation by matching on
+  line CONTENT, so it confidently named the wrong function. Nothing was wrong
+  with the mutation; the label was. Dropped in favour of `git diff -U0`, which
+  cannot be wrong about what it changed.
+- A census grep excluded string-method `.replace()` calls with
+  `\.replace\(.[a-z]+., ` and thereby excluded `os.replace(tmp, self.path)`,
+  dropping a filesystem call site from a population published as complete
+  (straightedge#251). **A filter written to remove noise removed a member of
+  the population.** Print the denominator and enumerate the exclusions: 19
+  `.replace(` occurrences, eight `datetime.replace(tzinfo=...)`, five string
+  operations, **one a docstring QUOTE of code**, seven real call sites. A count
+  with its domain and its exclusions stated cannot hide a wrong filter; a bare
+  "six sites" can.
+
+- **A guard that PRINTS its verdict has not asserted it.** A pre-apply check
+  computed `ok=0`, and the next line was `echo "SAFE: $ok"` chained to the
+  apply with `&&`. **`echo` succeeds whatever it prints**, so the apply ran
+  against a guard that had just said unsafe. The same guard was also the wrong
+  instrument for its subject, being line-oriented over files that are one
+  paragraph per line, and the correctness of what it let through was only
+  established by re-measuring at word level afterwards. Two defects stacked:
+  the verdict was never tested, and the verdict was wrong. Chain the ACTION
+  behind the comparison, never behind a line that reports it, and remember that
+  `$?` after a pipe is the PIPE's status, so a guard that pipes needs
+  `${PIPESTATUS[0]}`.
+
+Every one of those made a reviewer's instrument report the reassuring state,
+which is this file's subject applied to the tools the reviewer brought rather
+than to the code under review.
 ## A clean textual merge is not a passing merge
 
 Two changes can auto-merge with no conflict and produce a failing suite. Git
@@ -149,6 +208,15 @@ When two branches touch one test file, run the combined suite before either
 merges. `git merge --no-commit --no-ff <other>` then the suite, then
 `git merge --abort`.
 
+
+**The index is a third state.** A census that reads `git ls-files` sees the
+INDEX, not the working tree and not the ref. Measured: after resolving a
+`CHANGELOG` conflict in the working tree WITHOUT staging it, six
+`test_venue_vocabulary.py` counts came back inflated, because `git ls-files`
+emits a conflicted path once per unmerged stage, so the file was counted twice.
+The census was right and the tree was half-merged. `main` being green on the
+same tests is what separated the two readings, and a per-file count diff against
+it located the duplicate in one step.
 ## An observation taken downstream of your own mutation is not evidence
 
 Four of this sprint's wrong readings were the same act: looking at something
@@ -287,6 +355,62 @@ right and the narration was lucky, which is the distinction worth keeping: a
 correct outcome does not retroactively make the reading that accompanied it
 evidence.
 
+
+**This entry had no mechanism when it shipped, and the honest resolution is
+that the ENFORCEMENT already exists and is not ours: GitHub computes
+`mergeStateStatus` against the required contexts, and a `BLOCKED` pull request
+cannot be merged whatever any script of ours believes.** What has no mechanism,
+and what this entry is actually about, is the hand-rolled SECOND reading that
+gets built next to it. So the rule is: do not hand-roll it, and here is the
+command, because an entry telling a reader to assert something without saying
+how is the rot this file is about.
+
+```sh
+R=skyphusion-labs/straightedge
+SHA=$(gh pr view "$PR" --repo "$R" --json headRefOid --jq .headRefOid)
+# The contexts that GATE the branch, read from the rule rather than guessed:
+gh api "repos/$R/rules/branches/main" \
+  --jq '[.[]|select(.type=="required_status_checks")
+         |.parameters.required_status_checks[].context]'
+# Each one, by NAME, with ABSENT distinguished from PENDING and from a failure:
+for c in $(…that list…); do
+  gh api "repos/$R/commits/$SHA/check-runs" --jq \
+    "[.check_runs[]|select(.name==\"$c\")|.conclusion]
+     |if length==0 then \"ABSENT\" else .[0] // \"PENDING\" end"
+done
+```
+
+**Measured, and this is the control that makes the rule worth a section.** On a
+payload with no checks at all, which is exactly the four-poll window the
+paragraph above describes, the two expressions disagree:
+
+```
+$ echo '{"check_runs":[]}' | jq '[.check_runs[]|select(.conclusion!="success")]|length == 0'
+true
+```
+
+The broken expression reports **all-clear** on a sha where nothing has run, and
+the by-name form reports `coverage=ABSENT ci=ABSENT`. One command, offline,
+reproducible, and it is the whole argument: **the failure is not that the
+expression is subtly wrong, it is that its answer is identical in the clean case
+and in the empty case.**
+
+`repos/{owner}/{repo}/rules/branches/main` needs no elevated scope: it answers
+for a plain collaborator token, which is why reading the rule is preferable to
+hard-coding `ci` and `coverage` into a script that then cannot notice the rule
+changing. Read **`/rules/branches/main`**, which answers "what GATES this
+branch", and never `/rulesets`, which answers only "what EXISTS" and lists
+rulesets that match no branch.
+
+**What a CI mechanism would take, and why there is not one.** A workflow job
+cannot assert its own siblings: inside the same run `ci` and `coverage` are
+pending by construction, so the job would have to be keyed on the completion of
+the others and would then be asserting, at merge time, the thing GitHub's own
+branch rule already computes and already enforces. **A second implementation of
+a gate that works is not a second gate, it is a second thing that can be
+wrong** -- and it would be the one with no enforcement behind it. So this entry
+is deliberately a PRACTICE with a runnable command, not a check, and it says so
+rather than leaving a reader to discover it.
 ## A control beats a second opinion
 
 Two instruments agreeing is CORROBORATION. A control showing the instrument can
@@ -426,6 +550,40 @@ only catches the blind-seam case. **Three seams are blind today**
 (`cancel`, `check_working`, `working`), which is a finding this file is
 raising, not one it has fixed.
 
+
+## And the dual: a substitute that cannot SUCCEED the way the real thing does
+
+The section above is a double too SOFT to fail. A double can also be too HARSH
+to pass, and that one is harder to spot because it presents as a red: the test
+fails, the fix looks wrong, and the thing that is actually wrong is the stand-in
+demanding behaviour the subject must not have.
+
+Measured, straightedge#242. The fix retries a `replace` that a concurrent
+Windows reader refused. The first version of the `windows-latest` test held the
+destination open across the whole call, so the retry spun for its full window
+against a reader that never released, and then re-raised. **It failed on the
+branch WITH the fix**, and it was the test that was wrong: a retry absorbs a
+RACE, never a CONDITION, and a retry that waited out a permanent hold would
+convert a rare dropped tick into a stopped desk. A sibling test in the same
+file REQUIRED exactly the behaviour this one forbade, so the two halves of one
+file asserted opposite outcomes.
+
+**Neither POSIX run could have arbitrated, because on POSIX the conflict does
+not exist at all** -- a rename over an open file succeeds there. Only the
+platform could say which half was right, which is the same argument as the
+section above from the other end: a double's fidelity is not reviewable from
+the side that cannot reach the state.
+
+Two things it changes about how to write one:
+
+- **Split the two cases and assert both outcomes.** A hold that outlasts the
+  window must SURFACE; a hold that lets go must be ABSORBED. A file whose two
+  halves pin opposite results cannot be satisfied by making the retry
+  unbounded, which is the repair a single over-harsh test invites.
+- **Make the stand-in release on a SIGNAL, not a timer**, and only after a
+  positive control has observed the real refusal. Then the test cannot pass by
+  the conflict never having occurred, and it cannot fail by demanding the
+  impossible.
 ## Execute the documentation, do not review it
 
 Every procedure in a document rots silently, because reading one cannot tell a
@@ -445,8 +603,8 @@ branch:
 
 | domain | command naming the domain | files | with fenced blocks | blocks |
 | --- | --- | --- | --- | --- |
-| `docs/*.md` plus `README.md` | `git ls-files 'docs/*.md' README.md` | 11 | 6 | 41 |
-| `**/*.md` across the repo | `git ls-files '*.md'` | 18 | 12 | 64 |
+| `docs/*.md` plus `README.md` | `git ls-files 'docs/*.md' README.md` | 11 | 6 | 45 |
+| `**/*.md` across the repo | `git ls-files '*.md'` | 18 | 12 | 69 |
 
 **Those figures are MEASURED AT THE TIP THAT CARRIES THEM, not predicted for a
 future merge, and that change is deliberate.** Earlier versions of this
@@ -459,7 +617,11 @@ contains, and there is no arithmetic left to go stale.
 for the rule rather than an anecdote.** At `f98984b` the row read 18/11/57 and
 predicted 59 after this file merged. It merged, and the repo-wide figure was
 **62**. While the pull request adding the section above was open, #240 landed
-and it became **64**. The `docs/` row, meanwhile, hit its predicted 40 exactly
+and it became **64**. It reached **68**, and then **69** while the pull request
+carrying THIS sentence was open, because a `CHANGELOG.md` entry arrived
+carrying a fenced block. **That is a fourth movement with nothing in this file
+changing, and it came from the file nobody thinks of as documentation.**
+The `docs/` row, meanwhile, hit its predicted 40 exactly
 and has only moved by this file's own additions. So the broad domain moved
 three times without this file changing at all, and the narrow one never moved
 except when it did: **a markdown commit may move the count and may not, which
@@ -585,9 +747,60 @@ markdown table, which both renders better and keeps the row describing the file
 rather than describing itself; if you add a fence here, re-run and update the
 row.
 
-**The 2 are the `git diff` example far above and the script just above, and
-that is the whole population**, so the only thing that can move the number is a fence added
-to or removed from this file. Name the method as well, because this file is a
+**It went stale AGAIN, and this time nothing in this paragraph changed.** The
+sentence above used to read "the 2 are the `git diff` example far above and the
+script just above, and that is the whole population". **Measured on
+`origin/main` before this change: THREE.** #244 added a
+`python3 tests/double_census.py` output block in the section on substitutes, and
+the count here was not part of that diff, so the row describing this file was
+wrong the moment a section was appended to it. That is the third time this
+figure has rotted, and the second time it rotted while every word about it
+stayed put: the de-fenced table removed the self-reference and did not remove
+the dependence on the rest of the file.
+
+**So stop asserting the number in prose.** The blocks are enumerated below
+because an enumeration is checkable line by line, where a bare integer is only
+checkable by re-deriving it, and re-derive is exactly what nobody does:
+
+In file order, which is the order the script numbers them in:
+
+| # | what it is | command-shaped lines | executed |
+| --- | --- | --- | --- |
+| 1 | the `git diff --stat` pair, an example with its output | 2 | 0, both carry `<placeholder>` |
+| 2 | the required-contexts `gh` commands | 0 | 0, `gh`/`for`/assignments are not recognised |
+| 3 | the empty-payload control, a `jq` line and its output | 0 | 0 |
+| 4 | the `double_census.py` output | 0 | 0 |
+| 5 | the verifier itself | 0 | 0 |
+| 6 | the verifier's own `exit=1` output, quoted above | 0 | 0 |
+| 7 | the domain command below, added so this file is not a document the verifier refuses | 1 | **1** |
+
+**Seven, and only the last one runs.** That ratio is the honest reach of this
+tool restated: it recognises four command prefixes and skips anything carrying a
+placeholder, so most of what looks like a command in a document is correctly
+invisible to it. The row to watch is the last column summing to at least 1.
+
+**AND THE SHIPPED SCRIPT EXITED 1 ON THIS FILE, which is worse than a wrong
+count.** Run verbatim against `docs/TESTING.md` at `origin/main`:
+
+```
+fenced blocks: 3
+block 1: SKIP (placeholder)  git diff --stat origin/main..<head> ...
+block 1: SKIP (placeholder)  git diff --stat origin/main...<head> ...
+command lines executed: 0
+no command was executed: this is a broken check, not a clean document
+exit=1
+```
+
+Every command-shaped line in the file carried a `<placeholder>`, so the
+script's own `ran == 0` guard fired and reported the document broken. **The
+guard was right and the subject was this file.** A verifier that cannot pass on
+the document it ships in teaches a reader to ignore its exit code, which is the
+one thing a self-checking document cannot afford. One runnable line fixes it,
+and it is the command the domain table already names:
+
+```sh
+git ls-files 'docs/*.md' README.md
+``` Name the method as well, because this file is a
 case where both obvious ones lie: `grep -c` on the fence marker reports 5,
 since it counts matching LINES and one line carries two markers; `grep -o` of
 the same marker piped to `wc -l` reports 6, since it counts OCCURRENCES and two
