@@ -384,6 +384,7 @@ class TestTheContractSurvivesTheNetwork:
 
 
 class TestTheErrorPartitionSurvivesTheHop:
+    @pytest.mark.timing
     def test_a_401_is_not_retried_and_does_not_burn_the_startup_budget(
         self, tmp_path: Path
     ) -> None:
@@ -449,6 +450,7 @@ class TestTheErrorPartitionSurvivesTheHop:
         assert attempts, f"the 504 was never retried; log was {log}"
         assert any("504" in line for line in attempts), attempts
 
+    @pytest.mark.timing
     def test_a_shim_that_is_not_listening_is_retried(self, tmp_path: Path) -> None:
         """Connection refused is an `OSError`, and at boot that is ordinary.
 
@@ -777,6 +779,7 @@ class TestFileBridgeExchange:
         assert not (tmp_path / REQ_NAME).exists(), "the abandoned request is still live"
         assert caught.value.withdrawal == "withdrawn"
 
+    @pytest.mark.timing
     def test_exchange_takes_its_budget_from_the_requests_own_ttl(
         self, tmp_path: Path
     ) -> None:
@@ -837,6 +840,7 @@ class TestFileBridgeExchange:
             "ttl_ms is clamped down and the shim gives up before the desk does"
         )
 
+    @pytest.mark.timing
     def test_the_shim_mailbox_waits_the_full_send_ttl(self, tmp_path: Path) -> None:
         """The same thing measured rather than inspected, on the bridge itself."""
         bridge = FileBridge(
@@ -848,6 +852,7 @@ class TestFileBridgeExchange:
         waited = time.monotonic() - started
         assert 1.1 < waited < 2.0, waited
 
+    @pytest.mark.timing
     def test_a_ttl_beyond_the_shims_ceiling_is_clamped(self, tmp_path: Path) -> None:
         """`ttl_ms` arrives over the network, so it is clamped, not trusted.
 

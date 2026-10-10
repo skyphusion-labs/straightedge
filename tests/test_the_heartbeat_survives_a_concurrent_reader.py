@@ -98,6 +98,7 @@ def test_a_refused_replace_is_retried_until_it_lands(tmp_path: Path) -> None:
     assert dest.read_text(encoding="utf-8") == "second"
 
 
+@pytest.mark.timing
 def test_the_window_is_bounded_and_then_the_tick_is_allowed_to_fail(
     tmp_path: Path,
 ) -> None:
@@ -213,6 +214,7 @@ def test_the_retry_window_cannot_delay_a_tick() -> None:
 # --- 3. the real thing, which only one platform can run --------------------
 
 
+@pytest.mark.timing
 @pytest.mark.skipif(
     sys.platform != "win32",
     reason=(
