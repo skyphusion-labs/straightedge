@@ -301,23 +301,50 @@ class InstanceLockError(RuntimeError):
 #: `nonfinite:` marker is what made the difference, costing 97 bytes across
 #: those four fields.
 #:
-#:     516   measured worst case: every schema field large at once, all four
+#:     538   measured MAXIMAL row: every schema field large at once, all four
 #:           price fields non-finite, the symbol clipped to
-#:           RECORD_STRING_CHARS, and #216's per-field violation classes in
-#:           `degraded`
-#:    + 64   headroom for ONE more non-finite-capable numeric field on the
-#:           row, priced at an 8 character name, longer than any of the four
-#:           today; measured, not allowed for, because such a field costs
-#:           three places at once: the marked value, an entry in the
-#:           `nonfinite` list and a violation class in `degraded`. The
-#:           existing four cost 44, 44, 50 and 53.
+#:           RECORD_STRING_CHARS, #216's per-field violation classes in
+#:           `degraded`, AND a deferred rotation marking the row. That is every
+#:           conditional field present at the same time, which is the row the
+#:           bound actually has to answer for.
+#:    + 42   flat margin. NOT a per-field allowance, and that is the point.
 #:    = 580
 #:
-#: WHAT INVALIDATES THIS FIGURE, stated so it cannot go stale in silence:
-#: a SECOND new non-finite-capable numeric field on the row, a field name
-#: longer than 8 characters, a rise in `RECORD_STRING_CHARS`, a per-field
-#: violation class wider than `:not_a_number`, or a longer spelling of
-#: `nonfinite:`. Any of those needs this figure re-derived rather than nudged.
+#: THE MARGIN IS FLAT ON PURPOSE (straightedge#287). It was once expressed as
+#: "headroom for ONE more non-finite-capable numeric field, priced at an 8
+#: character name", with the existing four measured at 44, 44, 50 and 53. That
+#: reads as a budget, and a budget has to be tracked: when `rotate_deferred`
+#: drew 22 of the 64 the sentence still described the whole allowance, because
+#: nobody does the arithmetic on the way past. A flat margin has no balance to
+#: keep and no stale sentence to leave behind, and the worst case above now
+#: includes the draw rather than leaving it to be subtracted.
+#:
+#: Re-deriving is therefore MEASURING THE MAXIMAL ROW AGAIN, never adjusting a
+#: remainder.
+#:
+#: WHAT INVALIDATES THIS FIGURE, stated so it cannot go stale in silence.
+#: THE GENERAL CONDITION IS **ANY NEW FIELD ON THE ROW**, whatever its type and
+#: whatever sets it. Everything after this sentence is a special case of it,
+#: kept because each names a cost that is easy to under-price, and the general
+#: form is stated first because the list used to consist only of the special
+#: cases and `rotate_deferred` walked straight through it: a 15 character
+#: marker, not numeric, no `nonfinite` entry and no `degraded` class, matching
+#: no entry on the list while spending 22 of the then-64 bytes of margin
+#: (straightedge#287). A list that enumerates a family cannot catch a member of
+#: another family, and a reader who finds no matching entry concludes there is
+#: nothing to re-derive.
+#:
+#: The special cases: a SECOND new non-finite-capable numeric field on the row,
+#: a field name longer than 8 characters, a rise in `RECORD_STRING_CHARS`, a
+#: per-field violation class wider than `:not_a_number`, or a longer spelling
+#: of `nonfinite:`. Any of those, or any other new row field, needs this figure
+#: re-derived rather than nudged.
+#:
+#: A new row field is also GATED and not only documented, which is the half a
+#: list can never do: `ADVICE_TURN_ROW_FIELDS` below declares the row's own key
+#: set and a test asserts the real row against it in both directions, so a
+#: field journalled without being declared reds before anybody consults this
+#: comment.
 #:
 #: A field added to `ADVICE_PROPERTIES` alone costs the row NOTHING, measured:
 #: the row's fields are fixed in `desk.py` rather than derived from the schema,
@@ -338,6 +365,59 @@ RECORD_ROW_BOUND = 580
 #: that no number of such fields can push a row past the bound
 #: `docs/CONTRACT.md` states (straightedge#226).
 RECORD_STRING_CHARS = 48
+
+
+#: THE `advice_turn` ROW'S OWN KEY SET, declared because it CANNOT be derived.
+#:
+#: `ADVICE_PROPERTIES` is the INPUT schema and this is the ROW, and they are
+#: legitimately different sets rather than one being derivable from the other.
+#: The row carries `event`, `ts`, `provider`, `session`, `staged`, `degraded`
+#: and `nonfinite`, none of which a model may say; the schema carries `text`
+#: and `summary`, which nothing journals. So "derive the row from the schema"
+#: is not available, and forcing it would be wrong in both directions.
+#:
+#: WHAT THIS FIXES (straightedge#287). The bound's derivation claimed a field
+#: added to `ADVICE_PROPERTIES` was "covered without anyone remembering to".
+#: Measured, such a field contributes **0 bytes** to the row, because the row's
+#: fields were enumerated by hand in `desk.py` and a schema field is free until
+#: somebody journals it. The hand-kept list #226 argued against had been
+#: relocated into the writer, not removed, which made it LESS visible than when
+#: it sat in a test. The fixture derives the INPUT space; the bound answers for
+#: the ROW; nothing connected the two.
+#:
+#: Declaring the row's keys here, next to the bound that governs them, is what
+#: connects them. `tests/test_the_advice_row_is_bounded.py` asserts the real
+#: journalled row against these three sets IN BOTH DIRECTIONS, so a field
+#: journalled without being declared reds, and a field declared that nothing
+#: journals reds too. The second direction matters as much as the first: a
+#: declaration nobody checks for emptiness decays into a wishlist, which is the
+#: failure the hand-kept list had.
+ADVICE_TURN_ROW_FIELDS: frozenset[str] = frozenset({
+    "action",
+    "degraded",
+    "limit",
+    "provider",
+    "session",
+    "sl",
+    "staged",
+    "stop",
+    "symbol",
+    "ticket",
+    "tp",
+})
+
+#: Added by `Journal.write` to every row it writes, not by any caller.
+ROW_ENVELOPE_FIELDS: frozenset[str] = frozenset({"event", "ts"})
+
+#: Present only when their condition fires, so a row without them is correct.
+#: `nonfinite` lands when a non-finite value was marked (#250, #231) and
+#: `rotate_deferred` when a rotation was refused (#283). Both are ROW fields
+#: and both are inside what the bound measures, which is exactly why the
+#: derivation above is stated against the row that carries BOTH at once.
+CONDITIONAL_ROW_FIELDS: frozenset[str] = frozenset({
+    "nonfinite",
+    "rotate_deferred",
+})
 
 
 def clip_for_record(value: str, limit: int = RECORD_STRING_CHARS) -> str:

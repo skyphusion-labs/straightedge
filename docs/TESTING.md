@@ -318,6 +318,51 @@ because it also fails on an empty `room`, so it cannot pass by the exposure
 block rendering no rows. That property is what separates it from
 `all(v == 0 for v in room.values())`, which an empty book satisfies silently.
 
+## The emptiness half of a both-directions gate is a bill, not a free check
+
+A declaration that can rot gets repaired the same way every time: assert that
+nothing UNDECLARED appears, and assert that nothing DECLARED is absent. Without
+the second half the declaration decays into a list of things somebody once
+intended, and the gate reports green over it. `KNOWN_BLIND_SEAMS` is asserted
+for equality for exactly this reason, so progress updates it rather than hiding
+in it.
+
+**The second half obliges a FIXTURE for every declared member, and that cost is
+invisible when you add it.** A member whose condition no fixture reaches cannot
+be found absent, so it sits in the declaration unverified. The check that was
+added to stop a wishlist is the one the wishlist entry now hides behind.
+
+Worked instance, straightedge#287. The `advice_turn` row's keys are declared,
+split into always-present and conditional, and asserted both ways. One
+conditional member appears only when a journal rotation is refused. A fixture
+driving every schema field large cannot see it at all, so the emptiness half
+would have passed straight over it: present-and-undeclared would still red,
+declared-and-missing would not. The gate therefore asserts on a MAXIMAL row,
+with the rotation forced to fail, so every declared condition fires at once.
+That is not completeness for its own sake; without it one declared member is
+decoration.
+
+**The rule: a conditional member may be declared only if its condition is
+reachable from a fixture.** If it is not reachable, say so at the declaration
+and do not declare it. Declaring it buys a green that proves nothing, and it
+costs more than saying nothing would, because the gate standing over it implies
+somebody checked.
+
+**And do not build the escape hatch first.** The obvious mechanism is an
+exemption set for unreachable members. An unused exemption set is an exemption
+with no instance attached, which is worse than one with an instance, because
+nobody can judge whether it is justified and there is nothing to re-read it
+against. #287 needed none and got none. Add the mechanism when a real member
+forces it, and name that member at the exemption.
+
+This is the same family as two entries above. "An assertion over an empty
+collection passes for free" is the degenerate case, where the collection is
+empty and nothing is checked at all; this is the partial case, where most
+members are checked and one is not, which is harder to see precisely because
+the gate is doing real work everywhere else. And "a comment asserting a
+property the code does not have" is what the unverified member becomes once
+somebody reads the declaration as a guarantee.
+
 ## Two traps specific to this codebase
 
 **Always probe a config value at a NON-DEFAULT setting.** Every exposure fixture
@@ -510,6 +555,151 @@ a gate that works is not a second gate, it is a second thing that can be
 wrong** -- and it would be the one with no enforcement behind it. So this entry
 is deliberately a PRACTICE with a runnable command, not a check, and it says so
 rather than leaving a reader to discover it.
+## A monitor outliving its subject reports a confident false green
+
+A watcher that polls until something goes green has two ways to be measuring the
+wrong thing, and neither announces itself. Both were hit in one night.
+
+**The subject was IMPLICIT.** A watcher polling a pull request's checks read the
+sha from the working tree. One clone served several branches, and checking out
+another branch moved HEAD out from under it:
+
+```
+head=e42799ed...        <- this is origin/main, not the pull request
+ci completed success / coverage completed success
+rows NOT completed/success: (none)
+all_required_green=yes
+GREEN after 28 polls
+```
+
+It measured main, found main green, and reported the pull request green. **Every
+individual reading is true and the conclusion is worthless**, which is the worst
+shape a measurement can take, because there is nothing in the output to argue
+with. Attribution is the sha, never the tree.
+
+**The subject was PINNED and OBSOLETE.** Passing the sha as an argument fixes the
+case above and not this one. A watcher armed at a sha that a later current
+replaced is still polling, its checks still in flight, and on completion it
+announces green for a commit that is no longer the head. **A sha-pinned watcher
+is correct about a commit nobody cares about any more.**
+
+**And the part worth keeping: the instrument had already been fixed for the first
+reason, in the abstract, before it bit. The OLD COPY still in flight is what
+bit.** Fixing a design does nothing while an old instance runs, and nothing in
+the fix tells you an old instance exists. The leftover was found by enumerating
+processes, not by remembering.
+
+So the rule is the one `CLAUDE.md` already states for wake channels, and it
+applies to any poller: **enumerate what runs against your own subject, reap
+what is watching a subject that is gone, and arm exactly ONE PER SUBJECT.**
+Re-arm means REPLACE, not add.
+
+**"Arm exactly one" is the wrong spelling and the difference is not pedantic.**
+Read as a count, it tells you to reap a live watcher on a DIFFERENT subject in
+order to satisfy the number, which destroys a correct instrument to tidy a
+total. Two watchers on two pull requests is the correct state and reads
+identically to the broken one from a count alone. The defect is two on ONE
+subject, where the stale one reports first.
+
+So the check before arming is not "how many are running" but **"what is each
+running one watching"**. That question also answers the first failure above,
+because a watcher reading the tree cannot tell you its subject at all.
+
+**Zero armed is a correct state** too, once every subject is measured and
+nothing is left to watch.
+
+This sits with the attribution entries rather than with the gate entries. A gate
+that cannot fail is decorative; a monitor measuring the wrong subject is worse,
+because it actively reports the answer you wanted about something you did not
+ask about.
+
+## An empty answer is the commonest disguise for a broken question
+
+**An instrument that could not have produced a positive answer, reporting a
+negative one.** Six of these in one evening, from five different tools, and in
+every case the tempting reading was that the CLAIM was wrong rather than that
+the QUESTION was.
+
+| instrument | why it returned a confident nothing |
+|---|---|
+| `gh pr diff -- <path>` | returned empty for a path that WAS in the diff |
+| a `grep` | case sensitive against content that differed in case |
+| two `merge-base --is-ancestor` checks | unfetched object, so the ancestor was UNKNOWN, not absent |
+| a sweep pattern | `os\.replace` missed `tmp.replace(dest)` |
+| a mutation harness | printed `changed outcome: 0` while its mutation had FAILED |
+| a dash check using `grep -P` | the flag does not exist on this seat's `grep`, so the check could not run |
+
+The last one is the sharpest, because it was measuring this exact defect. Its
+anchor no longer existed after the commit it was testing, so the mutation phase
+re-ran unmutated code and **compared it with itself**. A zero meaning "I measured
+nothing" presented as a zero meaning "nothing changed", inside a change whose
+whole subject was assertions that pass vacuously.
+
+**The last row is a different animal from the five above it, and the difference
+is the useful part.** Those five are tools asked the wrong question. That one is
+a tool that COULD NOT RUN, whose failure was converted into a pass by the shell
+idiom wrapped around it:
+
+```sh
+check && echo ok || echo none          # never write this around a check
+```
+
+`cmd && echo ok || echo none` renders an unavailable flag, a missing file, a
+typo in the pattern and a genuine clean result **identically**. It is not a
+measurement error; it is an error-handling idiom that turns failure into the
+reassuring branch by construction.
+
+**And it is INVISIBLE FROM THE SEAT THAT WROTE IT.** The same command is a
+working instrument where `grep` resolves to one that supports `-P`, and a
+false-negative generator where it resolves to BSD grep, decided entirely by that
+account's PATH. Measured both ways: on the authoring seat it found a planted
+dash; on the other seat, given a file whose bytes are verifiably `e2 80 94` and
+`e2 80 93`, the same command printed `none`. An author who writes and controls a
+check on their own seat **cannot discover this defect**, because it passes its
+own control exactly where it was written and manufactures passes only for
+whoever inherits it.
+
+So the control has a sharper requirement than "prove the instrument can return a
+positive": **a shared check's control must run on the seat that RUNS it, not on
+the seat that wrote it.** A control proven once by the author proves nothing
+about anybody else's PATH. This is the copied-tool fork with no copy involved;
+the thing that forked is the environment.
+
+Three prescriptions, and they are the same failure at three distances: the
+INSTRUMENT, the TOOL that reports it, and the REVIEWER who accepts it. **Each is
+invisible from the position of the one before it:** a reviewer cannot see a
+vacuous zero, a harness cannot see a reviewer's checklist, and an instrument
+cannot see either. That is why these are one entry and not three unrelated
+cautions.
+
+**1. The instrument.** A negative result is evidence only after you confirm the
+instrument could have produced a positive one. That is already doctrine here;
+what it misses is that **an empty answer is the most comfortable possible
+disguise for a broken question**, because it looks like good news and it costs
+nothing to accept. So the check is adversarial on the INSTRUMENT, never on the
+claim: before accepting a nothing, make the instrument find something you
+already know is there. A scan that cannot find a planted needle is not a clean
+scan.
+
+**2. The tool.** A harness must **REFUSE TO REPORT when its own precondition did
+not hold.** This is stronger than telling readers to check their instruments,
+because **it moves the obligation from the reader to the tool**, and the reader
+is the person least able to discharge it: a vacuous zero is indistinguishable
+from a real one at the point of reading. The repaired harness greps the file to
+prove its mutation landed before it compares anything, and exits rather than
+printing a number it cannot stand behind.
+
+**3. The reviewer.** **A document's payload IS its prescription, so review the
+instruction and not only its hygiene.** Recorded as a review failure on the pull
+request that landed the monitor entry above, because the instance is what makes
+it checkable. Every hygiene check run on that review was the CORRECT check and
+all of them passed: zero dashes, correct siting against the two sections it
+generalises, no retracted wordings, a present-tense claim verified against
+`main`, scope confirmed. **Nothing in that list reads the payload.** The entry
+shipped telling a reader to reap a correct watcher to satisfy a count, and a
+reviewer could run that whole checklist, pass it honestly, and still ship it.
+That is what makes it a gap rather than a lapse.
+
 ## A control beats a second opinion
 
 Two instruments agreeing is CORROBORATION. A control showing the instrument can

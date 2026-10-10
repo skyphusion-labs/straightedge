@@ -10,17 +10,17 @@
     "deploy": "wrangler deploy"
   },
   "dependencies": {
-    "@ai-sdk/openai": "^4.0.83",
-    "@cloudflare/computer": "^0.4.0",
-    "ai": "^7.0.127",
+    "@ai-sdk/openai": "^4.0.86",
+    "@cloudflare/computer": "^0.4.1",
+    "ai": "^7.0.130",
     "zod": "^4.6.5"
   },
   "devDependencies": {
     "@cloudflare/vitest-pool-workers": "^0.22.0",
-    "@cloudflare/workers-types": "^5.20261004.1",
+    "@cloudflare/workers-types": "^5.20261007.1",
     "typescript": "^7.0.2",
     "vitest": "^4.1.11",
-    "wrangler": "^4.147.0"
+    "wrangler": "^4.148.0"
   },
   "overrides": {
     "miniflare": "5.20260908.0-alpha",

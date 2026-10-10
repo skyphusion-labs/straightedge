@@ -39,10 +39,15 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
+import pytest
+
 from straightedge.broker.paper import PaperBroker
 from straightedge.config import BotConfig
 from straightedge.engine import Engine
 from straightedge.journal import (
+    ADVICE_TURN_ROW_FIELDS,
+    CONDITIONAL_ROW_FIELDS,
+    ROW_ENVELOPE_FIELDS,
     RECORD_ROW_BOUND,
     RECORD_STRING_CHARS,
     clip_for_record,
@@ -73,7 +78,22 @@ def _claude_reply(obj: dict) -> dict:
     return {"content": [{"type": "text", "text": json.dumps(obj)}]}
 
 
-def _engine(tmp_path: Path, *payloads: dict, provider: str = "claude") -> Engine:
+#: THIS DEFAULT IS THE SHIPPED DEFAULT, and a test below pins that it stays so
+#: (straightedge#290).
+#:
+#: It used to be `claude` while the product shipped `grok`, and the divergence
+#: cost three readers. Inside this file `provider="grok"` read as a departure
+#: from the default when it was the shipped value, while `provider="claude"` was
+#: invisible because it WAS the default: the case driving the structured path
+#: looked ordinary and the case driving the shipped path looked special. #284
+#: was filed on that inversion by a reader being careful.
+#:
+#: Every call whose vantage can matter now names it. The only calls still riding
+#: this default pass NO payload, so the advisor is never reached and no provider
+#: is exercised. That split is MEASURED, not asserted: flipping this default
+#: changes the outcome of exactly the payload-bearing calls and nothing else,
+#: and after making those four explicit the flip changes nothing at all.
+def _engine(tmp_path: Path, *payloads: dict, provider: str = "grok") -> Engine:
     cfg = BotConfig()
     cfg.journal_path = str(tmp_path / "j.jsonl")
     cfg.session.enabled = False
@@ -275,7 +295,7 @@ def test_every_model_reachable_field_driven_large_at_once_stays_in_bound(
     one reply. The row has to stay under the documented bound, and no field may
     carry a model string whole.
     """
-    engine = _engine(tmp_path, _claude_reply(_everything_large()))
+    engine = _engine(tmp_path, _claude_reply(_everything_large()), provider="claude")
     engine.handle_command(TgCommand("1", 1, "/ask take a view", 1))
     row = _turn(engine)
     blob = json.dumps(row, sort_keys=True)
@@ -313,8 +333,38 @@ def test_the_same_reply_through_the_bare_parser_is_also_in_bound(
     engine.stop()
 
 
+#: The vantages the close case is driven on. Declared once because the pin
+#: below reads it: a second hand-written copy in the parametrize list is the
+#: drift this file already warns about elsewhere.
+PROVIDERS_UNDER_TEST = ("claude", "grok")
+
+
+#: The close reply, in whichever envelope the provider under test reads.
+#:
+#: ONE payload, two envelopes, because the thing being proven is that the path
+#: is not provider-specific. Two hand-built payloads could drift and the test
+#: would still pass, which is the "consumer that rebuilds what it should call"
+#: shape `docs/TESTING.md` warns about.
+#:
+#: THE `text` KEY ON THE CLAUDE ARM IS LOAD-BEARING. `text` is `required` in
+#: `ADVICE_FORMAT`, so a claude payload without it is a SCHEMA VIOLATION
+#: (`_schema_violations` returns `[("text", "missing")]`), `action` is forced to
+#: `hold`, the close never stages, and NO `reject` row is written at all. Drop
+#: it and this case stops measuring anything on that arm. The grok and computer
+#: paths have no schema gate, so they never noticed it was absent.
+def _close_the_model_asked_for(provider: str) -> dict:
+    tail = {
+        "action": "close", "symbol": "E" * 5600, "ticket": None,
+        "sl": None, "tp": None, "limit": None, "stop": None, "summary": "s",
+    }
+    if provider == "claude":
+        return _claude_reply(dict(tail, text="p"))
+    return {"choices": [{"message": {"content": "p\n" + json.dumps(tail)}}]}
+
+
+@pytest.mark.parametrize("provider", PROVIDERS_UNDER_TEST)
 def test_a_close_the_model_asked_for_bounds_every_row_it_writes(
-    tmp_path: Path,
+    tmp_path: Path, provider: str
 ) -> None:
     """The PATH no field derivation could reach, found in review.
 
@@ -335,16 +385,44 @@ def test_a_close_the_model_asked_for_bounds_every_row_it_writes(
     is at `_reject` rather than at the three call sites, because that is the
     single writer of every `reject` row and a fourth site would otherwise
     repeat this.
+
+    PARAMETERISED OVER BOTH PROVIDERS (straightedge#284), because the sentence
+    above claims the vantage is not `grok`-only and only `grok` was driven. A
+    docstring was doing the fixture's job.
+
+    TWO THINGS THE ISSUE ASSUMED THAT MEASUREMENT CONTRADICTS, recorded because
+    both would have produced a worse test.
+
+    **`grok` IS the product default**, so the original case was already driving
+    it: `AdviceConfig.provider` defaults to `"grok"` (`config.py`),
+    `config.example.toml` ships `provider = "grok"`, and the `AI_PROVIDER`
+    fallback is `"grok"`. What reads as a departure from the default is
+    `_engine`'s OWN default of `"claude"`, which is a test-file convenience and
+    not the shipped shape. The claim worth proving was never "drive the
+    default", it was "this is not provider-specific".
+
+    **And the claude arm does NOT need different assertions.** The issue
+    expected the schema gate to force `hold` here, blank the symbol and write no
+    `reject` row, which would have meant two cases. Measured: that happens only
+    when the fixture omits `text`, a `required` property, so the hold was an
+    artifact of an INCOMPLETE PAYLOAD rather than a property of the path. With
+    the payload schema-complete, both arms write one `reject` row, both read
+    `close_needs_ticket`, both carry the identical clipped symbol, and both rows
+    measure 212 bytes. Encoding that difference as two cases would have frozen a
+    fixture bug into the suite as if it were behaviour.
     """
-    engine = _engine(
-        tmp_path,
-        {"choices": [{"message": {"content": "p\n" + json.dumps({
-            "action": "close", "symbol": "E" * 5600, "ticket": None,
-            "sl": None, "tp": None, "limit": None, "stop": None, "summary": "s",
-        })}}]},
-        provider="grok",
-    )
+    engine = _engine(tmp_path, _close_the_model_asked_for(provider), provider=provider)
     engine.handle_command(TgCommand("1", 1, "/ask flatten it", 1))
+
+    turn = _turn(engine)
+    assert turn.get("action") == "close", (
+        "the turn did not reach the close path on provider "
+        + provider
+        + f", so nothing below measures the reject row: action={turn.get('action')!r} "
+        + f"violations={turn.get('violations')!r}. On the claude arm the usual "
+        "cause is a payload missing a `required` schema property, which forces "
+        "action to hold; see _close_the_model_asked_for."
+    )
 
     rejects = _rows_named(engine, "reject")
     assert rejects, "the close never reached the reject path, so this proves nothing"
@@ -357,6 +435,171 @@ def test_a_close_the_model_asked_for_bounds_every_row_it_writes(
     )
     _assert_every_row_in_bound(engine)
     engine.stop()
+
+
+def test_the_close_case_covers_the_SHIPPED_default_provider() -> None:
+    """The docstring above says `grok` is the default. Assert it, do not say it.
+
+    straightedge#284 was filed believing the case did not drive the default
+    provider, and the belief was reasonable: `_engine` defaults to `"claude"`,
+    so `provider="grok"` reads as an explicit departure from the default rather
+    than as the shipped value. It is the test file's convenience that differs
+    from the product, not the case.
+
+    Leaving that in prose is the exact defect #284 fixed one level up, where a
+    docstring asserted a vantage the fixture never drove. So the shipped default
+    is read from the config here, and if it ever moves to a provider this case
+    does not drive, this reds and names it.
+    """
+    shipped = BotConfig().advice.provider
+    assert shipped in PROVIDERS_UNDER_TEST, (
+        f"the shipped default provider is {shipped!r}, which this case does not "
+        f"drive (it drives {list(PROVIDERS_UNDER_TEST)}), so the bound on the "
+        "close path is unproven on the configuration customers actually run. "
+        "Add it to PROVIDERS_UNDER_TEST, with its reply envelope in "
+        "_close_the_model_asked_for."
+    )
+
+
+def test_the_helper_default_IS_the_shipped_default() -> None:
+    """straightedge#290: the divergence that manufactured a false premise.
+
+    This helper defaulted to `claude` while the product shipped `grok`. Neither
+    value was wrong; the DIVERGENCE was, because a reader inside this file
+    cannot see `AdviceConfig`, so they must guess which way the default points
+    and the guess inverts which case looks special. #284 was filed on that.
+
+    PINNED rather than commented, for the reason #284 itself established: a
+    docstring claiming the two agree is a sentence doing a fixture's job. If the
+    product default moves, this reds, and the move becomes an explicit decision
+    about this file instead of a silent re-pointing of every case riding the
+    default.
+
+    Read through `inspect` rather than compared to a literal, so there is no
+    second copy of the value to drift from the signature.
+    """
+    import inspect
+
+    shipped = BotConfig().advice.provider
+    helper = inspect.signature(_engine).parameters["provider"].default
+
+    assert helper == shipped, (
+        f"this file's _engine defaults to {helper!r} and the product ships "
+        f"{shipped!r}. That divergence is straightedge#290 and it cost three "
+        "readers a false premise. Either align this default, or, if the two are "
+        "meant to differ, make every call that rides the default name its "
+        "provider so no reader has to know which way the default points."
+    )
+
+
+def _maximal_row(tmp_path: Path, monkeypatch) -> dict:  # type: ignore[no-untyped-def]
+    """The row the bound actually has to answer for: EVERY field at once.
+
+    Every schema field driven large, all four price fields non-finite, the
+    symbol clipped, #216's per-field violation classes present, AND a deferred
+    rotation marking the row. That last one is what makes this the maximal row
+    rather than merely a large one: `rotate_deferred` is conditional, so a
+    fixture that does not refuse a rotation measures a row that is 22 bytes
+    short of the worst case and cannot see the conditional key at all.
+
+    `_everything_large` is reused rather than rebuilt, so a field added to
+    `ADVICE_PROPERTIES` is driven here without anyone editing this file.
+    """
+    from straightedge import journal as journal_mod
+
+    engine = _engine(tmp_path, _claude_reply(_everything_large()), provider="claude")
+    assert Path(engine.journal.path).exists(), (
+        "no live journal, so `_rotate_if_needed` returns early, the deferral "
+        "branch is unreachable and this would measure a row short of maximal"
+    )
+
+    def _refuse(tmp, dest, **kw):  # type: ignore[no-untyped-def]
+        raise PermissionError(5, "Access is denied")
+
+    monkeypatch.setattr(journal_mod, "_ROTATE_BYTES", 1)
+    monkeypatch.setattr(journal_mod, "replace_retrying_on_share_conflict", _refuse)
+    engine.handle_command(TgCommand("1", 1, "/ask take a view", 1))
+    monkeypatch.undo()
+
+    row = _turn(engine)
+    engine.stop()
+    assert row.get("rotate_deferred") == 1, (
+        "the deferral did not fire, so this is not the maximal row and the "
+        f"conditional key set below is untested: {sorted(row)}"
+    )
+    return row
+
+
+def test_the_rows_fields_are_the_DECLARED_fields_in_both_directions(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """straightedge#287: the hand-kept list moved into the writer, it did not go.
+
+    `docs/CONTRACT.md` claimed a field added to `ADVICE_PROPERTIES` was
+    "covered without anyone remembering to". It contributes **0 bytes**, which
+    this file's own fixture cannot notice, because the fixture derives the
+    INPUT space from the schema while the ROW's fields were enumerated by hand
+    in `desk.py`. The bound answers for the row; nothing connected them.
+
+    This is the connection, and it gates BOTH directions, which is the whole
+    reason it is not just a narrowed sentence:
+
+    * a field JOURNALLED but not declared reds, which is the case that used to
+      ship an unmeasured contribution to the row;
+    * a field DECLARED that nothing journals reds too, because a declaration
+      nobody checks for emptiness decays into a wishlist, which is precisely
+      how the hand-kept list failed.
+
+    Asserted on the MAXIMAL row so the conditional keys are in scope. A fixture
+    without the deferred rotation cannot see `rotate_deferred` at all, and that
+    invisibility is what let a 15 character non-numeric field walk past an
+    invalidation list that enumerated only the numeric family.
+
+    WHAT THIS DOES NOT CLAIM. It gates the `advice_turn` row, which is the row
+    whose fields were hand-kept and the row the bound's derivation is written
+    against. Other events are not covered by it, and the declaration is not a
+    runtime check: a field journalled in production on a path no fixture drives
+    would still reach disk. That is the honest reach of a test-time gate, and
+    it is stated rather than left to be assumed.
+    """
+    row = _maximal_row(tmp_path, monkeypatch)
+    observed = set(row)
+    declared = (
+        ADVICE_TURN_ROW_FIELDS | ROW_ENVELOPE_FIELDS | CONDITIONAL_ROW_FIELDS
+    )
+
+    undeclared = sorted(observed - declared)
+    assert not undeclared, (
+        "these keys are on the advice_turn row and declared NOWHERE:\n  "
+        + "\n  ".join(undeclared)
+        + "\n\nEach one adds bytes to a row `journal.RECORD_ROW_BOUND` answers "
+        "for, so adding it invalidates the bound's derivation. Declare it in "
+        "`journal.ADVICE_TURN_ROW_FIELDS` (or CONDITIONAL_ROW_FIELDS if it is "
+        "only sometimes present), then RE-MEASURE the maximal row and "
+        "re-derive the bound rather than nudging it."
+    )
+
+    missing = sorted((ADVICE_TURN_ROW_FIELDS | ROW_ENVELOPE_FIELDS) - observed)
+    assert not missing, (
+        "these fields are declared as ALWAYS present and the maximal row does "
+        "not carry them:\n  "
+        + "\n  ".join(missing)
+        + "\n\nEither the writer stopped journalling them, in which case the "
+        "bound is now derived against a row that no longer exists, or the "
+        "declaration is aspirational. A declaration nobody empties is the "
+        "hand-kept list this replaced."
+    )
+
+    unreached = sorted(CONDITIONAL_ROW_FIELDS - observed)
+    assert not unreached, (
+        "these fields are declared CONDITIONAL and the maximal row does not "
+        "carry them:\n  "
+        + "\n  ".join(unreached)
+        + "\n\nThe maximal row is supposed to fire every condition at once. "
+        "If one of these is now unreachable from this fixture, the bound is "
+        "being asserted on a row smaller than the worst case, which is the "
+        "defect #283's field had before it was driven."
+    )
 
 
 def test_the_signal_path_row_is_bounded_too(tmp_path: Path) -> None:
@@ -754,6 +997,7 @@ def test_an_ordinary_turn_is_byte_for_byte_what_it_was(tmp_path: Path) -> None:
             "sl": 1.09, "tp": 1.11, "limit": None, "stop": None, "ticket": None,
             "summary": "take it",
         }),
+        provider="claude",
     )
     engine.handle_command(TgCommand("1", 1, "/ask take a view", 1))
     row = _turn(engine)
