@@ -234,6 +234,26 @@ REASON_AUTHORITIES = ("unusable_stop", "unusable_volume")
 #: `refused: ` is operator prose.
 REASON_WORD = re.compile(r"^[a-z][a-z0-9_]*:?$")
 
+#: EVERY KIND of non-word site `scan_refusal_literals` can put in `forwarded`,
+#: declared here so a gate can assert it covers all of them instead of listing
+#: prefixes from memory.
+#:
+#: This exists because of a measured defect: the scanner gained the `composed: `
+#: kind and the gate that pins non-word sites kept filtering on the two kinds it
+#: knew, so a concatenated refusal was surfaced by the instrument and ignored by
+#: the gate. Nothing in the types said so and a green run could not tell.
+#: Asserting that a bucket is EMPTY would not have caught it either, since
+#: `forwarded` legitimately holds eight entries here; the claim that holds is
+#: that the gate's filter covers every kind this scanner can emit.
+NON_WORD_KIND_PROSE = "prose: "
+NON_WORD_KIND_INTERPOLATED = "interpolated: "
+NON_WORD_KIND_COMPOSED = "composed: "
+NON_WORD_KINDS = (
+    NON_WORD_KIND_COMPOSED,
+    NON_WORD_KIND_INTERPOLATED,
+    NON_WORD_KIND_PROSE,
+)
+
 
 def scan_reason_authorities(
     source: str, *, function_names: tuple[str, ...] = REASON_AUTHORITIES
@@ -381,7 +401,7 @@ def scan_refusal_literals(source: str) -> ReasonScan:
         if REASON_WORD.match(tail):
             collector._record(tail, prefix=True)
         else:
-            collector.forwarded.add("prose: " + text.rstrip())
+            collector.forwarded.add(NON_WORD_KIND_PROSE + text.rstrip())
 
     for node in ast.walk(tree):
         if isinstance(node, ast.Constant) and isinstance(node.value, str):
@@ -393,7 +413,7 @@ def scan_refusal_literals(source: str) -> ReasonScan:
                 # `"refused: " + x.comment`, a `join`, a `%`. The site is real
                 # and names no word here, so it is surfaced with the statement
                 # that builds it rather than dropped.
-                collector.forwarded.add("composed: " + enclosing_statement(node))
+                collector.forwarded.add(NON_WORD_KIND_COMPOSED + enclosing_statement(node))
                 continue
             take(node.value)
         elif isinstance(node, ast.JoinedStr):
@@ -419,7 +439,7 @@ def scan_refusal_literals(source: str) -> ReasonScan:
                 # `forwarded` already carries for `RiskDecision(reason=...)`.
                 # A new site of either kind then fails until a person says
                 # which it is.
-                collector.forwarded.add("interpolated: " + ast.unparse(node))
+                collector.forwarded.add(NON_WORD_KIND_INTERPOLATED + ast.unparse(node))
                 continue
             take(head.value)
 

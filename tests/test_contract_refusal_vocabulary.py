@@ -27,6 +27,7 @@ import re
 import pytest
 
 from refusal_scan import (
+    NON_WORD_KINDS,
     scan_decision_reasons,
     scan_reason_authorities,
     scan_reasons,
@@ -266,14 +267,15 @@ def test_non_word_refusal_sites_are_pinned_rather_than_ignored() -> None:
             s
             for scan in _scans().values()
             for s in scan.forwarded
-            # `composed: ` BELONGS HERE AND WAS MISSING, which made the
-            # previous fix close the example rather than the hole for the
-            # fourth time on this PR. The scanner surfaced a concatenated
-            # site and this filter dropped it, so injecting
-            # `"refused: " + x.comment` into desk.py left the pin GREEN while
-            # a test one level down reported the scanner had seen it.
-            # Measured both ways before and after.
-            if s.startswith(("prose: ", "interpolated: ", "composed: "))
+            # FILTERED BY THE SCANNER'S OWN DECLARATION, never by a list
+            # repeated here. A remembered list is what broke this: the scanner
+            # gained `composed: ` and this filter kept the two kinds it knew,
+            # so a concatenated refusal was surfaced by the instrument and
+            # dropped by the gate. Importing the declaration makes that drift
+            # impossible rather than merely fixed once, and
+            # `test_the_gate_covers_every_kind_the_scanner_can_emit` asserts
+            # the two cannot diverge.
+            if s.startswith(NON_WORD_KINDS)
         )
     )
     # Compared against a SORTED pin rather than the literal order above, so a
@@ -442,4 +444,129 @@ def test_a_computed_prefix_is_the_known_blind_spot() -> None:
         f"improvement: got {sites!r} / {names!r}. Update the docstring of "
         "scan_refusal_literals and the CONTRACT.md paragraph that both name "
         "this as the residual blind spot, then delete this test."
+    )
+
+
+#: One spelling per kind the scanner can emit, so every declared kind is proved
+#: REACHABLE and proved to survive the gate's filter. A kind declared and never
+#: produced is a filter entry nobody tests; a kind produced and not filtered is
+#: the defect this file already shipped once.
+KIND_WITNESSES = {
+    "composed: ": 'return "refused: " + x.operator_detail',
+    "interpolated: ": 'return f"refused: {x.operator_detail}"',
+    "prose: ": 'return "refused: %s" % x.operator_detail',
+}
+
+
+def test_the_gate_covers_every_kind_the_scanner_can_emit() -> None:
+    """The claim that would have caught the `composed: ` defect.
+
+    Not "a bucket is empty", which is a weaker and more fragile claim: this
+    scanner's `forwarded` legitimately holds eight entries, so empty is not
+    available, and a bucket that CAN hold a correctly-recognised input is a
+    disposition rather than a residual pile. What holds instead is that the
+    gate's filter covers every kind the scanner is able to emit.
+
+    Enforced two ways, because the first alone is not enough. The filter is
+    imported from the scanner rather than repeated, so it cannot drift; and
+    every declared kind is witnessed below by a spelling that actually produces
+    it, so a kind cannot be declared, filtered and dead.
+    """
+    assert set(KIND_WITNESSES) == set(NON_WORD_KINDS), (
+        "the scanner declares kinds this test has no witness for, or vice "
+        f"versa: declared {sorted(NON_WORD_KINDS)!r}, witnessed "
+        f"{sorted(KIND_WITNESSES)!r}. A kind with no witness is a filter entry "
+        "nobody tests."
+    )
+
+
+@pytest.mark.parametrize("kind", sorted(KIND_WITNESSES), ids=lambda k: k.strip(": "))
+def test_each_kind_is_produced_and_survives_the_gate_filter(kind: str) -> None:
+    """The instrument reads it AND the gate acts on it, which are two claims.
+
+    The `composed: ` defect passed every test in this file while a concatenated
+    refusal was surfaced by the scanner and dropped by the gate, because the
+    only test that touched it asked whether the SCANNER saw it. This asks the
+    second question: does the site survive the filter the pin uses.
+    """
+    sites, names = _probe(KIND_WITNESSES[kind])
+    assert not names, f"{kind!r} witness produced a NAME, so it is the wrong witness: {names!r}"
+    assert sites, f"the scanner produced nothing for the {kind!r} witness"
+    of_kind = [s for s in sites if s.startswith(kind)]
+    assert of_kind, f"expected a {kind!r} site, got {sites!r}"
+    survives = [s for s in of_kind if s.startswith(NON_WORD_KINDS)]
+    assert survives == of_kind, (
+        f"a {kind!r} site does not survive the gate's filter, so the scanner "
+        "would see a new refusal of this shape and the pin would stay green: "
+        f"{of_kind!r}"
+    )
+
+
+def test_an_injected_composed_site_would_red_the_pin() -> None:
+    """END TO END, against the PIN rather than the scanner.
+
+    The distinction this test exists for: a site being visible to
+    `scan_refusal_literals` and a site reaching the pinned comparison are
+    different claims, and only the second is the gate. Measured by injection
+    into desk.py when this was fixed; asserted here so it stays fixed.
+    """
+    from refusal_scan import scan_refusal_literals
+
+    injected = (SRC / "desk.py").read_text(encoding="utf-8") + (
+        '\n\ndef _injected(x) -> str:\n'
+        '    return "refused: " + x.operator_detail\n'
+    )
+    scan = scan_refusal_literals(injected)
+    sites = tuple(
+        sorted(s for s in scan.forwarded if s.startswith(NON_WORD_KINDS))
+    )
+    assert sites != tuple(sorted(PINNED_NON_WORD_SITES)), (
+        "injecting a concatenated refusal into desk.py leaves the pinned set "
+        "unchanged, so the pin would not red and a new free-text refusal is "
+        "unforced"
+    )
+    assert any(s.startswith("composed: ") for s in sites), sites
+
+
+def test_no_undeclared_kind_escapes_the_scanner() -> None:
+    """The third leg, and without it the other two do not close.
+
+    The argument the gate rests on is a containment chain:
+
+      every site the scanner EMITS carries a DECLARED kind   (this test)
+      the gate's filter IS the declaration                   (imported, not copied)
+      therefore every emitted site reaches the pin
+
+    Leg one is what this test adds. Without it, the first two are satisfied by
+    a scanner that emits `"weird: ..."` with a raw literal: the declaration
+    would not list it, the filter would therefore not cover it, and the gate
+    would be blind again for a new reason while every other test here passed.
+    That is the same defect as the `composed: ` one, displaced from the filter
+    to the emitter, which is exactly where a fix that only touched the filter
+    would leave it.
+
+    Checked over the real modules AND over every witness, since a kind can be
+    unreachable in today's source and reachable from a probe.
+    """
+    from refusal_scan import scan_refusal_literals
+
+    sources = {
+        "desk.py": (SRC / "desk.py").read_text(encoding="utf-8"),
+        "engine.py": (SRC / "engine.py").read_text(encoding="utf-8"),
+    }
+    for kind, line in KIND_WITNESSES.items():
+        sources["witness " + kind.strip(": ")] = (
+            _PROBE_STUB + "\n\ndef _w(x) -> str:\n    " + line + "\n"
+        )
+
+    offenders = {}
+    for where, text in sources.items():
+        for site in scan_refusal_literals(text).forwarded:
+            if not site.startswith(NON_WORD_KINDS):
+                offenders.setdefault(where, []).append(site)
+
+    assert not offenders, (
+        "scan_refusal_literals emitted a site whose kind is not in "
+        f"NON_WORD_KINDS, so the gate's filter cannot cover it: {offenders!r}. "
+        "Either declare the kind (and add a witness) or stop emitting it."
     )
