@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import os
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -214,37 +215,82 @@ def test_the_retry_window_cannot_delay_a_tick() -> None:
         "cannot be reached here. This case runs on the windows-latest leg."
     ),
 )
-def test_the_heartbeat_lands_while_a_reader_holds_the_destination(
+def test_the_heartbeat_lands_once_a_transient_reader_lets_go(
     tmp_path: Path,
 ) -> None:
-    """The defect itself, with a held handle rather than a raised exception.
+    """The defect itself, with a REAL handle, and the handle must let go.
 
-    Carries its own positive control: the raw `os.replace` must be REFUSED
-    while the handle is held. Without that, a green here could mean the
-    platform no longer refuses and the test caught nothing.
+    THE FIRST VERSION OF THIS TEST WAS WRONG AND ONLY THE WINDOWS RUNNER COULD
+    SAY SO, which is the whole reason straightedge#242 asked for this leg. It
+    held the handle across the entire call, so the retry spun for its full
+    window against a reader that never released and then re-raised, exactly as
+    `test_the_window_is_bounded_and_then_the_tick_is_allowed_to_fail` requires
+    it to. The test asserted the fix would do something the fix must NOT do.
+
+    The defect is a transient READ racing a write, measured at one occurrence
+    in two weeks against a 15 second cadence, not a reader that keeps the file.
+    A retry absorbs a race; nothing can absorb a permanent hold, and a retry
+    that tried would convert a rare dropped tick into a stopped desk. So the
+    two cases are split and both are asserted: a hold that outlasts the window
+    SURFACES (that test, driven by a raise, which is all a raise can do), and a
+    hold that lets go is ABSORBED (this one, driven by a real handle).
+
+    The holder releases only AFTER the positive control has observed a real
+    refusal, so this cannot pass by the conflict never having happened, and the
+    elapsed time is asserted to prove the write WAITED rather than succeeding
+    on its first attempt.
     """
     engine = _engine(tmp_path)
     dest = watchdog.heartbeat_path_for(engine.journal.path)
     engine._write_heartbeat()
     first = dest.read_text(encoding="utf-8")
 
-    with open(dest, "r", encoding="utf-8") as holder:
-        holder.read()
+    holding = threading.Event()
+    may_release = threading.Event()
+    released = threading.Event()
+    hold_s = 0.05
 
-        # POSITIVE CONTROL: this platform must still refuse a bare replace
-        # onto a destination held open without FILE_SHARE_DELETE.
-        decoy = tmp_path / "decoy.tmp"
-        decoy.write_text("decoy", encoding="utf-8")
-        with pytest.raises(PermissionError):
-            os.replace(decoy, dest)
+    def hold() -> None:
+        with open(dest, "r", encoding="utf-8") as fh:
+            fh.read()
+            holding.set()
+            # Keep the handle until the main thread has PROVEN the platform
+            # refuses, then a little longer so the first retry attempt inside
+            # `_write_heartbeat` is refused for real.
+            may_release.wait(timeout=5.0)
+            time.sleep(hold_s)
+        released.set()
 
-        # AND the heartbeat still publishes, which is the fix.
-        time.sleep(0.01)
-        engine._write_heartbeat()
+    reader = threading.Thread(target=hold, name="se242-holder", daemon=True)
+    reader.start()
+    assert holding.wait(timeout=5.0), "the holding thread never opened the file"
 
+    # POSITIVE CONTROL: with the handle held, this platform must refuse a bare
+    # replace onto the destination. If it ever stops refusing, this test can no
+    # longer measure anything and says so here rather than passing quietly.
+    decoy = tmp_path / "decoy.tmp"
+    decoy.write_text("decoy", encoding="utf-8")
+    with pytest.raises(PermissionError):
+        os.replace(decoy, dest)
+
+    may_release.set()
+    started = time.monotonic()
+    engine._write_heartbeat()
+    elapsed = time.monotonic() - started
+    reader.join(timeout=5.0)
     engine.stop()
+
+    assert released.is_set(), "the holding thread did not finish"
     assert dest.read_text(encoding="utf-8") != first, (
-        "the heartbeat did not advance while a reader held the destination"
+        "the heartbeat did not advance after the reader let go"
+    )
+    assert elapsed >= hold_s / 2, (
+        f"the write took {elapsed:.3f}s, which is too fast to have been "
+        "refused and retried; the conflict may not have occurred"
+    )
+    assert elapsed < HEARTBEAT_REPLACE_RETRY_SECONDS * 4, (
+        f"the write took {elapsed:.3f}s against a "
+        f"{HEARTBEAT_REPLACE_RETRY_SECONDS}s window"
     )
 
 
