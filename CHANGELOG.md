@@ -90,10 +90,14 @@ the breach printed but not journaled.
 
 **One mutation was run and is NOT in that list, because it cannot fire.**
 Replacing the RESTORE's own `max(self._hb_gap_ever_s, float(raw))` with a plain
-assignment leaves the whole suite green (1394 passed), and correctly so: the
-restore happens once, before any live write, when the carried figure is still
-`0.0`, and a gap is never negative, so the two forms cannot be told apart by
-any reachable input. That `max` is defensive rather than load-bearing. The
+assignment leaves the whole suite green, at the SAME count as the unmutated run,
+and correctly so: the restore happens once, before any live write, when the
+carried figure is still `0.0`, and a gap is never negative, so the two forms
+cannot be told apart by any reachable input. The claim is that the two runs
+AGREE, so it carries no absolute count: a count is the only part of it that can
+rot, it says nothing about whether the mutant fired, and a reader can still
+check the claim by running both and comparing (straightedge#218). That `max` is
+defensive rather than load-bearing. The
 load-bearing one is in the WRITER, where the live process's own observation is
 folded in, and dropping THAT reds four tests. An earlier draft of this entry
 described the equivalent one as though it were the proof, which would have

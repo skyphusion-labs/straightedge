@@ -3030,7 +3030,24 @@ class Engine:
         chain at its own observations, and `watchdog.decide` says so rather
         than reading the absence as a clean history. The figure is never lower
         than what this process has itself observed, so it is always a true
-        lower bound on the box's history and never an invented one.
+        lower bound on every reading this desk WROTE.
+
+        IT IS NOT A LOWER BOUND ON WHAT THIS DESK READ, and an earlier version
+        of this paragraph claimed it was ("never an invented one"), which was
+        false. straightedge#218 measured the damaged cases. `garbage`, `nan`,
+        `-5`, an empty value and anything else that will not parse or will not
+        survive `max` are discarded, and the chain restarts from this process's
+        own observation, which is the behaviour the claim describes. **A
+        non-finite value is not**: `inf` parses, survives `max`, is published
+        as `inf`, sets `over_budget_ever=1`, makes `watchdog.decide` tell the
+        operator this BOX has breached its budget, and STICKS, because every
+        later write folds it with `max`. Only deleting the heartbeat clears it.
+        That is a breach claim no process observed, so for a DAMAGED file the
+        figure can be an invented one. All three properties are pinned by
+        `tests/test_the_damaged_box_figure_and_the_both_over_note.py`, and
+        whether this path should REFUSE a non-finite value is a behaviour
+        change on a live operator surface, so it is straightedge#328 rather
+        than taken there.
 
         Once per process: the first heartbeat write restores, and every later
         one only grows the figure. It happens HERE rather than in `start()` so
