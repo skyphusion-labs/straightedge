@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import json
 import re
+from dataclasses import dataclass
 from pathlib import Path
 
 from straightedge.broker.paper import PaperBroker
@@ -96,6 +97,30 @@ def _turn(engine: Engine) -> dict:
     return rows[-1]
 
 
+@dataclass(frozen=True)
+class GrowthRate:
+    """What an exempt diagnostic row's size is a function OF, and how steeply.
+
+    #236's ruling: a diagnostic gets a documented growth RATE rather than the
+    512 byte constant, because its size is a property of the operator's book
+    rather than of anything a model can say. A constant would be a lie and an
+    exemption with prose beside it is discipline rather than a gate: a review
+    measured that a row exempted with an EMPTY reason passed, so the entry
+    carries numbers that are checked instead of a sentence that is not.
+
+    `population` names WHICH count the row scales with, and the two are not the
+    same question. `history_preflight` grows with every CONFIGURED symbol, so
+    it is a property of the operator's book and it is stable. The prose row
+    grows with the UNUSABLE ones, which is near zero on a healthy desk and
+    spikes to the whole book during exactly the incident somebody is reading
+    the row to understand. Documenting one rate for both would hide that.
+    """
+
+    population: str
+    bytes_per_item: int
+    why: str
+
+
 #: Rows that DO exceed the bound and carry no model-chosen content, each with
 #: what it scales with, so the exemption is a decision on the record rather
 #: than a hole. Measured on this fixture's four-symbol book:
@@ -108,9 +133,37 @@ def _turn(engine: Engine) -> dict:
 #: A row that exceeds the bound and is NOT in this map fails, so a new row on
 #: the advice path has to be classified by a person.
 ROWS_EXEMPT_FROM_THE_BOUND = {
-    "history_preflight": "one entry per configured symbol",
-    "history_unavailable": "our own prose, a paragraph per unusable symbol",
+    "history_preflight": GrowthRate(
+        population="configured",
+        bytes_per_item=200,
+        why="one entry per configured symbol: bars, needed, attempts, status, "
+        "history_error, ATR",
+    ),
+    "history_unavailable": GrowthRate(
+        population="unusable",
+        bytes_per_item=250,
+        why="our own prose, a paragraph per unusable symbol",
+    ),
 }
+
+
+def bad_exemptions(entries: dict[str, GrowthRate]) -> list[str]:
+    """Every exemption entry that does not state a checkable rate, and why.
+
+    ONE checker, called by `_assert_every_row_in_bound` and by the control
+    below, because a control that re-implements the rule proves the control
+    rather than the rule. #236's ruling named this hole: a row exempted with an
+    EMPTY reason passed, so prose beside a name was discipline and not a gate.
+    """
+    out: list[str] = []
+    for name, rate in entries.items():
+        if rate.population not in POPULATIONS:
+            out.append(f"{name}: population {rate.population!r} is not measured")
+        if rate.bytes_per_item <= 0:
+            out.append(f"{name}: no growth rate")
+        if not rate.why.strip():
+            out.append(f"{name}: no reason")
+    return out
 
 
 def _assert_every_row_in_bound(engine: Engine) -> None:
@@ -155,6 +208,18 @@ def _assert_every_row_in_bound(engine: Engine) -> None:
                 f"the exempt row {row.get('event')!r} is carrying model-chosen "
                 "text, so its exemption no longer holds"
             )
+
+    # EVERY EXEMPTION CARRIES NUMBERS THAT ARE CHECKED. A review measured that
+    # an entry with an EMPTY reason passed, so prose beside a name was never a
+    # gate. The rate itself is asserted in both directions by
+    # `test_the_documented_growth_rate_is_the_measured_one`; this is the
+    # cheaper half, that nothing can be exempted without stating what it scales
+    # with and how steeply.
+    broken = bad_exemptions(ROWS_EXEMPT_FROM_THE_BOUND)
+    assert not broken, (
+        "an exemption from the row bound does not state what it scales with: "
+        f"{broken!r}"
+    )
 
     # And a name in the map that no longer appears is a stale exemption, which
     # would quietly widen the hole as rows are renamed.
@@ -427,6 +492,218 @@ def test_a_400_digit_ticket_does_not_raise_out_of_the_handler(
     assert reply, "the handler returned nothing, so something escaped"
     assert _turn(engine)["ticket"] is None
     engine.stop()
+
+
+#: The two counts an exempt diagnostic can scale with. Named rather than
+#: inferred, because which population a row grows with is the part a reader
+#: gets wrong: one is the operator's book and the other is how much of it is
+#: broken right now.
+POPULATIONS = ("configured", "unusable")
+
+#: How far the measured rate may sit under the documented one before the
+#: document is called generous. Both directions matter: too LOW a document reds
+#: when a field is added (the point), and too HIGH a document would let a row
+#: grow by half again with nothing saying so, or let the row quietly stop
+#: carrying its per-symbol detail.
+RATE_TOLERANCE = 0.70
+
+
+def _diagnostic_row_sizes(
+    tmp_path: Path, symbols: int, usable: int = 1
+) -> dict[str, int]:
+    """The two diagnostic rows' sizes for a book of `symbols`, `usable` seeded.
+
+    THE TWO COUNTS MOVE INDEPENDENTLY, which is the whole reason this takes two
+    arguments. Seeding bars for `usable` of them makes `configured` equal
+    `symbols` and `unusable` equal `symbols - usable`, so a test can hold one
+    population still and vary the other. With only ever one symbol seeded the
+    two counts differ by a constant, their SLOPES are identical, and a row
+    exempted against the wrong population would pass: measured, and it is why
+    this signature is not the simpler one.
+    """
+    names = ["EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCHF", "USDCAD", "NZDUSD"]
+    while len(names) < symbols:
+        names.append(f"SYM{len(names):03d}")
+    cfg = BotConfig()
+    cfg.journal_path = str(tmp_path / "j.jsonl")
+    cfg.session.enabled = False
+    cfg.risk.halt_file = str(tmp_path / "HALT")
+    cfg.symbols = names[:symbols]
+    broker = PaperBroker(balance=10_000)
+    for n, name in enumerate(cfg.symbols[:usable]):
+        broker.seed_bars(
+            name, generate_bars(120, drift=0.0004, vol=0.0002, seed=3 + n)
+        )
+    engine = Engine(cfg, broker, halt_dir=str(tmp_path), advisor=None)
+    engine.start()
+    sizes = {}
+    for row in engine.journal.tail(5000):
+        event = row.get("event")
+        if event in ROWS_EXEMPT_FROM_THE_BOUND:
+            sizes[event] = max(
+                sizes.get(event, 0), len(json.dumps(row, sort_keys=True))
+            )
+    engine.stop()
+    return sizes
+
+
+def _population_pairs(tmp_path: Path) -> dict[str, tuple[dict, dict, int]]:
+    """For each population, two books in which ONLY that count moves.
+
+    This is what makes the `population` field on an exemption load-bearing
+    rather than decorative. A pair where both counts move by the same amount
+    gives both populations the same slope, so a row declared against the wrong
+    one passes: measured, by mutation, and it is why the fixtures are built per
+    population instead of once.
+
+      configured: 8 symbols / 1 seeded  ->  24 symbols / 17 seeded   (+16, +0)
+      unusable:  24 symbols / 17 seeded ->  24 symbols / 1 seeded    (+0, +16)
+    """
+    small_book = _diagnostic_row_sizes(tmp_path / "small-book", symbols=8, usable=1)
+    wide_book = _diagnostic_row_sizes(tmp_path / "wide-book", symbols=24, usable=17)
+    broken_book = _diagnostic_row_sizes(tmp_path / "broken-book", symbols=24, usable=1)
+    return {
+        "configured": (small_book, wide_book, 16),
+        "unusable": (wide_book, broken_book, 16),
+    }
+
+
+def test_the_documented_growth_rate_is_the_measured_one(tmp_path: Path) -> None:
+    """#236. A diagnostic has a documented RATE, and it is checked both ways.
+
+    The 512 byte bound was never true of these rows: `history_preflight`
+    measured 876 bytes and `history_unavailable` 1108 on a four-symbol book,
+    and both grow linearly with the book. Summarising them was considered and
+    rejected on measurement, because the row repeats no boilerplate: the
+    "check the symbol name" advice is written once and every other byte is a
+    per-symbol fact, so a summary could only delete facts, and only during the
+    incident that makes somebody read the row.
+
+    So the contract states a rate PER POPULATION, and this is the gate. Each
+    row's slope is measured on the pair of books where its OWN declared
+    population moves and the other is held, which is what makes that field
+    checkable: a row declared against the wrong population is measured where it
+    does not move, and fails the lower bound.
+
+    BOTH DIRECTIONS, which is the half an exemption never had:
+
+    * measured <= documented, so a field added to the per-symbol entry reds
+      here rather than quietly making every row bigger;
+    * measured >= documented * RATE_TOLERANCE, so the document cannot be set
+      generously to stop reding, and a row that STOPS carrying its per-symbol
+      detail also reds instead of passing a ceiling it no longer approaches.
+    """
+    pairs = _population_pairs(tmp_path)
+
+    for event, rate in ROWS_EXEMPT_FROM_THE_BOUND.items():
+        a, b, delta = pairs[rate.population]
+        assert event in a and event in b, (
+            f"{event!r} was not written at both ends of the {rate.population!r} "
+            f"pair, so no slope can be measured: {a!r} {b!r}"
+        )
+        slope = (b[event] - a[event]) / delta
+        assert slope <= rate.bytes_per_item, (
+            f"{event!r} grows at {slope:.0f} bytes per {rate.population} symbol, "
+            f"over the documented {rate.bytes_per_item}. Either a field was "
+            "added to the per-symbol entry, in which case raise the documented "
+            "rate in docs/CONTRACT.md deliberately, or the row gained "
+            "something that does not belong in it."
+        )
+        assert slope >= rate.bytes_per_item * RATE_TOLERANCE, (
+            f"{event!r} grows at only {slope:.0f} bytes per {rate.population} "
+            f"symbol against a documented {rate.bytes_per_item}. Either it does "
+            "not scale with that population at all, or the row stopped carrying "
+            "its per-symbol detail, or the documented rate is generous enough "
+            "that it could never red."
+        )
+
+
+def test_each_row_responds_to_ITS_population_and_not_the_other(
+    tmp_path: Path,
+) -> None:
+    """The distinction the ruling asked for, and the reason it needs a test.
+
+    `history_preflight` grows with the operator's whole BOOK and is stable.
+    `history_unavailable` grows with the UNUSABLE count, which is near zero on
+    a healthy desk and spikes to the whole book during exactly the incident
+    somebody is reading the row to understand. One documented rate for both
+    would hide that.
+
+    FOUND BY MUTATION: declaring the prose row against `configured` instead of
+    `unusable` passed, because with one symbol seeded the two counts differ by
+    a constant and their slopes are identical. A claim about WHICH population a
+    row scales with is only testable if the two can move independently, so this
+    holds one still and varies the other.
+
+    * configured 8 -> 24 with unusable held at 7: preflight must grow, the
+      prose row must not.
+    * unusable 7 -> 23 with configured held at 24: the prose row must grow,
+      preflight must not.
+    """
+    #: Held-still is not expected to be byte-identical: the fixed head of each
+    #: row carries counts that gain digits. A response under this many bytes
+    #: per item is "did not scale with it".
+    flat = 20
+
+    base = _diagnostic_row_sizes(tmp_path / "a", symbols=8, usable=1)
+    wider_book = _diagnostic_row_sizes(tmp_path / "b", symbols=24, usable=17)
+    more_broken = _diagnostic_row_sizes(tmp_path / "c", symbols=24, usable=1)
+
+    pre_per_configured = (wider_book["history_preflight"] - base["history_preflight"]) / 16
+    prose_per_configured = (
+        wider_book["history_unavailable"] - base["history_unavailable"]
+    ) / 16
+    pre_per_unusable = (
+        more_broken["history_preflight"] - wider_book["history_preflight"]
+    ) / 16
+    prose_per_unusable = (
+        more_broken["history_unavailable"] - wider_book["history_unavailable"]
+    ) / 16
+
+    assert pre_per_configured > flat, (
+        f"history_preflight gained only {pre_per_configured:.0f} bytes per "
+        "configured symbol, so it does not scale with the book as documented"
+    )
+    assert abs(prose_per_configured) < flat, (
+        f"history_unavailable moved {prose_per_configured:.0f} bytes per "
+        "configured symbol while the unusable count was held, so it is not "
+        "the unusable count it scales with"
+    )
+    assert prose_per_unusable > flat, (
+        f"history_unavailable gained only {prose_per_unusable:.0f} bytes per "
+        "unusable symbol, so it does not scale with the incident as documented"
+    )
+    assert abs(pre_per_unusable) < flat, (
+        f"history_preflight moved {pre_per_unusable:.0f} bytes per unusable "
+        "symbol while the book was held, so it is not the book it scales with"
+    )
+
+
+def test_an_exemption_cannot_be_claimed_without_a_rate_and_a_reason(
+    tmp_path: Path,
+) -> None:
+    """The empty-reason hole, closed. A review measured that it passed.
+
+    `_assert_every_row_in_bound` now checks every entry in the map, so this
+    drives the check against deliberately broken entries rather than waiting
+    for somebody to add one. Each of the three must be rejected: an unknown
+    population, a zero rate, and a blank reason.
+    """
+    del tmp_path
+    # Run the REAL checker, the one `_assert_every_row_in_bound` calls, against
+    # deliberately broken entries. Re-implementing the predicate here would
+    # test this test.
+    for bad, why in (
+        (GrowthRate(population="vibes", bytes_per_item=200, why="x"), "unknown population"),
+        (GrowthRate(population="configured", bytes_per_item=0, why="x"), "zero rate"),
+        (GrowthRate(population="configured", bytes_per_item=200, why="   "), "blank reason"),
+    ):
+        assert bad_exemptions({"row": bad}), (
+            f"an exemption with a {why} would be accepted: {bad!r}"
+        )
+    # And the real map must come back clean, so the control is measuring the
+    # breakage rather than a checker that always finds something.
+    assert not bad_exemptions(ROWS_EXEMPT_FROM_THE_BOUND)
 
 
 # --- 3. the controls: nothing that fits is reshaped ------------------------
