@@ -197,6 +197,81 @@ VENUE_CLOCK_BAR_SLACK_SEC = 1
 #: built from it must not collide with "nothing recorded".
 _CLOCK_UNRECORDED: tuple[Any, ...] = ("unrecorded",)
 
+#: How long `_write_heartbeat` keeps retrying a `replace` that a concurrent
+#: READER refused, before it gives up and lets the tick fail (straightedge#242).
+#:
+#: Sized by what the TICK can afford, not by how long the conflict lasts. A
+#: reader of this file holds its handle for microseconds, so 0.5s at a 20ms
+#: spin is 25 attempts and generous by orders of magnitude; what it must never
+#: do is delay the next tick, so it stays far below the smallest plausible
+#: `poll_seconds` (a test pins that relationship rather than leaving it to this
+#: comment). A reader that holds the file for longer than this is a DIFFERENT
+#: problem, a scanner pinning the path rather than a read racing a write, and
+#: that one should surface as a `loop_error` rather than be absorbed in silence.
+HEARTBEAT_REPLACE_RETRY_SECONDS = 0.5
+
+#: The spin, matching `broker/mt4_live.py`'s established figure rather than
+#: inventing a second one for the same class of wait.
+_HEARTBEAT_REPLACE_SPIN_SECONDS = 0.02
+
+
+def _replace_retrying_on_share_conflict(
+    tmp: Path, dest: Path, *, window_s: float = HEARTBEAT_REPLACE_RETRY_SECONDS
+) -> None:
+    """`tmp.replace(dest)`, retried while a concurrent reader refuses it.
+
+    straightedge#242, found by a live read of the deployed desk and never by
+    the suite:
+
+        [WinError 5] Access is denied:
+        'C:\\bot-state\\journal.heartbeat.tmp' -> 'C:\\bot-state\\journal.heartbeat'
+
+    THE MECHANISM. On Windows `MoveFileEx(..., MOVEFILE_REPLACE_EXISTING)`
+    fails with `ERROR_ACCESS_DENIED` when the destination is open in a process
+    that did not ask for `FILE_SHARE_DELETE`, and CPython's ordinary `open()`
+    does not ask for it. So ANY concurrent reader of the heartbeat makes this
+    replace fail for as long as it holds the handle, and `watchdog.read` is
+    such a reader. On POSIX a rename over an open file succeeds, which is why
+    no amount of local testing reaches this.
+
+    WHICH READER HELD THE HANDLE IS NOT MEASURED, and this does not claim one.
+    A scheduled `watchdog.read` is the likeliest candidate on the deployed box,
+    but a scanner is equally capable of it and the `.tmp` file is also a scan
+    target. The fix is correct whichever it was, which is the argument for it:
+    it does not depend on identifying the culprit. Do not let a later reader
+    turn this comment into an accusation.
+
+    NARROW ON PURPOSE: `PermissionError` only, never a bare `OSError`, and
+    never a check on the message. `broker/mt4_live.py` already ruled that a
+    retry policy must not depend on error wording, and a bare `OSError` here
+    would absorb a full disk, a vanished directory and a revoked ACL, all of
+    which are states waiting cannot fix. A test drives a non-`PermissionError`
+    through this to prove it propagates on the FIRST attempt.
+
+    THE SAME CLASS IS ALREADY HANDLED ONE MODULE OVER, in
+    `broker/mt4_live.py`'s `_atomic_write` and `_retry_unlink`, in this shape
+    and at this spin. The mailbox path retried and the liveness path did not;
+    this closes that asymmetry rather than inventing a policy. The two loops
+    are deliberately NOT yet unified: the mailbox is the interface a customer
+    installs against, so a shared helper is a separate change with its own
+    reasoning, not a side effect of a heartbeat fix.
+
+    WHAT THIS DOES NOT COVER, said out loud so nobody reads it as covered: the
+    `tmp.write_text` that precedes this call can also meet a `PermissionError`
+    if a scanner holds the `.tmp` path open for writing. That is unobserved,
+    so it is not handled here; a second instance would be evidence, and a
+    retry installed on an unobserved path is a guard nobody can red.
+    """
+    deadline = time.monotonic() + window_s
+    while True:
+        try:
+            tmp.replace(dest)
+            return
+        except PermissionError:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(_HEARTBEAT_REPLACE_SPIN_SECONDS)
+
 
 class Engine:
     def __init__(
@@ -2858,7 +2933,10 @@ class Engine:
             encoding="utf-8",
         )
         os.chmod(tmp, 0o600)
-        tmp.replace(dest)
+        # NOT a bare `tmp.replace(dest)`: on Windows a concurrent reader of the
+        # heartbeat makes that fail, which aborted the whole tick
+        # (straightedge#242). The helper says why, and how narrowly.
+        _replace_retrying_on_share_conflict(tmp, dest)
 
     def _restore_gap_ever(self, dest: Path) -> None:
         """Carry the worst gap this BOX has seen across a restart. Once.
