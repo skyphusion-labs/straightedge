@@ -156,52 +156,40 @@ jobs:
           exit 0
       # Deploy-Desk.ps1 is PowerShell that cannot run on a Mac at all, so
       # without this its first execution would be against a live real-money
-      # box. A dry run proves it parses, that the preflight reads a real git
-      # checkout, and that it records a rollback point; it does not prove the
-      # task disable/enable or the checkout, which need a desk to stop.
-      - name: the deploy script's dry run, against a real checkout
+      # box. deploy/windows/Test-DeployScripts.ps1 holds the cases: the
+      # Invoke-Git stderr/failure pair, the stated version requirement driven
+      # from both sides, the abort-window resume judgement, the in-progress
+      # marker, and the Deploy-Desk.ps1 dry runs that used to be inline here.
+      # It does not prove the task disable/enable, the checkout, the reinstall
+      # or the stamp, which need a desk to stop; docs/DEPLOY.md says so.
+      #
+      # THE SHELL IS ITSELF THE FINDING (straightedge#274). Both Deploy-Desk
+      # steps that used to live here ran `shell: pwsh`, which is PowerShell 7,
+      # and PowerShell 7 does not turn native-command stderr into a terminating
+      # error at all. So this gate was structurally incapable of producing the
+      # red: a `git fetch` writing "From https://..." to stderr aborted the
+      # deploy on the box's Windows PowerShell 5.1 and passed here forever. The
+      # controls now run under BOTH shells, and the 5.1 leg is the one that
+      # reproduces the defect and would red a regression.
+      #
+      # 5.1 goes first because it is the shell the box has (`shell: powershell`
+      # is Windows PowerShell 5.1; `shell: pwsh` is 7.x). Separate work roots,
+      # so neither leg can satisfy the other leg's "changed nothing" assertions.
+      - name: deploy script controls on Windows PowerShell 5.1, the shell the box runs
+        shell: powershell
+        run: |
+          $python = (Get-Command python).Source
+          Write-Host "PSVersion for this step: $($PSVersionTable.PSVersion) ($($PSVersionTable.PSEdition))"
+          if ($PSVersionTable.PSEdition -eq "Core") { throw "this leg must be Windows PowerShell 5.1 (Desktop); it got Core, so the control that reproduces #274 cannot fire here" }
+          .\deploy\windows\Test-DeployScripts.ps1 -Repo "$PWD" -PythonExe $python -WorkRoot "$PWD\..\se-deploy-51"
+          if ($LASTEXITCODE -ne 0) { throw "the deploy script controls failed on Windows PowerShell 5.1, which is the shell the live box runs" }
+      - name: deploy script controls on PowerShell 7
         shell: pwsh
         run: |
           $python = (Get-Command python).Source
-          New-Item -ItemType Directory -Force -Path "$PWD\..\se-state" | Out-Null
-          $state = (Resolve-Path "$PWD\..\se-state").Path
-          Copy-Item config.example.toml (Join-Path $state "config.toml")
-          # No -BookIsFlat: the script must STOP at the judgement gate and exit
-          # 0, because stopping a live autonomous desk is not its decision.
-          .\deploy\windows\Deploy-Desk.ps1 -Ref HEAD -Repo "$PWD" -StateDir $state `
-            -ConfigPath (Join-Path $state "config.toml") -PythonExe $python `
-            -RecordDir (Join-Path $state "deploys")
-          if ($LASTEXITCODE -ne 0) { throw "the dry run without -BookIsFlat should exit 0 at the judgement gate, got $LASTEXITCODE" }
-          # With the gate passed it must traverse the rest without changing
-          # anything, because -Apply is still absent.
-          .\deploy\windows\Deploy-Desk.ps1 -Ref HEAD -Repo "$PWD" -StateDir $state `
-            -ConfigPath (Join-Path $state "config.toml") -PythonExe $python `
-            -RecordDir (Join-Path $state "deploys") -BookIsFlat
-          if ($LASTEXITCODE -ne 0) { throw "the full dry run failed: $LASTEXITCODE" }
-          if (Test-Path (Join-Path $state "journal.deployed.json")) { throw "a DRY RUN wrote the deploy stamp; -Apply is not gating writes" }
-          if (Test-Path (Join-Path $state "deploys")) { throw "a DRY RUN created the rollback record directory" }
-          Write-Host "dry run changed nothing, as it must"
-      - name: the deploy script REFUSES a state dir inside the checkout
-        shell: pwsh
-        run: |
-          # The negative control for the single most destructive mistake this
-          # procedure could make: a hard checkout with the live journal inside
-          # the tree would delete the audit log of every trade the desk has
-          # ever made. A refusal nobody has watched fire is not a refusal.
-          $python = (Get-Command python).Source
-          $inside = "$PWD\se-state-inside"
-          New-Item -ItemType Directory -Force -Path $inside | Out-Null
-          Copy-Item config.example.toml (Join-Path $inside "config.toml")
-          $ok = $false
-          try {
-            .\deploy\windows\Deploy-Desk.ps1 -Ref HEAD -Repo "$PWD" -StateDir $inside `
-              -ConfigPath (Join-Path $inside "config.toml") -PythonExe $python 2>&1 | Write-Host
-          } catch {
-            $ok = $true
-            Write-Host "refused as designed: $($_.Exception.Message)"
-          }
-          if (-not $ok) { throw "the script ACCEPTED a state dir inside the checkout, so the guard that protects the live journal cannot fire" }
-          Remove-Item -Recurse -Force $inside
+          Write-Host "PSVersion for this step: $($PSVersionTable.PSVersion) ($($PSVersionTable.PSEdition))"
+          .\deploy\windows\Test-DeployScripts.ps1 -Repo "$PWD" -PythonExe $python -WorkRoot "$PWD\..\se-deploy-7"
+          if ($LASTEXITCODE -ne 0) { throw "the deploy script controls failed on PowerShell 7" }
       - name: unregister
         if: always()
         shell: pwsh
