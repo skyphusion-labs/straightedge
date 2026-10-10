@@ -55,7 +55,6 @@ not a silent one.
 
 from __future__ import annotations
 
-import math
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -85,6 +84,11 @@ assert SECOND_GAP_S < MT4_BUDGET
 #: interpolates figures.
 PROCESS_NOTE = "the desk has observed a gap between ticks longer"
 BOX_NOTE = "this BOX has breached it before"
+#: The note straightedge#328 added, and the one the absence branch must NOT
+#: emit for a damaged figure: reading damage as an upgrade gap would tell the
+#: operator to start the chain here, which is the clean-history reading.
+DAMAGED_NOTE = "this box's history is UNREADABLE"
+NO_FIELD_NOTE = "this desk publishes no over_budget_ever"
 
 
 def _damaged_prior(raw: str) -> str:
@@ -198,29 +202,40 @@ def test_a_damaged_box_figure_does_not_stop_the_heartbeat_being_written(
     )
 
 
-def test_a_non_finite_box_figure_carries_through_and_sticks(
+def test_a_non_finite_box_figure_is_published_as_damaged_and_claims_nothing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """`inf` is the ONE damaged input that persists, so it is the one pinned.
+    """straightedge#328, and this test used to pin the OPPOSITE on purpose.
 
-    Three properties, measured rather than quoted, and all three are the
-    CURRENT behaviour being recorded rather than endorsed:
+    It pinned `inf` carrying through, publishing as `inf`, setting
+    `over_budget_ever=1` and making the watcher tell the operator the BOX had
+    breached. That was recorded rather than endorsed, and straightedge#328
+    decided against it: a breach claim no process observed, on the surface an
+    operator reads to judge whether `UNBOUNDED_TAIL_ALLOWANCE` is too tight.
 
-    1. `inf` parses, survives `max`, and is published as `inf`;
-    2. it STICKS: a second process folds it with `max` and it never comes down,
-       so only deleting the heartbeat clears it;
-    3. it sets `over_budget_ever=1` and makes the watcher tell the operator the
-       BOX breached, which is a claim no process ever observed.
+    What is pinned now, and the shape chosen was TWO of the three on the issue
+    because they close different directions:
 
-    FAILS IF: any of the three changes, in either direction. A refactor that
-    normalised `inf` away would red this and have to say so, and so would one
-    that made it refuse. That is the point of pinning a behaviour nobody is
-    defending: the next change to it is deliberate.
+    1. the non-finite figure is refused AT THE WRITE, so nothing non-finite is
+       ever published whatever its source, and it is published as `damaged`
+       rather than dropped;
+    2. `over_budget_ever` is `damaged` too, because a figure that is not a
+       measurement cannot answer whether the box breached, and publishing `1`
+       or `0` from it would invent the answer in one direction or the other;
+    3. the watcher says the history is UNREADABLE, and says neither of the two
+       things it could otherwise say;
+    4. the PER-PROCESS pair is untouched, which was already true and is the
+       property that would make a regression here worse than the defect;
+    5. it still STICKS across a restart, because the box history really is
+       unrecoverable, and deleting the heartbeat is still the one way out.
 
-    `_restore_gap_ever`'s docstring claimed the figure is "never an invented
-    one". Property 3 is an invented one, the docstring is corrected in this
-    change, and the behaviour question is straightedge#328 rather than being
-    decided inside an issue whose scope is two tests and no behaviour change.
+    THE SHAPE THAT WAS REFUSED, recorded so the next reader does not re-propose
+    it: refusing the non-finite at the RESTORE instead. That is a smaller change
+    and it makes `_restore_gap_ever`'s original claim true, but it converts a
+    damaged file into a CLEAN box history, and reading absence as clean is the
+    one thing straightedge#190 refuses everywhere else.
+
+    FAILS IF: any of the five changes in either direction.
     """
     import straightedge.engine as engine_mod
 
@@ -232,24 +247,41 @@ def test_a_non_finite_box_figure_carries_through_and_sticks(
 
     _run_with_gap(cfg, tmp_path, clock, FIRST_GAP_S)
     first = dict(_fields(cfg))
-    assert math.isinf(float(first["tick_gap_ever_s"])), (
-        f"inf did not carry through: {first['tick_gap_ever_s']!r}"
+    assert first["tick_gap_ever_s"] == watchdog.DAMAGED, (
+        "a non-finite box figure must be published as "
+        f"{watchdog.DAMAGED!r}, not as a number: {first['tick_gap_ever_s']!r}"
     )
-    assert first["over_budget_ever"] == "1"
-    assert BOX_NOTE in _report(cfg).text
+    assert first["over_budget_ever"] == watchdog.DAMAGED, (
+        "the breach flag derived from a non-measurement must not claim an "
+        f"answer in either direction: {first['over_budget_ever']!r}"
+    )
 
-    # A SECOND process on the SAME box, with a fresh monotonic clock. If `inf`
-    # came down here it would not stick, and property 2 would be wrong.
+    text = _report(cfg).text
+    assert DAMAGED_NOTE in text, "the operator was not told the history is unreadable"
+    assert BOX_NOTE not in text, (
+        "the watcher claimed this BOX breached, off a figure no process observed"
+    )
+    assert NO_FIELD_NOTE not in text, (
+        "the watcher read the damage as an upgrade gap, which tells the operator "
+        "to start the chain here and is the clean-history reading #190 refuses"
+    )
+
+    # A SECOND process on the SAME box, with a fresh monotonic clock. The damage
+    # must STICK: the box history really is unrecoverable, so a restart must not
+    # quietly turn it into a clean one.
     clock[0] = 0.0
     _run_with_gap(cfg, tmp_path, clock, SECOND_GAP_S)
     second = dict(_fields(cfg))
-    assert math.isinf(float(second["tick_gap_ever_s"])), (
-        "inf did not survive the restart, so it does not stick: "
-        f"{second['tick_gap_ever_s']!r}"
+    assert second["tick_gap_ever_s"] == watchdog.DAMAGED, (
+        "the damage did not survive the restart, so a restart launders a "
+        f"damaged box history into a clean one: {second['tick_gap_ever_s']!r}"
     )
     assert second["tick_gap_max_s"] == str(SECOND_GAP_S), (
         "the PER-PROCESS figure was contaminated too, which would be a "
-        "different and worse defect than the one being pinned"
+        "different and worse defect than the one being fixed"
+    )
+    assert second["over_budget"] == "0", (
+        "the per-process breach flag was contaminated by the damaged box figure"
     )
 
     # Deleting the file is the documented way out, and that is asserted rather

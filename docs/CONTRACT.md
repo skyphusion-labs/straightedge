@@ -560,9 +560,34 @@ the row does not exist: `tick_gap_ever_s` still answers whether this box has
 ever breached, and the count of occurrences is short by this much. The journal
 row is attempted on up to three ticks before the record is declared lost; an
 unbounded retry would sit in the latency path the record exists to explain.
-A desk too old to publish `over_budget_ever` leaves the box history UNKNOWN. A
-reader says so and does NOT read the missing field as a clean history, the same
-rule this file already states for a missing `stale_after_s`.
+Both box fields carry a third value, `damaged`, and it is not a number
+(straightedge#328). A heartbeat is an input from outside the process, and a
+damaged one can hold a value that parses and survives `max` but is not a
+measurement: `inf`, `Infinity` and `1e400` all become `inf` through `float`.
+Published as a number that would be a breach claim NO PROCESS OBSERVED, on the
+surface an operator reads to judge whether the derived allowance is too tight,
+and it would stick, because every later write folds it with `max`.
+So a non-finite figure is refused at the WRITE and both box fields publish
+`damaged`: `tick_gap_ever_s=damaged over_budget_ever=damaged`. `over_budget_ever`
+is `damaged` as well, and that is deliberate rather than tidy, because a figure
+that is not a measurement cannot answer whether the box breached and publishing
+`1` or `0` from it would invent the answer in one direction or the other.
+`damaged` is carried ACROSS restarts for the same reason the figure itself is:
+the box history really is unreadable, and a restart must not launder it into a
+clean one. Deleting `journal.heartbeat` is still the one way out, and it still
+discards the box history, so the only remedy destroys what is being remedied;
+do it deliberately and not as routine cleanup.
+A reader MUST distinguish `damaged` from a MISSING field. A desk too old to
+publish `over_budget_ever` leaves the box history UNKNOWN, and a reader says so
+and does NOT read the missing field as a clean history, the same rule this file
+already states for a missing `stale_after_s`. `damaged` is a different fact:
+the field is present and its value is unreadable. "No history yet" and "history
+destroyed" lead an operator to different actions, which is why `damaged` is its
+own word and not the `unmeasured` this file uses for `deployed`.
+The PER-PROCESS pair is unaffected in every case. `tick_gap_max_s` and
+`over_budget` come from this process's own monotonic readings, which have no
+path from a file, and they keep measuring this process while the box pair reads
+`damaged`.
 Every breach also appends a `tick_gap_breach` journal record carrying `gap_s`,
 `budget_s`, `symbols` and `run_id`, once per process per breach. The heartbeat
 holds the worst gap; the journal is what can answer how OFTEN. The journal is
