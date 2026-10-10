@@ -763,6 +763,24 @@ an earlier order's outcome was never established.
 A standing money question that stops being announced is one that gets forgotten.
 The ledger keeps 64 open entries. Past that the OLDEST are dropped.
 
+### A value the desk could not read
+
+A number the desk could not use is written as text, not as a number. You
+see `"sl": "nonfinite:inf"` instead of a price, and the row also lists
+the fields it did this to:
+
+    {"event": "advice_turn", "sl": "nonfinite:inf", "nonfinite": ["sl"]}
+
+This means the AI sent something that cannot be a price. The desk did not
+trade on it. The row keeps what was sent so you can see it later.
+
+Do not read `nonfinite:inf` as a very large price. It is not a price at
+all. If you see it often, the problem is the AI reply, not the desk.
+
+If a row says `unencodable`, the desk could not write that row in full. It
+still wrote the event name and the reason. Report that row; it should not
+happen.
+
 ### The journal records
 
 | Event | Written when | Money state |
