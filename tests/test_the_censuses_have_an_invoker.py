@@ -109,6 +109,28 @@ def test_every_elapsed_time_assertion_is_marked_timing() -> None:
     )
 
 
+def _new_blind_seam_message(new: list[str]) -> str:
+    """The text a reader is shown when a new blind seam lands.
+
+    A FUNCTION rather than an inline f-string so the property "this message
+    carries the narrowed claim" can be asserted by CALLING it. The gate it
+    belongs to only reds when a new blind seam appears, and the property has
+    to hold on every run, so it cannot be verified by waiting for the red.
+
+    THE CLAIM COMES FROM THE CENSUS, never a second copy here: this message
+    was the last place still printing the retracted stronger wording, and it
+    is the only place a tripped reader ever looks.
+    """
+    return (
+        "these seams have doubles and NO double that can fail:\n  "
+        + "\n  ".join(new)
+        + "\n\n"
+        + double_census.BLIND_SEAM_CLAIM
+        + " Make a double enter the state, disclaim the path in the test, or "
+        "cite a live run. See docs/TESTING.md."
+    )
+
+
 def test_the_blind_seams_are_exactly_the_known_set() -> None:
     """A new seam whose doubles cannot fail must not land silently.
 
@@ -127,17 +149,7 @@ def test_the_blind_seams_are_exactly_the_known_set() -> None:
     blind = double_census.blind_seams(implemented)
 
     new = sorted(blind - KNOWN_BLIND_SEAMS)
-    assert not new, (
-        "these seams have doubles and NO double that can fail:\n  "
-        + "\n  ".join(new)
-        + "\n\n"
-        # THE CLAIM COMES FROM THE CENSUS, not from a second copy here. This
-        # message is what a reader sees when the gate reds, and it was the last
-        # place still printing the retracted stronger wording.
-        + double_census.BLIND_SEAM_CLAIM
-        + " Make a double enter the state, disclaim the path in the test, or "
-        "cite a live run. See docs/TESTING.md."
-    )
+    assert not new, _new_blind_seam_message(new)
 
     fixed = sorted(KNOWN_BLIND_SEAMS - blind)
     assert not fixed, (
@@ -275,18 +287,32 @@ def test_the_scan_can_find_the_retracted_wording() -> None:
     )
 
 
-def test_the_assertion_message_quotes_the_shared_claim() -> None:
-    """The message a tripped reader sees must come from the one source.
+def test_the_reader_facing_message_carries_the_narrowed_claim() -> None:
+    """INVOKED, not grepped, and the first version of this test was decorative.
 
-    Asserted on the SOURCE of this module rather than by redding the gate,
-    because the gate only reds when a new blind seam appears and this property
-    has to hold on every run.
+    It read this module's own source for the string
+    `double_census` + `.BLIND_SEAM_CLAIM` and asserted it was present. That
+    assertion cannot go red: the needle is spelled in the very file being
+    read, so it always finds ITSELF. A mutation sweep leg that replaced the
+    shared reference with a hand-written second copy passed it green, which is
+    how the hole was found rather than reasoned about.
+
+    The fix is to stop scanning text and build the message instead. This also
+    asserts the RIGHT property: what matters is that the sentence a reader is
+    shown is the narrowed one, not which Python expression produced it.
     """
-    src = pathlib.Path(__file__).resolve().read_text(encoding="utf-8")
-    assert "double_census.BLIND_SEAM_CLAIM" in src, (
-        "the assertion message no longer reads the shared claim, so it is a "
-        "second spelling again"
+    msg = _new_blind_seam_message(["broker.send"])
+
+    assert double_census.BLIND_SEAM_CLAIM in msg, (
+        "the message a tripped reader sees no longer carries the shared "
+        "claim, so it is a second spelling of it again:\n" + msg
+    )
+    assert "broker.send" in msg, (
+        "the message does not name the offending seam, so a reader cannot act "
+        "on it"
     )
     assert "no DOUBLE here covers" in double_census.BLIND_SEAM_CLAIM, (
-        "the shared claim lost its narrowing"
+        "the shared claim lost its narrowing, which is the whole point of it"
     )
+    for bad in RETRACTED_CLAIM_WORDINGS:
+        assert bad not in msg, f"the reader-facing message overclaims: {bad}"
