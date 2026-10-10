@@ -445,26 +445,29 @@ branch:
 
 | domain | command naming the domain | files | with fenced blocks | blocks |
 | --- | --- | --- | --- | --- |
-| `docs/*.md` plus `README.md` | `git ls-files 'docs/*.md' README.md` | 11 | 6 | 40 |
-| `**/*.md` across the repo | `git ls-files '*.md'` | 18 | 12 | 62 |
+| `docs/*.md` plus `README.md` | `git ls-files 'docs/*.md' README.md` | 11 | 6 | 41 |
+| `**/*.md` across the repo | `git ls-files '*.md'` | 18 | 12 | 64 |
 
-**Those figures are re-derived on `main` at `8c96c9f`, and the pin is the only
-reason they are quotable.** This file IS in them now, and the prediction the
-previous version of this paragraph made is worth keeping as a measured result
-rather than deleting. Pinned at `f98984b` it read 11/5/38 and 18/11/57 with
-this file not yet merged, and predicted that merging it would take both
-`blocks` columns to 40 and 59. **The docs row landed exactly on 40. The
-repo-wide row is 62, not 59**, because that domain includes markdown outside
-`docs/`, which moved three blocks in the meantime while this file changed not
-at all. The hazard the next paragraph describes therefore recurred during the
-life of the paragraph describing it, which is the strongest argument available
-for quoting a ref.
+**Those figures are MEASURED AT THE TIP THAT CARRIES THEM, not predicted for a
+future merge, and that change is deliberate.** Earlier versions of this
+paragraph pinned the counts to a `main` that did not yet contain this file and
+then stated the delta merging it would produce. That design has now rotted
+three times in a row, so the table states what the commit it ships in actually
+contains, and there is no arithmetic left to go stale.
 
-The section immediately above adds one fenced block (the census output), taking
-this file from 2 to 3 and both `blocks` columns up by one, to 41 and 63.
-Neither `with fenced blocks` column moves, because this file already held
-some. Past that, do not read the number, run the command, because **both rows
-count THIS file, so both move when it does.** That is the controls table's
+**The three readings are worth keeping, because together they are the argument
+for the rule rather than an anecdote.** At `f98984b` the row read 18/11/57 and
+predicted 59 after this file merged. It merged, and the repo-wide figure was
+**62**. While the pull request adding the section above was open, #240 landed
+and it became **64**. The `docs/` row, meanwhile, hit its predicted 40 exactly
+and has only moved by this file's own additions. So the broad domain moved
+three times without this file changing at all, and the narrow one never moved
+except when it did: **a markdown commit may move the count and may not, which
+means you can infer neither staleness from the fact that documentation changed
+nor freshness from the fact that this file did not.** Re-derive, or quote a ref.
+
+Past that, do not read the number, run the command, because **both rows count
+THIS file, so both move when it does.** That is the controls table's
 self-inclusion one domain wider.
 
 **An unpinned corpus count is stale by default, and this one went stale twice
