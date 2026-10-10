@@ -102,6 +102,7 @@ def _broker(tmp_path: Path, *, wait: float, log: list[str] | None = None) -> Mt4
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.timing
 def test_startup_connect_waits_for_an_expert_that_appears_late(tmp_path: Path) -> None:
     """The cold boot, reproduced: the mailbox answers only after 1.2s.
 
@@ -162,6 +163,7 @@ def test_the_default_log_sink_writes_to_stdout(capsys: pytest.CaptureFixture[str
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.timing
 def test_startup_connect_gives_up_bounded_when_the_expert_never_appears(
     tmp_path: Path,
 ) -> None:
@@ -221,6 +223,7 @@ def test_startup_connect_makes_more_than_one_attempt(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.timing
 def test_connect_does_not_inherit_the_startup_budget(tmp_path: Path) -> None:
     """`Engine._reconnect_broker()` lands here, on the trading path.
 
@@ -234,6 +237,7 @@ def test_connect_does_not_inherit_the_startup_budget(tmp_path: Path) -> None:
     assert time.monotonic() - started < 5.0
 
 
+@pytest.mark.timing
 def test_ensure_connected_does_not_inherit_the_startup_budget(tmp_path: Path) -> None:
     """`Engine.step_all()` calls this on EVERY step."""
     br = _broker(tmp_path, wait=30.0)
@@ -253,6 +257,7 @@ def test_a_bridge_timeout_is_still_a_runtime_error() -> None:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.timing
 def test_startup_connect_does_not_retry_an_expert_that_refuses(tmp_path: Path) -> None:
     """An `ok=0` reply is a LIVE Expert stating a diagnosis. Waiting cannot fix it.
 
@@ -277,6 +282,7 @@ def test_startup_connect_does_not_retry_an_expert_that_refuses(tmp_path: Path) -
     assert ea.ops == ["ping"], "a refusal must not be retried"
 
 
+@pytest.mark.timing
 def test_a_zero_budget_is_one_ping(tmp_path: Path) -> None:
     """The pre-1.4.2 behaviour, kept reachable and meaning exactly itself.
 
