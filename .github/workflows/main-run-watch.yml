@@ -121,6 +121,6 @@ jobs:
             echo "updated existing tracker #$num"
           else
             gh issue create --title "$title" --body-file alert-body.md \
-              --assignee skyphusion-strummer
+              --assignee skyphusion-mackaye
             echo "opened a new tracker"
           fi
