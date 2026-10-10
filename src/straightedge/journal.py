@@ -18,6 +18,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, TextIO
 
+from straightedge.atomic import replace_retrying_on_share_conflict
+
 # `mailbox_token` is spelled out because the match is exact-key, not substring:
 # "token" alone does not redact a field called "mailbox_token". Nothing journals
 # it today; it is listed so that adding such a field cannot leak one silently.
@@ -51,6 +53,16 @@ _ROTATE_BYTES = 10 * 1024 * 1024
 
 class Journal:
     def __init__(self, path: str | Path) -> None:
+        #: How many times a rotation was DEFERRED because a concurrent reader
+        #: refused the replace for longer than the retry window.
+        #:
+        #: A COUNT and not a boolean, for the reason `breach_rows_lost` is a
+        #: count: a persistent holder defers every write, and an operator needs
+        #: to know how many rather than that it happened. The engine publishes
+        #: it on the heartbeat, which is the file the watcher reads; the row
+        #: field is the record of WHICH rows were affected, this is the figure
+        #: that leaves the process.
+        self.rotate_deferrals = 0
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         if self.path.exists():
@@ -86,21 +98,81 @@ class Journal:
                 kept = prior if isinstance(prior, list) else [prior]
                 rec["nonfinite"] = kept + [p for p in nonfinite if p not in kept]
         line = _dump(rec) + "\n"
-        self._rotate_if_needed(len(line.encode("utf-8")))
+        # ROTATION MUST NOT COST THE ROW. `_rotate_if_needed` can be refused by
+        # a concurrent reader (straightedge#251) and it used to raise out of
+        # `write`, so a housekeeping failure destroyed an audit record on a
+        # real-money desk. `__main__` catches and keeps looping, so that was
+        # silent data loss rather than a crash (the shape #217 measured).
+        # Rotation bounds a FILE SIZE; the row IS the product. So a refusal
+        # that outlasts the retry window defers the rotation and the row still
+        # lands, with the deferral marked IN the row. The file exceeding its
+        # bound is recoverable on the next write; the row is not recoverable at
+        # all. The mark is a RECORD of which rows were written while the file
+        # was over its bound; `Journal.rotate_deferrals` is what leaves this
+        # process and reaches the watcher. See `_rotate_if_needed`.
+        deferred = self._rotate_if_needed(len(line.encode("utf-8")))
+        if deferred and "rotate_deferred" not in rec:
+            # NEVER CLOBBER a caller's key, the discipline the `nonfinite`
+            # merge above already had to learn at this exact spot.
+            rec["rotate_deferred"] = 1
+            line = _dump(rec) + "\n"
         with self.path.open("a", encoding="utf-8") as fh:
             fh.write(line)
         _chmod600(self.path)
 
-    def _rotate_if_needed(self, incoming: int) -> None:
+    def _rotate_if_needed(self, incoming: int) -> bool:
+        """Rotate the live file to `.1`. True when a refusal DEFERRED it.
+
+        Returns rather than raises on a refused rotation, because the caller's
+        contract is to record the row: see `write`. Anything that is not a
+        share-mode refusal still propagates, so a full disk or a revoked ACL
+        stays loud.
+        """
         if not self.path.exists():
-            return
+            return False
         size = self.path.stat().st_size
         if size + incoming <= _ROTATE_BYTES:
-            return
+            return False
         dest = self.path.with_name(self.path.name + ".1")
-        self.path.replace(dest)
+        try:
+            # This moves the LIVE file aside, so unlike every other site here
+            # the thing a reader holds open is the SOURCE as well as the
+            # destination. The helper retries the race either way.
+            replace_retrying_on_share_conflict(self.path, dest)
+        except PermissionError:
+            # A holder that outlasts the window is a CONDITION, not a race, and
+            # `atomic.py` requires such a thing to SURFACE rather than be
+            # absorbed. Two surfaces, and they answer different questions:
+            #
+            #   `rotate_deferred` on the row is the RECORD. It says which rows
+            #   were written while the file was over its bound. Nothing reads
+            #   it; it is for whoever reconstructs the log afterwards.
+            #
+            #   `rotate_deferrals` is the SURFACE. The engine publishes it on
+            #   the heartbeat, which is the file `straightedge-watch` reads
+            #   every cycle, so a persistent holder is visible OFF this process
+            #   instead of only inside the log it is preventing from rotating.
+            #
+            # A row field alone would not have satisfied the doctrine, and an
+            # earlier version of this comment claimed it did. It is a record,
+            # and a record reaches nobody: the rotation it describes is the
+            # thing that is failing, so the log is the worst available channel
+            # for saying so.
+            #
+            # WHAT THIS STILL DOES NOT DO, said plainly rather than implied:
+            # the count is PUBLISHED, not ALERTED. It is not a watchdog
+            # `reason`, so a holder that defers rotation forever is visible to
+            # anyone reading the heartbeat and pages nobody. Choosing a
+            # threshold and an operator action is a watchdog design decision
+            # and is filed as straightedge#288 rather than invented here.
+            #
+            # Narrow to `PermissionError` on purpose: every other `OSError`
+            # still raises.
+            self.rotate_deferrals += 1
+            return True
         self.path.touch()
         _chmod600(self.path)
+        return False
 
     def tail(self, n: int = 20) -> list[dict[str, Any]]:
         """Last n live records, redacted AGAIN on the way out.
@@ -211,6 +283,83 @@ class Journal:
 
 class InstanceLockError(RuntimeError):
     """Another process already holds this journal's run lock."""
+
+
+#: The size a single journal row must stay under.
+#:
+#: Stated here and in `docs/CONTRACT.md` rather than only inside a test, which
+#: is what it was until straightedge#226: a bound that lives in one assertion
+#: is a number nobody can check a change against, and two separate suites had
+#: already hardcoded it. Tests import this, so the documented figure and the
+#: asserted figure cannot drift apart.
+#:
+#: DERIVED, not chosen, and the derivation is the contract rather than the
+#: number. 512 was the first figure here and the fixture that justifies this
+#: one measured it wrong before it ever landed: with every `ADVICE_PROPERTIES`
+#: field driven large AT ONCE and all four price fields non-finite, the
+#: `advice_turn` row measures 516 bytes, four over. #250's in-place
+#: `nonfinite:` marker is what made the difference, costing 97 bytes across
+#: those four fields.
+#:
+#:     516   measured worst case: every schema field large at once, all four
+#:           price fields non-finite, the symbol clipped to
+#:           RECORD_STRING_CHARS, and #216's per-field violation classes in
+#:           `degraded`
+#:    + 64   headroom for ONE more non-finite-capable numeric field on the
+#:           row, priced at an 8 character name, longer than any of the four
+#:           today; measured, not allowed for, because such a field costs
+#:           three places at once: the marked value, an entry in the
+#:           `nonfinite` list and a violation class in `degraded`. The
+#:           existing four cost 44, 44, 50 and 53.
+#:    = 580
+#:
+#: WHAT INVALIDATES THIS FIGURE, stated so it cannot go stale in silence:
+#: a SECOND new non-finite-capable numeric field on the row, a field name
+#: longer than 8 characters, a rise in `RECORD_STRING_CHARS`, a per-field
+#: violation class wider than `:not_a_number`, or a longer spelling of
+#: `nonfinite:`. Any of those needs this figure re-derived rather than nudged.
+#:
+#: A field added to `ADVICE_PROPERTIES` alone costs the row NOTHING, measured:
+#: the row's fields are fixed in `desk.py` rather than derived from the schema,
+#: so a schema field is free until somebody journals it. The fixture drives
+#: INPUT; the bound answers for the ROW.
+#:
+#: Stated here and in `docs/CONTRACT.md` rather than only inside a test, and a
+#: test reads the figure back out of that row, so the documented bound and the
+#: asserted bound cannot drift. #119 is why a ceiling exists at all, where one
+#: row stored a rendering of other rows and the payload compounded daily; an
+#: ordinary `advice_turn` still measures 196 bytes against this ceiling.
+RECORD_ROW_BOUND = 580
+
+#: How much of a MODEL-CHOSEN string a row may carry.
+#:
+#: Long enough that every real instrument name, vendor suffix and all, survives
+#: whole (`EURUSD`, `EURUSDm`, `EURUSD.a`, `XAUUSD`, `BTCUSD`), and short enough
+#: that no number of such fields can push a row past the bound
+#: `docs/CONTRACT.md` states (straightedge#226).
+RECORD_STRING_CHARS = 48
+
+
+def clip_for_record(value: str, limit: int = RECORD_STRING_CHARS) -> str:
+    """Bound a model-chosen string for the durable record, and SAY it was cut.
+
+    straightedge#226. `advice_turn` wrote `symbol` verbatim, and `symbol` is
+    model-chosen on the advice path, which is the premise of #197: a 5600
+    character symbol produced a 5838 byte row against the 512 byte bound this
+    repo documents, and the bounded-row test passed anyway because it varied
+    fields that are not echoed. #216 bounded the REASON and this is the same
+    exposure one field over.
+
+    The marker is not decoration. A silently truncated value reads as the whole
+    value, so a reader cannot tell `EURUSD` from a 5600 character string that
+    starts with it, and that is the defect class rather than a nicety: the
+    length is stated so the row says what it dropped.
+
+    Short values are returned unchanged, so nothing that fits is reshaped.
+    """
+    if len(value) <= limit:
+        return value
+    return f"{value[:limit]}[+{len(value) - limit} chars]"
 
 
 def lock_path_for(journal_path: str | Path) -> Path:

@@ -2963,6 +2963,11 @@ class Engine:
                 # field is one a reader can rely on being there
                 # (straightedge#217).
                 breach_rows_lost=self._hb_breach_rows_lost,
+                # Read off the journal rather than mirrored onto the engine,
+                # because the journal is the only thing that knows a rotation
+                # was refused and a second copy of the figure could disagree
+                # with it (straightedge#251).
+                rotate_deferrals=self.journal.rotate_deferrals,
             ),
             encoding="utf-8",
         )

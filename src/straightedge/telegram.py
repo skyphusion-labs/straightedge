@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
 
+from straightedge.atomic import replace_retrying_on_share_conflict
 from straightedge.config import TelegramConfig, is_shared_chat_id
 from straightedge.journal import redact_text
 
@@ -148,7 +149,17 @@ def _write_offset(path: str, offset: int) -> None:
     tmp = dest.with_name(dest.name + ".tmp")
     tmp.write_text(str(int(offset)), encoding="utf-8")
     os.chmod(tmp, 0o600)
-    tmp.replace(dest)
+    # NOT a bare `os.replace` (straightedge#251). The lowest-consequence site
+    # of the four and the one whose test has to be written most carefully: the
+    # only caller, `TelegramClient._store_offset`, already wraps this in
+    # `except OSError: return`, so a refused replace is ALREADY swallowed and
+    # the offset is silently not persisted. A test that asserts "no exception"
+    # here therefore passes without the fix; the gate reads the FILE.
+    #
+    # What the silence costs: the offset is where polling resumes, so a lost
+    # write makes the next process re-read or skip updates. Retrying converts
+    # that silent loss into a write that lands.
+    replace_retrying_on_share_conflict(tmp, dest)
 
 
 def _http_error(exc: urllib.error.HTTPError) -> TelegramError:

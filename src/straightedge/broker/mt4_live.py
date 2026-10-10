@@ -385,6 +385,14 @@ def _atomic_write(path: Path, text: str, deadline: float) -> None:
     tmp.write_text(text, encoding=_mailbox_encoding(), errors="replace", newline="\n")
     while True:
         try:
+            # DELIBERATELY NOT `atomic.replace_retrying_on_share_conflict`, and
+            # this stays a separate loop (straightedge#251). The mailbox is the
+            # interface a customer installs against, so it is the most
+            # expensive thing in this package to change, and this loop was
+            # already correct before the shared helper existed. Folding it in
+            # would buy nothing and would risk the one path with an installed
+            # base. A copied tool forks at copy time, so the spin figure is
+            # pinned to the shared one by a test rather than by these comments.
             tmp.replace(path)
             return
         except PermissionError:

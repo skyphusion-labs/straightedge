@@ -420,18 +420,39 @@ the reason to PRINT the row count as context.
 **But do not compare it to a constant, and this is where a first version of
 this entry was wrong.** The row count is a property of the BRANCH's workflow
 file; the required contexts are a property of the RULESET. **Those are different
-objects and only the second one gates.** Measured across the open pull requests
+objects and only the second one gates.**
+
+**One reading defeats both candidate floors at once**, measured on a currented
+branch after the workflow gained a fifteenth job:
+
+    rows=14  changelog=present  ci=ABSENT  coverage=SUCCESS  non_completed=2
+
+Fourteen rows **with the new row already present**, and a required context
+absent. A floor of 14 passes that while it is incomplete; a floor of 15 fails
+it while it is legitimately mid-flight. **And the new row being present rescues
+neither**, because its presence says which workflow the branch runs and nothing
+about whether the run finished. The two objects visibly diverge in that single
+line: the new row is a property of the workflow file and it is there, `ci` is a
+property of the ruleset and it is not. Measured across the open pull requests
 at one instant: three different row counts were live simultaneously, because
 each branch runs the workflow its own head carries. A branch whose head predates
 a workflow change keeps producing the old count until it currents, and that is
 correct rather than a missing row.
 
-The worked counterexample is a dependency bump whose head carries an older
-`ci.yml` with five jobs: **it legitimately produces TEN rows, so a floor of 14
-rejects it on the count alone, before anything is known about its
-conclusions.** Nothing need be said about whether that branch passes; the
-defect is in the denominator, not in the verdict, and the argument is cleaner
-without one.
+A second counterexample shows the two criteria reaching the SAME verdict for
+different reasons, which is the sharper half. A dependency bump whose head
+carries an older `ci.yml` with five jobs **legitimately produces TEN rows**:
+
+- **`rows >= 14` rejects it on the COUNT**, before anything is known about its
+  conclusions, and would reject an identical branch that was passing.
+- **`ci` present-and-SUCCESS rejects it because `ci` is FAILURE**, which is the
+  actual defect: three of its rows fail on an upstream incompatibility.
+
+**Same verdict, different reason, and only one of them generalises.** Note that
+this branch is NOT passing, and that is the point rather than a caveat: the
+count criterion happens to be right about it for a reason that has nothing to
+do with why it should be rejected. A criterion that is accidentally right is
+the hardest kind to retire.
 
 **So the criterion is the by-NAME half on its own:** the required contexts
 PRESENT and SUCCESS, the language-specific `Analyze` jobs COMPLETED, and zero
@@ -447,9 +468,20 @@ gate asserting every row is SUCCESS rejects a branch that is fine, while
 acceptable conclusions and assert SUCCESS only on the contexts the ruleset
 actually requires.**
 
+**And `NEUTRAL` is the mirror of the defect this section opens with.** That
+section's case is `select(.conclusion != "success") | length == 0`, satisfied by
+an EMPTY list. The mirror is `conclusion != "failure"`, which a NEUTRAL row
+satisfies while having neither run nor succeeded. Measured on that bump: seven
+rows have a conclusion other than `failure`, and one of those seven is the
+neutral one. **So a not-failure formulation passes a required context that did
+not succeed, and the by-name criterion survives precisely because it asserts
+SUCCESS rather than not-failure.**
+
 That row was first described to this file as a sixth state, `skipping`, present
 and never running. **It is not: it is COMPLETED with a neutral conclusion, and
-the table above stays at five.** Recorded because the measurement is the only
+the table above stays at five.** `skipping` is the CLI's one-word rendering of
+two fields, which is why the instruction is to read `status` and `conclusion`
+separately rather than trusting the single column. Recorded because the measurement is the only
 reason to know that, and a sixth state added on one unmeasured observation
 would have been this entry's own subject.
 
@@ -593,8 +625,10 @@ at all**, because a census that measured nothing is not a clean result.
 
 A double with no `raise` is **not** automatically a defect. Most tests
 exercise a happy path and should. What the census makes checkable is the
-CLAIM: if no double for a seam can fail, the suite covers no failure path
-through that seam, and one of the three answers above is owed.
+CLAIM: if no double for a seam can fail, **no DOUBLE in this suite** covers
+a failure path through that seam, and one of the three answers above is owed.
+Not "nothing covers it": a test that makes the REAL implementation fail covers
+the path and the census cannot see it, which is the limit stated below.
 
 **Now the limit, stated because this document is about claims that outlive
 their evidence and a mechanism shipped with an unverified claim would be this

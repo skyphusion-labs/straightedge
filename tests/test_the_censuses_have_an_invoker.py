@@ -40,6 +40,8 @@ reason. The precedent was in the repo and I had not weighed it.
 
 from __future__ import annotations
 
+import pathlib
+
 import double_census
 import timing_census
 
@@ -50,10 +52,36 @@ import timing_census
 #: a person edits this line deliberately and says why in the commit, which is
 #: the whole difference from a list the tool skips quietly.
 #:
-#: These three are a RAISED FINDING, not an accepted state: each owes one of
-#: the three answers in `docs/TESTING.md` (make a double enter the state,
-#: disclaim the path, or cite a live run). Shrinking this set is the fix.
-KNOWN_BLIND_SEAMS = frozenset({"cancel", "check_working", "working"})
+#: EMPTY as of straightedge#264, which answered the three that were here
+#: (`cancel`, `check_working`, `working`). All three took answer 1 from
+#: `docs/TESTING.md`, make the double enter the state, and the reason they
+#: share one answer is that they share one MECHANISM: all three are
+#: `self._result(self._call(op, ...))` in `Mt4Broker`, and `_call` is the
+#: injected transport whose mailbox bridge raises `BridgeTimeout`. There was
+#: never a case for disclaiming a path that one real exception reaches through
+#: all three.
+#:
+#: What differs, and why it is three tests rather than one parametrised over a
+#: list of method names: the CONSEQUENCE. Measured per seam before choosing.
+#:
+#:   working        a SEND. `inflight.begin()` has already run, so the entry
+#:                  must stay OPEN and the next confirm of the same staged
+#:                  order must be refused as unresolved.
+#:                  tests/test_send_idempotency.py
+#:   check_working  a READ, one call EARLIER. `begin()` has NOT run, so the
+#:                  ledger must stay EMPTY and nothing may be sent. The
+#:                  opposite correct answer to `working`, which is what makes
+#:                  the pair worth having.
+#:                  tests/test_send_idempotency.py
+#:   cancel         a sweep step on the SAFETY path. The order is a survivor,
+#:                  the report is incomplete, and the record must say COULD
+#:                  NOT MEASURE rather than carry a venue retcode.
+#:                  tests/test_flatten.py
+#:
+#: An empty set is not a finished job: it means no seam a double implements is
+#: blind. A seam no double implements at all is invisible to this census, which
+#: is a different question and not one this pin answers.
+KNOWN_BLIND_SEAMS: frozenset[str] = frozenset()
 
 
 def test_every_elapsed_time_assertion_is_marked_timing() -> None:
@@ -81,12 +109,36 @@ def test_every_elapsed_time_assertion_is_marked_timing() -> None:
     )
 
 
+def _new_blind_seam_message(new: list[str]) -> str:
+    """The text a reader is shown when a new blind seam lands.
+
+    A FUNCTION rather than an inline f-string so the property "this message
+    carries the narrowed claim" can be asserted by CALLING it. The gate it
+    belongs to only reds when a new blind seam appears, and the property has
+    to hold on every run, so it cannot be verified by waiting for the red.
+
+    THE CLAIM COMES FROM THE CENSUS, never a second copy here: this message
+    was the last place still printing the retracted stronger wording, and it
+    is the only place a tripped reader ever looks.
+    """
+    return (
+        "these seams have doubles and NO double that can fail:\n  "
+        + "\n  ".join(new)
+        + "\n\n"
+        + double_census.BLIND_SEAM_CLAIM
+        + " Make a double enter the state, disclaim the path in the test, or "
+        "cite a live run. See docs/TESTING.md."
+    )
+
+
 def test_the_blind_seams_are_exactly_the_known_set() -> None:
     """A new seam whose doubles cannot fail must not land silently.
 
     straightedge#244: a double that only ever RETURNS cannot enter a failure
-    state, so a suite built on it covers no failure path through that seam no
-    matter how many cases it has.
+    state, so no DOUBLE in this suite covers a failure path through that seam.
+    Narrowed in #275 and again here: "no double" is not "nothing", because a
+    test that makes the REAL implementation fail covers the path and the census
+    cannot see it.
     """
     implemented = double_census.collect()
     assert implemented, (
@@ -97,13 +149,7 @@ def test_the_blind_seams_are_exactly_the_known_set() -> None:
     blind = double_census.blind_seams(implemented)
 
     new = sorted(blind - KNOWN_BLIND_SEAMS)
-    assert not new, (
-        "these seams have doubles and NO double that can fail:\n  "
-        + "\n  ".join(new)
-        + "\n\nSo the suite covers no failure path through them. Make a double "
-        "enter the state, disclaim the path in the test, or cite a live run. "
-        "See docs/TESTING.md."
-    )
+    assert not new, _new_blind_seam_message(new)
 
     fixed = sorted(KNOWN_BLIND_SEAMS - blind)
     assert not fixed, (
@@ -131,3 +177,142 @@ def test_the_blind_seam_detector_can_tell_the_two_cases_apart() -> None:
     assert double_census.blind_seams(mixed) == set(), (
         "one double that can fail is enough to make the seam not blind"
     )
+
+
+#: The wording #275 retracted. It claimed a blind seam means NOTHING covers the
+#: failure path, when it means no DOUBLE here does; a test that makes the REAL
+#: implementation fail covers it and the census cannot see that.
+#:
+#: Pinned as a string to be absent rather than as a list of files to check,
+#: because the defect was one claim with FIVE spellings and a file list would
+#: have to be kept in step with wherever the sixth one lands.
+#: ASSEMBLED FROM FRAGMENTS, NOT WRITTEN OUT, and that is not obfuscation.
+#: The first version of this pin spelled the needles literally and the scan
+#: reded on THIS FILE, because a scanner that looks for a string cannot hold
+#: that string in the source it scans. Same self-inclusion as the contract
+#: table that counted its own rows: the instrument changed the population it
+#: was measuring.
+#:
+#: Excluding this file by name was the other option and it is worse: the file
+#: carrying the pin is exactly where a sixth spelling would be most likely to
+#: be pasted, and the control below asserts this file IS scanned.
+RETRACTED_CLAIM_WORDINGS = (
+    "covers no" + " failure path",
+    "cannot cover a" + " failure path",
+)
+
+#: `CHANGELOG.md` is append-only record and legitimately quotes the retracted
+#: wording while describing the retraction, so it is excluded BY NAME with that
+#: reason rather than by a pattern that would also excuse a live file.
+CLAIM_SCAN_EXCLUDES = frozenset({"CHANGELOG.md"})
+
+
+def _scanned_files() -> list[pathlib.Path]:
+    root = pathlib.Path(__file__).resolve().parents[1]
+    out: list[pathlib.Path] = []
+    for pattern in ("*.md", "docs/*.md", "tests/*.py", "src/straightedge/*.py",
+                    "src/straightedge/broker/*.py"):
+        out.extend(root.glob(pattern))
+    return [f for f in sorted(set(out)) if f.name not in CLAIM_SCAN_EXCLUDES]
+
+
+def test_the_retracted_claim_wording_appears_nowhere_live() -> None:
+    """One claim, one wording, enforced repo-wide rather than per file.
+
+    #275 narrowed this claim in ONE of five places. The four it missed were
+    this module's docstring, the census module's docstring short-form, the
+    document's CLAIM line, and **this file's assertion message, which is the
+    one a reader actually sees when the gate reds** -- so the retracted wording
+    was the only version a tripped reader was shown.
+
+    Scanning for the retracted STRING rather than checking a list of known
+    sites is deliberate: the defect was a claim with five spellings, and a file
+    list would itself need keeping in step with wherever the sixth appears.
+    """
+    offenders: dict[str, list[str]] = {}
+    for f in _scanned_files():
+        text = f.read_text(encoding="utf-8")
+        for bad in RETRACTED_CLAIM_WORDINGS:
+            if bad in text:
+                offenders.setdefault(str(f.name), []).append(bad)
+    assert not offenders, (
+        "the retracted claim wording is live again: "
+        + repr(offenders)
+        + ". A blind seam means no DOUBLE here covers the failure path, never "
+        "that nothing does, because a test can make the REAL implementation "
+        "fail and this census cannot see it. Use "
+        "double_census.BLIND_SEAM_CLAIM for runtime wording."
+    )
+
+
+def test_the_scan_can_find_the_retracted_wording() -> None:
+    """CONTROL. The scan above has only ever passed, which proves nothing.
+
+    Without this, `bad in text` could be checking an empty file list and the
+    test would be permanently green: the file-collection half is exactly where
+    a scan like this goes blind, and the entry in `docs/TESTING.md` about
+    printing the denominator is about this shape.
+    """
+    files = _scanned_files()
+    # The scan must be able to FIND the needle, shown on a synthetic string
+    # built here rather than on a file, so the control cannot be satisfied by
+    # the needle being unfindable.
+    sentinel = RETRACTED_CLAIM_WORDINGS[0]
+    haystack = "a suite that " + sentinel + " through that seam"
+    assert sentinel in haystack, "the needle cannot be found even when present"
+    assert all(w not in pathlib.Path(__file__).resolve().read_text(encoding="utf-8")
+               for w in RETRACTED_CLAIM_WORDINGS), (
+        "a needle is spelled literally in this file, so the scan will red on "
+        "itself; assemble it from fragments"
+    )
+    # And the scanned set must include the files that carried the defect, so a
+    # glob change that stops reaching them cannot pass this silently.
+    #
+    # BY NAME, AND NO COUNT COMPARED TO A CONSTANT. An earlier version of this
+    # control asserted `len(files) >= 20`, which is the same error as gating a
+    # branch on a check-run ROW COUNT: the number of files under these globs is
+    # a property of how many docs and modules the repo happens to have, so it
+    # drifts for reasons that have nothing to do with whether the scan reaches
+    # the files that carried the defect. Naming them answers that directly, and
+    # it already proves the denominator is not empty. The count stays as context
+    # in the failure text, never as the criterion.
+    names = {f.name for f in files}
+    missing = [r for r in ("double_census.py",
+                           "test_the_censuses_have_an_invoker.py",
+                           "TESTING.md") if r not in names]
+    assert not missing, (
+        f"the scan no longer reaches {missing}, so a retracted wording could "
+        f"return to the files that carried it and stay green "
+        f"({len(files)} files scanned)"
+    )
+
+
+def test_the_reader_facing_message_carries_the_narrowed_claim() -> None:
+    """INVOKED, not grepped, and the first version of this test was decorative.
+
+    It read this module's own source for the string
+    `double_census` + `.BLIND_SEAM_CLAIM` and asserted it was present. That
+    assertion cannot go red: the needle is spelled in the very file being
+    read, so it always finds ITSELF. A mutation sweep leg that replaced the
+    shared reference with a hand-written second copy passed it green, which is
+    how the hole was found rather than reasoned about.
+
+    The fix is to stop scanning text and build the message instead. This also
+    asserts the RIGHT property: what matters is that the sentence a reader is
+    shown is the narrowed one, not which Python expression produced it.
+    """
+    msg = _new_blind_seam_message(["broker.send"])
+
+    assert double_census.BLIND_SEAM_CLAIM in msg, (
+        "the message a tripped reader sees no longer carries the shared "
+        "claim, so it is a second spelling of it again:\n" + msg
+    )
+    assert "broker.send" in msg, (
+        "the message does not name the offending seam, so a reader cannot act "
+        "on it"
+    )
+    assert "no DOUBLE here covers" in double_census.BLIND_SEAM_CLAIM, (
+        "the shared claim lost its narrowing, which is the whole point of it"
+    )
+    for bad in RETRACTED_CLAIM_WORDINGS:
+        assert bad not in msg, f"the reader-facing message overclaims: {bad}"

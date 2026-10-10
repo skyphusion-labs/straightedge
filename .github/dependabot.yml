@@ -33,3 +33,15 @@ updates:
       npm-minor-patch:
         patterns: ["*"]
         update-types: ["minor", "patch"]
+    # vitest is HELD at ^4 (straightedge#120). The `npm-minor-patch` group above only
+    # decides how minor and patch updates are BATCHED; it does not stop a major from
+    # opening its own PR, which is how #46 and #116 (vitest 5) were opened. Nothing
+    # published accepts vitest 5: `npm view @cloudflare/vitest-pool-workers
+    # peerDependencies` reads `vitest: ^4.1.0`, so a vitest 5 install dies with
+    # ERESOLVE before a test runs. Lift this ignore (and bump pool-workers and
+    # vitest together in one PR) once that peer range admits 5.
+    ignore:
+      - dependency-name: "vitest"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "@vitest/*"
+        update-types: ["version-update:semver-major"]

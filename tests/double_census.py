@@ -2,9 +2,11 @@
 """Census: which test doubles can FAIL the way the real thing does?
 
 The rule this enforces is in `docs/TESTING.md` under "A substitute that cannot
-fail the way the real thing does". The short form: a double that only ever
-RETURNS cannot enter any failure state, so a suite built on it cannot cover a
-failure path through that seam no matter how many cases it has.
+fail the way the real thing does". The short form is `BLIND_SEAM_CLAIM`
+below: a double that only ever RETURNS cannot enter any failure state, so no
+DOUBLE in this suite covers a failure path through that seam. Note "no double"
+and not "nothing": a test that makes the REAL implementation fail covers the
+path and is invisible here.
 
 This is the measurement, not advice. It was written after straightedge#232,
 where 1457 green tests could not see a defect on the error path because every
@@ -17,10 +19,21 @@ automatically instead of silently leaving the new seam uncounted.
 
 A double with no `raise` is NOT automatically a defect: most tests exercise a
 happy path and should. What the census makes checkable is the CLAIM. If no
-double for a seam can raise, then any claim that the suite covers a failure
-path through that seam is false, and the three honest answers are: make the
-double enter that state, have the test disclaim the path, or point at a live
-run. Exit codes say which situation you are in; they do not say you are wrong.
+double for a seam can raise, then no DOUBLE in this suite covers a failure
+path through that seam, and the three honest answers are: make the double
+enter that state, have the test disclaim the path, or point at a live run.
+Exit codes say which situation you are in; they do not say you are wrong.
+
+WHAT THIS CANNOT SEE, stated because the reading is reassuring either way.
+It measures test-file doubles, by looking for a `raise` inside a method whose
+name matches a seam. A failure path covered by making the REAL implementation
+fail is INVISIBLE to it and reads as blind: `docs/TESTING.md` prefers exactly
+that ("when the real thing can be made to fail cheaply, that beats any
+double"), and #232's own repair pointed a real transport at a closed loopback
+port and needed no double at all. So a blind seam here means "no double can
+fail", never "nothing covers the failure"; check for a real-implementation
+test before concluding a path is uncovered. Narrowed in #264, where the
+previous wording claimed the stronger thing.
 """
 
 from __future__ import annotations
@@ -32,6 +45,28 @@ import sys
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 SRC = ROOT / "src" / "straightedge"
 TESTS = ROOT / "tests"
+
+#: THE CLAIM, in one place, because it had five spellings and #275's narrowing
+#: reached one of them.
+#:
+#: The narrowing was correct: a blind seam means no DOUBLE here covers a failure
+#: path, never that nothing covers it, since a test can make the REAL
+#: implementation fail and this census cannot see that. But the sentence was
+#: repeated in this module's docstring short-form, in this module's output, in
+#: the pin's docstring, in the pin's ASSERTION MESSAGE and in
+#: `docs/TESTING.md`. Four kept the stronger wording, and **the assertion
+#: message is the one a failing gate actually prints**, so a reader who tripped
+#: the gate saw only the claim that had been retracted.
+#:
+#: So the two RUNTIME spellings now read this constant and cannot diverge. The
+#: docstrings and the document are prose and are narrowed by hand;
+#: `test_the_claim_has_one_wording` asserts the document's CLAIM line still
+#: agrees with this string, so a future narrowing of either reds rather than
+#: silently splitting them again.
+BLIND_SEAM_CLAIM = (
+    "No double for these seams can raise, so no DOUBLE here covers a failure "
+    "path through them."
+)
 
 
 def protocol_seams() -> dict[str, set[str]]:
@@ -150,10 +185,12 @@ def main() -> int:
             where = ", ".join(sorted({f"{f}:{c}" for f, c, _ in found[m]}))
             print(f"  {m}  -- implemented by {where}")
         print()
-        print("No double for these seams can raise, so the suite covers no")
-        print("failure path through them. That is a finding about the CLAIM:")
-        print("make a double enter the state, disclaim the path, or cite a")
-        print("live run. See docs/TESTING.md.")
+        print(BLIND_SEAM_CLAIM)
+        print("Check whether a test makes the REAL implementation fail, which")
+        print("this census cannot see, before reading that as uncovered. If")
+        print("nothing does, that is a finding about the CLAIM: make a double")
+        print("enter the state, disclaim the path, or cite a live run.")
+        print("See docs/TESTING.md.")
         return 1
     print("every implemented seam has at least one double that can fail")
     return 0
