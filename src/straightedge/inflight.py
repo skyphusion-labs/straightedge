@@ -59,6 +59,8 @@ import os
 import secrets
 import time
 from pathlib import Path
+
+from straightedge.atomic import replace_retrying_on_share_conflict
 from typing import Any
 
 #: Sidecar suffix, same idiom as the heartbeat and the instance lock: derived
@@ -153,7 +155,20 @@ class InflightLedger:
             # write that never reached the platter is an entry the next process
             # cannot see, which is the in-memory set this file replaces.
             os.fsync(fh.fileno())
-        os.replace(tmp, self.path)
+        # NOT a bare `os.replace`: a concurrent reader of this file makes that
+        # fail on Windows (straightedge#251, and the helper carries the
+        # mechanism). The consequence here is NOT the halt `state.py` takes:
+        # `_store` is reached from `Engine._open` and `_place_pending` through
+        # `begin()`, which runs BEFORE `broker.market(order)`, and neither call
+        # site wraps it. So a refused replace raises out of the send path with
+        # the order NEVER SENT, which is the safe direction and is why this is
+        # a retry rather than a rewrite. `PermissionError` is an `OSError` and
+        # so escapes `Desk.handle`'s `(ValueError, RuntimeError)`; the loop
+        # catches it one level up in `Engine.poll_telegram` and the desk
+        # survives. Read in the code rather than inferred: no `_halt_reason` is
+        # set on this path, and the only two halts are `state_unreadable` and
+        # `state_unwritable` in `risk.py`.
+        replace_retrying_on_share_conflict(tmp, self.path)
         try:
             self.path.chmod(0o600)
         except OSError:  # pragma: no cover - platform dependent

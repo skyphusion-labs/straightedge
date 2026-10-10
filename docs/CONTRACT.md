@@ -506,7 +506,8 @@ Each `step_all` that reaches `account` writes `journal.heartbeat`.
 Line 1 is an ISO timestamp, and that has not changed since 1.0.0.
 After it, one `key=value` per line: `blocked=`, `mode=`, `stale_after_s=`,
 `tick_budget_s=`, `tick_gap_max_s=`, `over_budget=`, `tick_gap_ever_s=`,
-`over_budget_ever=`, `breach_rows_lost=`, `run_id=`, `started_at=`,
+`over_budget_ever=`, `breach_rows_lost=`, `rotate_deferrals=`, `run_id=`,
+`started_at=`,
 `deployed=`.
 (`deployed=` was shipped by 1.6.0 and this list did not name it; corrected
 here rather than left for a reader to find in the renderer. **A test now reads

@@ -18,6 +18,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, TextIO
 
+from straightedge.atomic import replace_retrying_on_share_conflict
+
 # `mailbox_token` is spelled out because the match is exact-key, not substring:
 # "token" alone does not redact a field called "mailbox_token". Nothing journals
 # it today; it is listed so that adding such a field cannot leak one silently.
@@ -51,6 +53,16 @@ _ROTATE_BYTES = 10 * 1024 * 1024
 
 class Journal:
     def __init__(self, path: str | Path) -> None:
+        #: How many times a rotation was DEFERRED because a concurrent reader
+        #: refused the replace for longer than the retry window.
+        #:
+        #: A COUNT and not a boolean, for the reason `breach_rows_lost` is a
+        #: count: a persistent holder defers every write, and an operator needs
+        #: to know how many rather than that it happened. The engine publishes
+        #: it on the heartbeat, which is the file the watcher reads; the row
+        #: field is the record of WHICH rows were affected, this is the figure
+        #: that leaves the process.
+        self.rotate_deferrals = 0
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         if self.path.exists():
@@ -86,21 +98,81 @@ class Journal:
                 kept = prior if isinstance(prior, list) else [prior]
                 rec["nonfinite"] = kept + [p for p in nonfinite if p not in kept]
         line = _dump(rec) + "\n"
-        self._rotate_if_needed(len(line.encode("utf-8")))
+        # ROTATION MUST NOT COST THE ROW. `_rotate_if_needed` can be refused by
+        # a concurrent reader (straightedge#251) and it used to raise out of
+        # `write`, so a housekeeping failure destroyed an audit record on a
+        # real-money desk. `__main__` catches and keeps looping, so that was
+        # silent data loss rather than a crash (the shape #217 measured).
+        # Rotation bounds a FILE SIZE; the row IS the product. So a refusal
+        # that outlasts the retry window defers the rotation and the row still
+        # lands, with the deferral marked IN the row. The file exceeding its
+        # bound is recoverable on the next write; the row is not recoverable at
+        # all. The mark is a RECORD of which rows were written while the file
+        # was over its bound; `Journal.rotate_deferrals` is what leaves this
+        # process and reaches the watcher. See `_rotate_if_needed`.
+        deferred = self._rotate_if_needed(len(line.encode("utf-8")))
+        if deferred and "rotate_deferred" not in rec:
+            # NEVER CLOBBER a caller's key, the discipline the `nonfinite`
+            # merge above already had to learn at this exact spot.
+            rec["rotate_deferred"] = 1
+            line = _dump(rec) + "\n"
         with self.path.open("a", encoding="utf-8") as fh:
             fh.write(line)
         _chmod600(self.path)
 
-    def _rotate_if_needed(self, incoming: int) -> None:
+    def _rotate_if_needed(self, incoming: int) -> bool:
+        """Rotate the live file to `.1`. True when a refusal DEFERRED it.
+
+        Returns rather than raises on a refused rotation, because the caller's
+        contract is to record the row: see `write`. Anything that is not a
+        share-mode refusal still propagates, so a full disk or a revoked ACL
+        stays loud.
+        """
         if not self.path.exists():
-            return
+            return False
         size = self.path.stat().st_size
         if size + incoming <= _ROTATE_BYTES:
-            return
+            return False
         dest = self.path.with_name(self.path.name + ".1")
-        self.path.replace(dest)
+        try:
+            # This moves the LIVE file aside, so unlike every other site here
+            # the thing a reader holds open is the SOURCE as well as the
+            # destination. The helper retries the race either way.
+            replace_retrying_on_share_conflict(self.path, dest)
+        except PermissionError:
+            # A holder that outlasts the window is a CONDITION, not a race, and
+            # `atomic.py` requires such a thing to SURFACE rather than be
+            # absorbed. Two surfaces, and they answer different questions:
+            #
+            #   `rotate_deferred` on the row is the RECORD. It says which rows
+            #   were written while the file was over its bound. Nothing reads
+            #   it; it is for whoever reconstructs the log afterwards.
+            #
+            #   `rotate_deferrals` is the SURFACE. The engine publishes it on
+            #   the heartbeat, which is the file `straightedge-watch` reads
+            #   every cycle, so a persistent holder is visible OFF this process
+            #   instead of only inside the log it is preventing from rotating.
+            #
+            # A row field alone would not have satisfied the doctrine, and an
+            # earlier version of this comment claimed it did. It is a record,
+            # and a record reaches nobody: the rotation it describes is the
+            # thing that is failing, so the log is the worst available channel
+            # for saying so.
+            #
+            # WHAT THIS STILL DOES NOT DO, said plainly rather than implied:
+            # the count is PUBLISHED, not ALERTED. It is not a watchdog
+            # `reason`, so a holder that defers rotation forever is visible to
+            # anyone reading the heartbeat and pages nobody. Choosing a
+            # threshold and an operator action is a watchdog design decision
+            # and is filed as straightedge#288 rather than invented here.
+            #
+            # Narrow to `PermissionError` on purpose: every other `OSError`
+            # still raises.
+            self.rotate_deferrals += 1
+            return True
         self.path.touch()
         _chmod600(self.path)
+        return False
 
     def tail(self, n: int = 20) -> list[dict[str, Any]]:
         """Last n live records, redacted AGAIN on the way out.
